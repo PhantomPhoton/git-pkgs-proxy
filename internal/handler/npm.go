@@ -215,10 +215,8 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		accept = contentTypeJSON
 	}
 
-	if rewritten, ok := h.proxy.storedRewrite("npm", metadataCacheKey, h.proxyURL, metadataCacheKey); ok {
-		w.Header().Set(headerContentType, contentTypeJSON)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(rewritten)
+	if stored, ok := h.proxy.storedRewrite("npm", metadataCacheKey, h.proxyURL, metadataCacheKey); ok {
+		serveRewrittenMetadata(w, r, stored)
 		return
 	}
 
@@ -243,7 +241,7 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	rewritten, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, body, func(b []byte) ([]byte, error) {
+	rewritten, etag, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, body, func(b []byte) ([]byte, error) {
 		return h.rewriteMetadata(packageName, b)
 	})
 	if err != nil {
@@ -270,9 +268,7 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	w.Header().Set(headerContentType, contentTypeJSON)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(rewritten)
+	serveRewrittenMetadata(w, r, h.proxy.rewrittenMetadataFor("npm", metadataCacheKey, rewritten, etag))
 }
 
 // handleFilteredNPMVersionMetadata serves /pkg/<version> and /pkg/<tag> from the
@@ -290,7 +286,7 @@ func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *
 		return
 	}
 
-	rewritten, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, packument, func(b []byte) ([]byte, error) {
+	rewritten, _, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, packument, func(b []byte) ([]byte, error) {
 		return h.rewriteNPMVersionFromPackument(packageName, specifier, b)
 	})
 	if err != nil {
