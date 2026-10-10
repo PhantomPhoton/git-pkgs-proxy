@@ -514,9 +514,11 @@ entry replaces that default.
 
 Once the proxy says it serves a database, the `go` command no longer contacts
 that database directly. The proxy therefore only says so when it can fetch the
-database's latest signed tree, or has it cached. If it cannot, it answers 404
-as for an unknown name, and clients go to the database themselves. After a
-failed check the proxy waits a minute before it tries the database again.
+database's latest signed tree, or has a fresh one cached (fetched within
+`metadata_ttl`). If it cannot, it answers 404 as for an unknown name, and
+clients go to the database themselves, as they would without the proxy. The
+check waits five seconds at most, and after a failed check the proxy waits a
+minute before it tries the database again.
 
 With `cache_metadata` enabled, lookups, partial tiles and the latest signed
 tree follow `metadata_ttl` and are served from cache when the database is

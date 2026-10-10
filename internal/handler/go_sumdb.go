@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
@@ -28,14 +29,29 @@ const (
 	// goSumDBProbeBackoff is how long supported keeps answering 404 after the
 	// proxy failed to reach a checksum database, before it tries again.
 	goSumDBProbeBackoff = time.Minute
+	// goSumDBProbeTimeout is how long supported waits for the database. The
+	// go command's own request has no timeout, so a database that drops
+	// packets must not hold every build for the full upstream timeout.
+	goSumDBProbeTimeout = 5 * time.Second
 )
 
 // goSumDBProbes remembers when the proxy last failed to reach each checksum
 // database, so a database that is unreachable does not make every go command
 // wait for an upstream timeout before it falls back.
 type goSumDBProbes struct {
-	mu     sync.Mutex
-	failed map[string]time.Time
+	// timeout overrides goSumDBProbeTimeout when set (tests).
+	timeout time.Duration
+
+	mu        sync.Mutex
+	failed    map[string]time.Time
+	succeeded map[string]time.Time
+}
+
+func (p *goSumDBProbes) probeTimeout() time.Duration {
+	if p.timeout > 0 {
+		return p.timeout
+	}
+	return goSumDBProbeTimeout
 }
 
 func (p *goSumDBProbes) recentlyFailed(name string) bool {
@@ -50,6 +66,24 @@ func (p *goSumDBProbes) record(name string, reachable bool) {
 	defer p.mu.Unlock()
 	if reachable {
 		delete(p.failed, name)
+		if p.succeeded == nil {
+			p.succeeded = make(map[string]time.Time)
+		}
+		p.succeeded[name] = time.Now()
+		return
+	}
+	if p.failed == nil {
+		p.failed = make(map[string]time.Time)
+	}
+	p.failed[name] = time.Now()
+}
+
+// recordTimeout records a failure for a probe started at start, unless the
+// fetch it gave up waiting for has succeeded in the meantime.
+func (p *goSumDBProbes) recordTimeout(name string, start time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.succeeded[name].Before(start) {
 		return
 	}
 	if p.failed == nil {
@@ -99,7 +133,7 @@ func (h *GoHandler) handleSumDB(w http.ResponseWriter, r *http.Request, rest str
 	}
 
 	cacheKey := goSumDBCacheKey(name, sumDBURL, path)
-	check := goSumDBTileCheck(path)
+	check := goSumDBResponseCheck(path)
 	served, damaged := false, false
 	if immutable {
 		served, damaged = h.serveCachedSumDBTile(w, r, cacheKey, check)
@@ -115,23 +149,91 @@ func (h *GoHandler) handleSumDB(w http.ResponseWriter, r *http.Request, rest str
 // 200 the go command uses only the proxy for that database and never falls
 // back to contacting it directly, so a database the proxy cannot reach gets
 // 404 instead. The probe goes through the same cache entry as a latest
-// request, so it costs at most one upstream request per metadata TTL.
+// request: with cache_metadata it costs at most one upstream request per
+// metadata TTL, without it each probe fetches latest.
 func (h *GoHandler) sumDBReachable(r *http.Request, name, sumDBURL string) bool {
-	if h.sumDBProbes.recentlyFailed(name) {
-		return false
-	}
 	cacheKey := goSumDBCacheKey(name, sumDBURL, "latest")
-	_, _, _, err := h.proxy.fetchOrCacheMetadata(r.Context(), goEcosystem, cacheKey, sumDBURL+"/latest", "identity", nil, "*/*")
-	if err != nil && r.Context().Err() != nil {
+	treeCheck := goSumDBResponseCheck("latest")
+	if h.sumDBProbes.recentlyFailed(name) {
+		return h.cachedTreeServes(r.Context(), cacheKey, treeCheck)
+	}
+	// The fetch is shared with concurrent callers and runs detached from this
+	// request, so it is bounded by the upstream timeout, not by ours. Wait
+	// for it only up to the probe timeout; it finishes in the background,
+	// records its own outcome and fills the cache for the next probe.
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- h.probeSumDB(context.WithoutCancel(r.Context()), name, cacheKey, sumDBURL, treeCheck)
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(h.sumDBProbes.probeTimeout()):
+		err = fmt.Errorf("no answer within %s", h.sumDBProbes.probeTimeout())
+		h.sumDBProbes.recordTimeout(name, start)
+	case <-r.Context().Done():
 		// The client went away; that says nothing about the database.
 		return false
 	}
-	h.sumDBProbes.record(name, err == nil)
-	if err != nil {
-		h.proxy.Logger.Info("checksum database unreachable, sending go clients to it directly",
-			"name", name, "url", sumDBURL, "error", err)
+	if err == nil {
+		return true
 	}
-	return err == nil
+	// The stale-cache fallback inside the fetch only runs once upstream has
+	// failed, which a silent database delays past the probe timeout. A tree
+	// cached earlier may still serve lookups, so look for it here.
+	if h.cachedTreeServes(r.Context(), cacheKey, treeCheck) {
+		return true
+	}
+	h.proxy.Logger.Info("checksum database unreachable, sending go clients to it directly",
+		"name", name, "url", sumDBURL, "error", err)
+	return false
+}
+
+// probeSumDB fetches the database's latest tree and records whether the
+// database answered. A tree served from the cache within its TTL counts as
+// an answer; one served because upstream failed does not.
+func (h *GoHandler) probeSumDB(ctx context.Context, name, cacheKey, sumDBURL string, check func([]byte) error) error {
+	res := h.proxy.lookupMetadata(ctx, goEcosystem, cacheKey, sumDBURL+"/latest", "*/*", "identity", check)
+	err := res.err
+	if err == nil && res.stale {
+		err = errors.New("checksum database did not answer, tree served from cache")
+	}
+	h.sumDBProbes.record(name, err == nil)
+	return err
+}
+
+// cachedTreeServes reports whether a cached tree lets the proxy answer for
+// the database although the database did not: only while the tree is fresh,
+// so clients fall back to the database once the proxy has lost it.
+func (h *GoHandler) cachedTreeServes(ctx context.Context, cacheKey string, check func([]byte) error) bool {
+	entry, _, _, ok := h.readCachedSumDB(ctx, cacheKey, check)
+	return ok && h.treeFresh(entry)
+}
+
+// treeFresh reports whether a cached tree is within the metadata TTL.
+func (h *GoHandler) treeFresh(entry *database.MetadataCacheEntry) bool {
+	ttl := h.proxy.MetadataTTL
+	return ttl > 0 && entry.FetchedAt.Valid && time.Since(entry.FetchedAt.Time) < ttl
+}
+
+// readCachedSumDB reads a checksum database response from the metadata
+// cache regardless of its age. It reports false when nothing usable is
+// cached.
+func (h *GoHandler) readCachedSumDB(ctx context.Context, cacheKey string, check func([]byte) error) (entry *database.MetadataCacheEntry, body []byte, contentType string, ok bool) {
+	p := h.proxy
+	if !p.CacheMetadata || p.DB == nil {
+		return nil, nil, "", false
+	}
+	entry, err := p.DB.GetMetadataCache(goEcosystem, cacheKey)
+	if err != nil || entry == nil {
+		return nil, nil, "", false
+	}
+	body, contentType, err = p.readCachedMetadata(ctx, entry, check)
+	if err != nil {
+		return nil, nil, "", false
+	}
+	return entry, body, contentType, true
 }
 
 // parseGoSumDBPath reports whether path is a request the checksum database
@@ -152,13 +254,38 @@ func parseGoSumDBPath(path string) (immutable, valid bool) {
 	return tile.W == 1<<tile.H, true
 }
 
-// goSumDBTileCheck returns a check for a tile response, or nil when path is
-// not a tile. A hash tile holds exactly W hashes, so a body of any other size
-// (an error page from a proxy in between, a cut-off response) is refused
-// rather than cached; complete tiles are never revalidated, so a bad one
-// would otherwise stay. Data tiles have no fixed size and only must not be
-// empty.
-func goSumDBTileCheck(path string) func([]byte) error {
+// goSumDBTreePrefix starts every signed tree a checksum database serves, as
+// latest and after each lookup record (tlog.FormatTree).
+const goSumDBTreePrefix = "go.sum database tree\n"
+
+// goSumDBResponseCheck returns a check for a response to path, or nil when
+// path is not one the protocol defines. A 200 that is not what the protocol
+// defines (a block page from an egress proxy, a cut-off response) is refused
+// rather than cached. latest must look like a signed tree, since supported
+// counts it as proof the database is reachable. A lookup must be a record
+// followed by a signed tree, which is how the go command reads it; a block
+// page cached in its place would also replace the copy kept for an outage.
+// A hash tile holds exactly W hashes, and complete tiles are never
+// revalidated, so a bad one would otherwise stay for good. Data tiles have no
+// fixed size and only must not be empty.
+func goSumDBResponseCheck(path string) func([]byte) error {
+	if path == "latest" {
+		return func(body []byte) error {
+			if !strings.HasPrefix(string(body), goSumDBTreePrefix) {
+				return errors.New("checksum database latest is not a signed tree")
+			}
+			return nil
+		}
+	}
+	if strings.HasPrefix(path, "lookup/") {
+		return func(body []byte) error {
+			_, _, tree, err := tlog.ParseRecord(body)
+			if err != nil || !strings.HasPrefix(string(tree), goSumDBTreePrefix) {
+				return fmt.Errorf("checksum database lookup %s is not a record with a signed tree", path)
+			}
+			return nil
+		}
+	}
 	tile, err := tlog.ParseTilePath(path)
 	if err != nil {
 		return nil
@@ -202,16 +329,8 @@ func goSumDBCacheKey(name, sumDBURL, path string) string {
 // served false when the tile is not cached, and damaged as well when the
 // cached copy fails check.
 func (h *GoHandler) serveCachedSumDBTile(w http.ResponseWriter, r *http.Request, cacheKey string, check func([]byte) error) (served, damaged bool) {
-	p := h.proxy
-	if !p.CacheMetadata || p.DB == nil {
-		return false, false
-	}
-	entry, err := p.DB.GetMetadataCache(goEcosystem, cacheKey)
-	if err != nil || entry == nil {
-		return false, false
-	}
-	body, contentType, err := p.readCachedMetadata(r.Context(), entry, nil)
-	if err != nil {
+	entry, body, contentType, ok := h.readCachedSumDB(r.Context(), cacheKey, nil)
+	if !ok {
 		return false, false
 	}
 	if check != nil && check(body) != nil {

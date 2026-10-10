@@ -1297,7 +1297,7 @@ func (p *Proxy) fetchMetadataFromUpstream(ctx context.Context, ecosystem, cacheK
 
 	p.Logger.Info("serving metadata from cache",
 		"ecosystem", ecosystem, "key", cacheKey)
-	return metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String}.describedBy(entry)
+	return metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String, stale: true}.describedBy(entry)
 }
 
 // metadataResult is what a metadata lookup hands back. A shared fetch gives
@@ -1310,6 +1310,9 @@ type metadataResult struct {
 	// empty otherwise.
 	digest string
 	err    error
+	// stale is set when the body is the cached copy served because upstream
+	// failed.
+	stale bool
 }
 
 // describedBy returns res with the digest that entry, the cache row its body
