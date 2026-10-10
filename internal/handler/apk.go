@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
@@ -17,6 +20,24 @@ const (
 	defaultAPKUpstream = "https://dl-cdn.alpinelinux.org/alpine"
 	apkMatchCount      = 3 // full match + name + version
 )
+
+// Packages are stored as pkg:apk/alpine/{name}, the namespace purl gives
+// every apk package, whichever configured repository they came from. Package
+// rules may leave the namespace out.
+func init() {
+	retention.Default.Register(retention.Spec{Key: apkEcosystem, CanonicalPackage: apkRetentionKey})
+}
+
+// apkRetentionKey maps pkg:apk/{name} and pkg:apk/alpine/{name} to the stored
+// package PURL. Another namespace, or a name with a slash, can never match a
+// stored package and is refused.
+func apkRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil || p.Type != "apk" || (p.Namespace != "" && p.Namespace != "alpine") || strings.Contains(p.Name, "/") {
+		return "", false
+	}
+	canonical := purl.MakePURLString(apkEcosystem, p.Name, "")
+	return canonical, canonical != ""
+}
 
 // APKHandler handles Alpine APK repository protocol requests. Each configured
 // upstream repository is mounted at /apk/{repository}/ and the remaining path
