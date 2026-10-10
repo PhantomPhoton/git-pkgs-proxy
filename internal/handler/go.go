@@ -32,6 +32,7 @@ type GoHandler struct {
 	upstreamURL string
 	proxyURL    string
 	sumDBs      map[string]string
+	sumDBProbes goSumDBProbes
 }
 
 // NewGoHandler creates a new Go module proxy handler.

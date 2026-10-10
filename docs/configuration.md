@@ -512,6 +512,12 @@ so the `go` command falls back to contacting that database itself. When
 `upstream.go_sumdbs` is empty, `sum.golang.org` is served; configuring any
 entry replaces that default.
 
+Once the proxy says it serves a database, the `go` command no longer contacts
+that database directly. The proxy therefore only says so when it can fetch the
+database's latest signed tree, or has it cached. If it cannot, it answers 404
+as for an unknown name, and clients go to the database themselves. After a
+failed check the proxy waits a minute before it tries the database again.
+
 With `cache_metadata` enabled, lookups, partial tiles and the latest signed
 tree follow `metadata_ttl` and are served from cache when the database is
 unreachable. Complete tiles never change and are not revalidated once cached.

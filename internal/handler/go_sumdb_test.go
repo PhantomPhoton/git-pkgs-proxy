@@ -94,19 +94,22 @@ func serveGoRequest(h *GoHandler, target string) *httptest.ResponseRecorder {
 	return w
 }
 
+func TestGoSumDB_DefaultsToSumGolangOrg(t *testing.T) {
+	h := NewGoHandler(nil, "http://proxy.example")
+	if got := h.sumDBs[defaultGoSumDBName]; got != defaultGoSumDBURL {
+		t.Errorf("default checksum database = %q, want %q", got, defaultGoSumDBURL)
+	}
+	h.SetSumDBs(nil)
+	if got := h.sumDBs[defaultGoSumDBName]; got != defaultGoSumDBURL || len(h.sumDBs) != 1 {
+		t.Errorf("SetSumDBs(nil) = %v, want only the default", h.sumDBs)
+	}
+}
+
 func TestGoSumDB_SupportedProbe(t *testing.T) {
-	t.Run("default database", func(t *testing.T) {
-		proxy, _, _, _ := setupTestProxy(t)
-		h := NewGoHandler(proxy, "http://proxy.example")
-		if w := serveGoRequest(h, "/sumdb/sum.golang.org/supported"); w.Code != http.StatusOK {
-			t.Errorf("supported for default sum.golang.org: status = %d, want 200", w.Code)
-		}
-	})
+	db := newFakeSumDB(t, map[string]string{"/latest": "signed tree"})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
 
-	t.Run("configured databases replace the default", func(t *testing.T) {
-		db := newFakeSumDB(t, nil)
-		h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
-
+	for range 2 {
 		for target, want := range map[string]int{
 			"/sumdb/sum.example/supported":    http.StatusOK,
 			"/sumdb/sum.golang.org/supported": http.StatusNotFound,
@@ -116,10 +119,47 @@ func TestGoSumDB_SupportedProbe(t *testing.T) {
 				t.Errorf("%s: status = %d, want %d", target, w.Code, want)
 			}
 		}
-		if n := db.totalRequests(); n != 0 {
-			t.Errorf("upstream requests = %d, want 0: supported is answered by the proxy", n)
-		}
-	})
+	}
+	if n := db.totalRequests(); n != 1 {
+		t.Errorf("upstream requests = %d, want 1: the probe fetches latest once, then uses the cache", n)
+	}
+}
+
+// TestGoSumDB_SupportedFallsBackWhenUnreachable covers the go command's only
+// way back to the database: once supported answers 200 it never contacts the
+// database directly, so a database the proxy cannot reach must get 404.
+func TestGoSumDB_SupportedFallsBackWhenUnreachable(t *testing.T) {
+	for _, cacheMetadata := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cache_metadata=%v", cacheMetadata), func(t *testing.T) {
+			db := newFakeSumDB(t, map[string]string{"/latest": "signed tree"})
+			db.down.Store(true)
+			h := newSumDBTestHandler(t, db.server.URL, cacheMetadata, time.Hour)
+
+			for i := range 2 {
+				if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusNotFound {
+					t.Fatalf("request %d: status = %d, want 404", i, w.Code)
+				}
+			}
+			if n := db.requests("/latest"); n != 1 {
+				t.Errorf("probes = %d, want 1: a failed probe is not repeated within %s", n, goSumDBProbeBackoff)
+			}
+		})
+	}
+}
+
+// TestGoSumDB_SupportedWithCachedTreeWhileUnreachable keeps the offline case:
+// a proxy that has served the database before can still serve it from cache.
+func TestGoSumDB_SupportedWithCachedTreeWhileUnreachable(t *testing.T) {
+	db := newFakeSumDB(t, map[string]string{"/latest": "signed tree"})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Nanosecond)
+
+	if w := serveGoRequest(h, "/sumdb/sum.example/latest"); w.Code != http.StatusOK {
+		t.Fatalf("latest: status = %d, want 200", w.Code)
+	}
+	db.down.Store(true)
+	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusOK {
+		t.Errorf("supported with a cached tree: status = %d, want 200", w.Code)
+	}
 }
 
 func TestGoSumDB_RequestsGoToTheDatabase(t *testing.T) {

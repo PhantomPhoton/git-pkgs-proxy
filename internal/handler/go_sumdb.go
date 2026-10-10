@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"golang.org/x/mod/module"
@@ -20,7 +22,39 @@ const (
 	defaultGoSumDBName = "sum.golang.org"
 	defaultGoSumDBURL  = "https://sum.golang.org"
 	goEcosystem        = "golang"
+
+	// goSumDBProbeBackoff is how long supported keeps answering 404 after the
+	// proxy failed to reach a checksum database, before it tries again.
+	goSumDBProbeBackoff = time.Minute
 )
+
+// goSumDBProbes remembers when the proxy last failed to reach each checksum
+// database, so a database that is unreachable does not make every go command
+// wait for an upstream timeout before it falls back.
+type goSumDBProbes struct {
+	mu     sync.Mutex
+	failed map[string]time.Time
+}
+
+func (p *goSumDBProbes) recentlyFailed(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	failedAt, ok := p.failed[name]
+	return ok && time.Since(failedAt) < goSumDBProbeBackoff
+}
+
+func (p *goSumDBProbes) record(name string, reachable bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if reachable {
+		delete(p.failed, name)
+		return
+	}
+	if p.failed == nil {
+		p.failed = make(map[string]time.Time)
+	}
+	p.failed[name] = time.Now()
+}
 
 // SetSumDBs sets the checksum databases served at /sumdb/{name}/, mapping
 // each database name to its base URL. An empty map keeps the default,
@@ -49,7 +83,11 @@ func (h *GoHandler) handleSumDB(w http.ResponseWriter, r *http.Request, rest str
 		return
 	}
 	if path == "supported" {
-		w.WriteHeader(http.StatusOK)
+		if h.sumDBReachable(r, name, sumDBURL) {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.NotFound(w, r)
+		}
 		return
 	}
 	immutable, valid := parseGoSumDBPath(path)
@@ -63,6 +101,30 @@ func (h *GoHandler) handleSumDB(w http.ResponseWriter, r *http.Request, rest str
 		return
 	}
 	h.proxySumDB(w, r, sumDBURL+"/"+path, cacheKey)
+}
+
+// sumDBReachable reports whether the proxy can serve a checksum database: it
+// can fetch the latest signed tree, or has it cached. Once supported answers
+// 200 the go command uses only the proxy for that database and never falls
+// back to contacting it directly, so a database the proxy cannot reach gets
+// 404 instead. The probe goes through the same cache entry as a latest
+// request, so it costs at most one upstream request per metadata TTL.
+func (h *GoHandler) sumDBReachable(r *http.Request, name, sumDBURL string) bool {
+	if h.sumDBProbes.recentlyFailed(name) {
+		return false
+	}
+	cacheKey := goSumDBCacheKey(name, sumDBURL, "latest")
+	_, _, _, err := h.proxy.fetchOrCacheMetadata(r.Context(), goEcosystem, cacheKey, sumDBURL+"/latest", "identity", nil, "*/*")
+	if err != nil && r.Context().Err() != nil {
+		// The client went away; that says nothing about the database.
+		return false
+	}
+	h.sumDBProbes.record(name, err == nil)
+	if err != nil {
+		h.proxy.Logger.Info("checksum database unreachable, sending go clients to it directly",
+			"name", name, "url", sumDBURL, "error", err)
+	}
+	return err == nil
 }
 
 // parseGoSumDBPath reports whether path is a request the checksum database
