@@ -7,11 +7,23 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
 	gemUpstream = "https://rubygems.org"
 )
+
+// Gems are stored under pkg:gem/{name} with the name from the gem filename,
+// and purl keeps gem names as they are, so package rules use the default
+// key mapping. parseGemFilename splits at the last hyphen before a digit,
+// so a platform like universal-darwin-22 lands under a wrong package name
+// that package rules don't reach. The spec also claims the "rubygems"
+// spelling git-pkgs writes into packages.ecosystem.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "gem", CanonicalPackage: retention.DefaultCanonical("gem")})
+}
 
 // GemHandler handles RubyGems registry protocol requests.
 type GemHandler struct {
