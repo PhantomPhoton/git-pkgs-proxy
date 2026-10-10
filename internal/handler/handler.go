@@ -1101,6 +1101,20 @@ func JSONError(w http.ResponseWriter, status int, message string) {
 // ErrUpstreamNotFound indicates the upstream returned 404.
 var ErrUpstreamNotFound = fmt.Errorf("upstream: %w", fetch.ErrNotFound)
 
+// upstreamNotFoundBodyLimit caps the part of an upstream 404 body kept in
+// upstreamNotFoundError.
+const upstreamNotFoundBodyLimit = 4 << 10
+
+// upstreamNotFoundError is ErrUpstreamNotFound with the start of the
+// upstream's 404 body, for handlers that relay the reason to clients.
+type upstreamNotFoundError struct {
+	body []byte
+}
+
+func (e *upstreamNotFoundError) Error() string { return ErrUpstreamNotFound.Error() }
+
+func (e *upstreamNotFoundError) Unwrap() error { return ErrUpstreamNotFound }
+
 // ErrArtifactBlocked indicates a pre-cache security scan blocked the artifact.
 var ErrArtifactBlocked = errors.New("artifact blocked by security scan")
 
@@ -1461,7 +1475,8 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrUpstreamNotFound
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamNotFoundBodyLimit))
+		return nil, &upstreamNotFoundError{body: body}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)

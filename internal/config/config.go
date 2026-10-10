@@ -573,6 +573,13 @@ type UpstreamConfig struct {
 	// Default: https://proxy.golang.org
 	Go string `json:"go" yaml:"go"`
 
+	// GoSumDBs maps Go checksum database names to their base URLs, served at
+	// /go/sumdb/{name}/ so the go command reaches the database through
+	// GOPROXY. Unknown names get 404, which makes the go command contact the
+	// database directly.
+	// Default when empty: {"sum.golang.org": "https://sum.golang.org"}.
+	GoSumDBs map[string]string `json:"go_sumdbs" yaml:"go_sumdbs"`
+
 	// Hex is the upstream Hex repository URL.
 	// Default: https://repo.hex.pm
 	Hex string `json:"hex" yaml:"hex"`
@@ -771,6 +778,9 @@ func (u *UpstreamConfig) Validate() error {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.arch", u.Arch); err != nil {
+		return err
+	}
+	if err := validateNamedUpstreams("upstream.go_sumdbs", u.GoSumDBs); err != nil {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.oci", u.OCI); err != nil {

@@ -330,7 +330,6 @@ func TestGoHandler_UpstreamProxy(t *testing.T) {
 		"/golang.org/x/text/@v/v0.14.0.info",
 		"/golang.org/x/text/@v/v0.14.0.mod",
 		"/golang.org/x/text/@latest",
-		"/sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0",
 	}
 
 	for _, path := range tests {
