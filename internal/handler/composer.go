@@ -144,7 +144,7 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	rewritten, etag, err := h.proxy.cachedRewrite(r.Context(), "composer", h.proxyURL, cacheKey, upstream.body, upstream.digest, h.rewriteMetadataKeeping)
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "composer", h.proxyURL, cacheKey, upstream.body, upstream.digest, h.rewriteMetadataKeeping)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return // the client left while waiting on a shared rewrite
@@ -155,7 +155,7 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	serveRewrittenMetadata(w, r, h.proxy.rewrittenMetadataFor(rewritten, etag, upstream.lastModified))
+	serveRewrittenMetadata(w, r, rewritten)
 }
 
 // rewriteMetadata rewrites dist URLs in Composer metadata to point at this proxy.
