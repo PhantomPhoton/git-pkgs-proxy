@@ -6,12 +6,31 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
 	nugetUpstream       = "https://api.nuget.org"
 	nugetSearchUpstream = "https://azuresearch-usnc.nuget.org"
 )
+
+// Packages are stored under pkg:nuget/{id} with the id lowercased, since
+// NuGet ids are case-insensitive. purl keeps nuget names as written, so
+// package rules are lowercased the same way before the default mapping.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "nuget", CanonicalPackage: nugetRetentionKey})
+}
+
+// nugetRetentionKey maps a package rule to the stored package PURL, so
+// pkg:nuget/Newtonsoft.Json matches the stored pkg:nuget/newtonsoft.json.
+func nugetRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	return retention.DefaultCanonical("nuget")(purl.New(p.Type, p.Namespace, strings.ToLower(p.Name), "", nil))
+}
 
 // NuGetHandler handles NuGet V3 API protocol requests.
 type NuGetHandler struct {

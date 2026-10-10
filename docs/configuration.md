@@ -102,7 +102,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `julia` | no | - |
 | `maven` | yes | `pkg:maven/com.google.guava/guava`, group and artifact as published, case included. Gradle build cache entries are not covered; they use `gradle.build_cache.max_age`. |
 | `npm` | yes | `pkg:npm/lodash`, `pkg:npm/@babel/core`; the name has to match exactly, case included, so `pkg:npm/jsonstream` doesn't cover `JSONStream`. |
-| `nuget` | no | - |
+| `nuget` | yes | `pkg:nuget/Newtonsoft.Json`; case doesn't matter. Give `proxy mirror` lowercase ids (`pkg:nuget/newtonsoft.json@13.0.3`): a mixed-case id is stored as a separate copy that clients are never served, so mirroring it doesn't keep their copy from aging out. |
 | `oci` | yes | `pkg:oci/library/nginx`, the repository name of the pull. A named upstream keeps its prefix, also when containerd reaches it through `ns`: `ghcr.io/owner/app` pulled that way is `pkg:oci/upstream/ghcr/owner/app`. Homebrew bottles use Homebrew's image name, with `@` written as `/` and `+` as `x` (`openssl@3` is `pkg:oci/homebrew/core/openssl/3`). Helm charts pulled over OCI are stored like images. Only blobs are evicted; manifests stay in the metadata cache. |
 | `pub` | no | - |
 | `pypi` | yes | `pkg:pypi/requests`; case and single `_`/`-` don't matter. Dots and repeated separators are kept as written, so a project like `zope.interface` can be stored as `zope.interface` and `zope-interface`; add a rule for each. |
