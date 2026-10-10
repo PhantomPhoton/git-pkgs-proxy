@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/git-pkgs/cooldown"
+	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -977,5 +978,32 @@ func TestComposerRewriteMetadataCooldown(t *testing.T) {
 	v := versions[0].(map[string]any)
 	if v["version"] != "5.0.0" {
 		t.Errorf("expected version 5.0.0, got %v", v["version"])
+	}
+}
+
+func TestComposerRetentionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"pkg:composer/symfony/console", "pkg:composer/symfony/console", true},
+		{"pkg:composer/Symfony/Console", "pkg:composer/symfony/console", true},
+		{"pkg:composer/console", "", false},
+		{"pkg:composer/symfony/console/extra", "", false},
+		{"pkg:npm/symfony/console", "", false},
+	}
+	for _, tt := range tests {
+		p, err := purl.Parse(tt.key)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tt.key, err)
+		}
+		got, ok := composerRetentionKey(p)
+		if ok != tt.ok || (ok && got != tt.want) {
+			t.Errorf("composerRetentionKey(%s) = %q, %v, want %q, %v", tt.key, got, ok, tt.want, tt.ok)
+		}
+	}
+	if _, ok := composerRetentionKey(nil); ok {
+		t.Error("composerRetentionKey(nil) accepted")
 	}
 }

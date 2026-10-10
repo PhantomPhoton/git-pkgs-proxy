@@ -13,6 +13,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
@@ -26,6 +29,24 @@ const (
 )
 
 var composerUnsetJSON = []byte(`"` + composerUnset + `"`)
+
+// Archives are stored under pkg:composer/{vendor}/{package}, which purl
+// lowercases, so a package rule matches whatever case it is written in. The
+// spec also claims the "packagist" spelling git-pkgs writes into
+// packages.ecosystem.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "composer", CanonicalPackage: composerRetentionKey})
+}
+
+// composerRetentionKey maps a package rule to the stored package PURL. A
+// key without a vendor parses fine but can never match, since every stored
+// package has one, so it is refused.
+func composerRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil || p.Namespace == "" {
+		return "", false
+	}
+	return retention.DefaultCanonical("composer")(p)
+}
 
 // ComposerHandler handles Composer/Packagist registry protocol requests.
 type ComposerHandler struct {
