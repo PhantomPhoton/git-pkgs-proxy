@@ -522,9 +522,11 @@ With `cache_metadata` enabled, lookups, partial tiles and the latest signed
 tree follow `metadata_ttl` and are served from cache when the database is
 unreachable. Complete tiles never change and are not revalidated once cached;
 a tile of the wrong size is refused and not stored.
-Without `cache_metadata` the requests are forwarded and nothing is stored. A
-404 from the database keeps its text (up to 4 KiB), which the `go` command
-prints to explain why a version is missing.
+Without `cache_metadata` the requests are forwarded and nothing is stored.
+
+A 404 from the database keeps its text, which the `go` command prints to
+explain why a version is missing. With `cache_metadata` enabled the text is
+cut at 4 KiB; without it the response is passed on unchanged.
 
 If `upstream.go` points at a module proxy that serves the checksum database
 itself, such as Athens, point the entry there instead, for example
