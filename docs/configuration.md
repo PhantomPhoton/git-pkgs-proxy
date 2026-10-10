@@ -92,7 +92,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `cargo` | yes | `pkg:cargo/serde`, the crate name as published; case, `-` and `_` have to match, so `pkg:cargo/inflector` doesn't cover `Inflector`. |
 | `composer` | yes | `pkg:composer/symfony/console`; case doesn't matter. A key without a vendor is refused. |
 | `conan` | yes | `pkg:conan/zlib`, the recipe name; a rule covers every version, revision and user/channel of it. |
-| `conda` | no | - |
+| `conda` | yes | `pkg:conda/conda-forge/numpy`, with the channel as the namespace; the package name's case doesn't matter. A key without a channel is refused. |
 | `cran` | yes | `pkg:cran/ggplot2`, the package name as published, case included (`pkg:cran/Rcpp`). A rule covers source and binary builds alike. |
 | `deb` | no | - |
 | `gem` | no | - |
