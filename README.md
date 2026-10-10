@@ -202,6 +202,13 @@ export GOPROXY=http://localhost:8080/go,direct
 
 Or in your shell profile for persistence.
 
+Checksum lookups go through the same URL: the proxy serves `sum.golang.org` at
+`/go/sumdb/sum.golang.org/`, and the `go` command uses it without further
+setup, so clients need no route of their own to `sum.golang.org`. The proxy
+itself needs to reach `https://sum.golang.org`. Other checksum databases are
+listed under `upstream.go_sumdbs`, see
+[Go checksum database](docs/configuration.md#go-checksum-database).
+
 ### Homebrew
 
 Point Homebrew's JSON API and artifact domain at the proxy:

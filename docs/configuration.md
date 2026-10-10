@@ -495,6 +495,34 @@ When `upstream.arch` is empty, a single repository named `archlinux` pointing at
 that default. Arch Linux ARM has no default: pick a regional HTTPS mirror, not
 the `mirror.archlinuxarm.org` redirector.
 
+### Go checksum database
+
+```yaml
+upstream:
+
+  # Named Go checksum databases, served at /go/sumdb/{name}/.
+  go_sumdbs:
+    sum.golang.org: "https://sum.golang.org"
+```
+
+The `go` command asks `GOPROXY` for the checksum database before contacting it
+directly. The proxy answers for every name listed here and fetches lookups and
+tiles from the database's URL, not from `upstream.go`. Unknown names get 404,
+so the `go` command falls back to contacting that database itself. When
+`upstream.go_sumdbs` is empty, `sum.golang.org` is served; configuring any
+entry replaces that default.
+
+With `cache_metadata` enabled, lookups, partial tiles and the latest signed
+tree follow `metadata_ttl` and are served from cache when the database is
+unreachable. Complete tiles never change and are not revalidated once cached.
+Without `cache_metadata` the requests are forwarded and nothing is stored. A
+404 from the database keeps its text (up to 4 KiB), which the `go` command
+prints to explain why a version is missing.
+
+If `upstream.go` points at a module proxy that serves the checksum database
+itself, such as Athens, point the entry there instead, for example
+`sum.golang.org: "https://athens.example/sumdb/sum.golang.org"`.
+
 ### Debian archives
 
 ```yaml
