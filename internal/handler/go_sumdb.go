@@ -78,9 +78,10 @@ func (p *goSumDBProbes) record(name string, reachable bool) {
 	p.failed[name] = time.Now()
 }
 
-// recordTimeout records a failure for a probe started at start, unless the
-// fetch it gave up waiting for has succeeded in the meantime.
-func (p *goSumDBProbes) recordTimeout(name string, start time.Time) {
+// recordFailure records that the database did not answer a request started
+// at start, unless a probe has reached it since: a probe that timed out, or
+// a lookup that fell back to the cache, must not overwrite a newer success.
+func (p *goSumDBProbes) recordFailure(name string, start time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.succeeded[name].Before(start) {
@@ -94,8 +95,11 @@ func (p *goSumDBProbes) recordTimeout(name string, start time.Time) {
 
 // SetSumDBs sets the checksum databases served at /sumdb/{name}/, mapping
 // each database name to its base URL. An empty map keeps the default,
-// sum.golang.org.
-func (h *GoHandler) SetSumDBs(sumDBs map[string]string) {
+// sum.golang.org. offline makes a cached tree of any age enough to keep
+// answering for a database the proxy cannot reach, for networks where
+// clients have no route to the database of their own.
+func (h *GoHandler) SetSumDBs(sumDBs map[string]string, offline bool) {
+	h.sumDBOffline = offline
 	if len(sumDBs) == 0 {
 		h.sumDBs = map[string]string{defaultGoSumDBName: defaultGoSumDBURL}
 		return
@@ -141,7 +145,7 @@ func (h *GoHandler) handleSumDB(w http.ResponseWriter, r *http.Request, rest str
 	if served {
 		return
 	}
-	h.proxySumDB(w, r, sumDBURL+"/"+path, cacheKey, check, damaged)
+	h.proxySumDB(w, r, name, sumDBURL+"/"+path, cacheKey, check, damaged)
 }
 
 // sumDBReachable reports whether the proxy can serve a checksum database: it
@@ -171,7 +175,7 @@ func (h *GoHandler) sumDBReachable(r *http.Request, name, sumDBURL string) bool 
 	case err = <-done:
 	case <-time.After(h.sumDBProbes.probeTimeout()):
 		err = fmt.Errorf("no answer within %s", h.sumDBProbes.probeTimeout())
-		h.sumDBProbes.recordTimeout(name, start)
+		h.sumDBProbes.recordFailure(name, start)
 	case <-r.Context().Done():
 		// The client went away; that says nothing about the database.
 		return false
@@ -204,11 +208,11 @@ func (h *GoHandler) probeSumDB(ctx context.Context, name, cacheKey, sumDBURL str
 }
 
 // cachedTreeServes reports whether a cached tree lets the proxy answer for
-// the database although the database did not: only while the tree is fresh,
-// so clients fall back to the database once the proxy has lost it.
+// the database although the database did not: always with go_sumdbs_offline,
+// otherwise only while the tree is fresh.
 func (h *GoHandler) cachedTreeServes(ctx context.Context, cacheKey string, check func([]byte) error) bool {
 	entry, _, _, ok := h.readCachedSumDB(ctx, cacheKey, check)
-	return ok && h.treeFresh(entry)
+	return ok && (h.sumDBOffline || h.treeFresh(entry))
 }
 
 // treeFresh reports whether a cached tree is within the metadata TTL.
@@ -360,15 +364,31 @@ func (h *GoHandler) serveCachedSumDBTile(w http.ResponseWriter, r *http.Request,
 // go command prints it, and it says why a module version is missing. check,
 // when set, must accept a response before it is cached or served. damaged
 // says the cached copy failed check.
-func (h *GoHandler) proxySumDB(w http.ResponseWriter, r *http.Request, upstreamURL, cacheKey string, check func([]byte) error, damaged bool) {
+func (h *GoHandler) proxySumDB(w http.ResponseWriter, r *http.Request, name, upstreamURL, cacheKey string, check func([]byte) error, damaged bool) {
 	p := h.proxy
 	if !p.CacheMetadata {
 		p.proxyMetadataStream(w, r, upstreamURL, "identity", "*/*")
 		return
 	}
+	// While the database is known to be unreachable, offline mode serves
+	// the cached copy at once rather than letting every request wait for
+	// the upstream timeout before the fetch falls back to it.
+	if h.sumDBOffline && h.sumDBProbes.recentlyFailed(name) {
+		if entry, body, contentType, ok := h.readCachedSumDB(r.Context(), cacheKey, check); ok {
+			p.writeMetadataCachedResponseWithEncoding(w, r, goEcosystem, cacheKey, body, contentType, entry.ContentEncoding.String)
+			return
+		}
+	}
 
-	body, contentType, contentEncoding, err := h.fetchSumDB(r.Context(), upstreamURL, cacheKey, check, damaged)
-	if err != nil {
+	start := time.Now()
+	res := h.fetchSumDB(r.Context(), upstreamURL, cacheKey, check, damaged)
+	if res.stale {
+		// The database did not answer. Remember it here too: the go command
+		// asks supported only once per process, so a long build would lose
+		// the shortcut above a minute into an outage.
+		h.sumDBProbes.recordFailure(name, start)
+	}
+	if err := res.err; err != nil {
 		var notFound *upstreamNotFoundError
 		switch {
 		case errors.As(err, &notFound) && len(notFound.body) > 0:
@@ -385,18 +405,17 @@ func (h *GoHandler) proxySumDB(w http.ResponseWriter, r *http.Request, upstreamU
 		return
 	}
 
-	p.writeMetadataCachedResponseWithEncoding(w, r, goEcosystem, cacheKey, body, contentType, contentEncoding)
+	p.writeMetadataCachedResponseWithEncoding(w, r, goEcosystem, cacheKey, res.body, res.contentType, res.contentEncoding)
 }
 
 // fetchSumDB fetches a checksum database response through the metadata
 // cache. A cached copy that failed check is fetched again without
 // revalidating it: past the TTL, a database that sends an ETag would answer
 // 304 and hand back the damaged copy for good.
-func (h *GoHandler) fetchSumDB(ctx context.Context, upstreamURL, cacheKey string, check func([]byte) error, damaged bool) ([]byte, string, string, error) {
+func (h *GoHandler) fetchSumDB(ctx context.Context, upstreamURL, cacheKey string, check func([]byte) error, damaged bool) metadataResult {
 	p := h.proxy
 	if damaged {
-		res := p.fetchMetadataFromUpstream(ctx, goEcosystem, cacheKey, upstreamURL, "*/*", "identity", check, nil)
-		return res.body, res.contentType, res.contentEncoding, res.err
+		return p.fetchMetadataFromUpstream(ctx, goEcosystem, cacheKey, upstreamURL, "*/*", "identity", check, nil)
 	}
-	return p.fetchOrCacheMetadata(ctx, goEcosystem, cacheKey, upstreamURL, "identity", check, "*/*")
+	return p.lookupMetadata(ctx, goEcosystem, cacheKey, upstreamURL, "*/*", "identity", check)
 }

@@ -580,6 +580,14 @@ type UpstreamConfig struct {
 	// Default when empty: {"sum.golang.org": "https://sum.golang.org"}.
 	GoSumDBs map[string]string `json:"go_sumdbs" yaml:"go_sumdbs"`
 
+	// GoSumDBsOffline keeps answering for a checksum database from its
+	// cached signed tree, however old, when the database cannot be reached.
+	// Set this when clients have no route to the database of their own;
+	// otherwise the proxy stops answering once the cached tree is older than
+	// metadata_ttl, and the go command contacts the database directly.
+	// Requires cache_metadata. Default: false.
+	GoSumDBsOffline bool `json:"go_sumdbs_offline" yaml:"go_sumdbs_offline"`
+
 	// Hex is the upstream Hex repository URL.
 	// Default: https://repo.hex.pm
 	Hex string `json:"hex" yaml:"hex"`
@@ -819,6 +827,18 @@ func (u *UpstreamConfig) validateGenericArtifacts() error {
 				return fmt.Errorf("invalid upstream.generic_artifacts.%s pattern %q: %w", name, pattern, err)
 			}
 		}
+	}
+	return nil
+}
+
+// validateUpstream checks the upstream block, including the one setting in
+// it that depends on a top-level option.
+func (c *Config) validateUpstream() error {
+	if err := c.Upstream.Validate(); err != nil {
+		return err
+	}
+	if c.Upstream.GoSumDBsOffline && !c.CacheMetadata {
+		return fmt.Errorf("upstream.go_sumdbs_offline requires cache_metadata")
 	}
 	return nil
 }
@@ -1150,6 +1170,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvBool(&c.Upstream.AllowLoopback, "PROXY_UPSTREAM_ALLOW_LOOPBACK")
 	setEnvString(&c.Upstream.NPM, "PROXY_UPSTREAM_NPM")
 	setEnvBool(&c.Upstream.NPMFullMetadata, "PROXY_UPSTREAM_NPM_FULL_METADATA")
+	setEnvBool(&c.Upstream.GoSumDBsOffline, "PROXY_UPSTREAM_GO_SUMDBS_OFFLINE")
 	setEnvString(&c.Upstream.Cargo, "PROXY_UPSTREAM_CARGO")
 	setEnvString(&c.Upstream.CargoDownload, "PROXY_UPSTREAM_CARGO_DOWNLOAD")
 	setEnvString(&c.Upstream.Gem, "PROXY_UPSTREAM_GEM")
@@ -1325,7 +1346,7 @@ func (c *Config) validateComponents() error {
 		return err
 	}
 
-	if err := c.Upstream.Validate(); err != nil {
+	if err := c.validateUpstream(); err != nil {
 		return err
 	}
 

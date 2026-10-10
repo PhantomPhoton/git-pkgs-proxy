@@ -207,8 +207,9 @@ Checksum lookups go through the same URL: the proxy serves `sum.golang.org` at
 setup, so clients need no route of their own to `sum.golang.org`. If the
 proxy loses `https://sum.golang.org`, it keeps answering until its cached
 copy of the database's signed tree is older than `metadata_ttl`; after that
-the `go` command contacts the database directly as before. Other checksum
-databases are listed under `upstream.go_sumdbs`, see
+the `go` command contacts the database directly as before. Set
+`upstream.go_sumdbs_offline` on networks where clients cannot do that. Other
+checksum databases are listed under `upstream.go_sumdbs`, see
 [Go checksum database](docs/configuration.md#go-checksum-database).
 
 ### Homebrew

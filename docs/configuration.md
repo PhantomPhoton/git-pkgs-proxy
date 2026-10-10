@@ -233,6 +233,7 @@ Each upstream used by a built-in package route can be set in YAML or JSON under 
 | `upstream.allow_loopback` | `PROXY_UPSTREAM_ALLOW_LOOPBACK` | `false` |
 | `upstream.npm` | `PROXY_UPSTREAM_NPM` | `https://registry.npmjs.org` |
 | `upstream.npm_full_metadata` | `PROXY_UPSTREAM_NPM_FULL_METADATA` | `false` |
+| `upstream.go_sumdbs_offline` | `PROXY_UPSTREAM_GO_SUMDBS_OFFLINE` | `false` |
 | `upstream.cargo` | `PROXY_UPSTREAM_CARGO` | `https://index.crates.io` |
 | `upstream.cargo_download` | `PROXY_UPSTREAM_CARGO_DOWNLOAD` | `https://static.crates.io/crates` |
 | `upstream.gem` | `PROXY_UPSTREAM_GEM` | `https://rubygems.org` |
@@ -503,6 +504,11 @@ upstream:
   # Named Go checksum databases, served at /go/sumdb/{name}/.
   go_sumdbs:
     sum.golang.org: "https://sum.golang.org"
+
+  # Keep answering for a database from its cached tree, however old, when
+  # the database cannot be reached. For networks where clients have no
+  # route to the database of their own. Requires cache_metadata.
+  go_sumdbs_offline: false
 ```
 
 The `go` command asks `GOPROXY` for the checksum database before contacting it
@@ -519,6 +525,17 @@ database's latest signed tree, or has a fresh one cached (fetched within
 clients go to the database themselves, as they would without the proxy. The
 check waits five seconds at most, and after a failed check the proxy waits a
 minute before it tries the database again.
+
+Set `upstream.go_sumdbs_offline: true` when clients have no route to the
+database of their own. The proxy then keeps answering for it from the cached
+tree for as long as the outage lasts and serves cached lookups and tiles.
+That does not mean every cached module still verifies: the `go` command
+checks each lookup against tiles of the signed tree that came with it, the
+database attaches a different tree to almost every lookup, and a tile no
+client fetched through the proxy before cannot be served during the outage.
+Lookups for modules that were never cached fail as well. Builds whose
+`go.sum` already lists every module do not ask the database at all and are
+not affected. This requires `cache_metadata`.
 
 With `cache_metadata` enabled, lookups, partial tiles and the latest signed
 tree follow `metadata_ttl` and are served from cache when the database is

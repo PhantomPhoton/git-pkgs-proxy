@@ -28,11 +28,12 @@ func init() {
 
 // GoHandler handles Go module proxy protocol requests.
 type GoHandler struct {
-	proxy       *Proxy
-	upstreamURL string
-	proxyURL    string
-	sumDBs      map[string]string
-	sumDBProbes goSumDBProbes
+	proxy        *Proxy
+	upstreamURL  string
+	proxyURL     string
+	sumDBs       map[string]string
+	sumDBOffline bool
+	sumDBProbes  goSumDBProbes
 }
 
 // NewGoHandler creates a new Go module proxy handler.

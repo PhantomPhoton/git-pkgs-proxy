@@ -1638,6 +1638,21 @@ func TestValidateGoSumDBs(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "Go checksum database offline mode requires metadata caching",
+			modify: func(cfg *Config) {
+				cfg.CacheMetadata = false
+				cfg.Upstream.GoSumDBsOffline = true
+			},
+			wantErr: true,
+		},
+		{
+			name: "Go checksum database offline mode with metadata caching",
+			modify: func(cfg *Config) {
+				cfg.CacheMetadata = true
+				cfg.Upstream.GoSumDBsOffline = true
+			},
+		},
 	}
 
 	for _, tt := range tests {
