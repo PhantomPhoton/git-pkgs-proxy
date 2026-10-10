@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -257,4 +258,33 @@ func serveDebianRequest(h *DebianHandler, target string) *httptest.ResponseRecor
 	w := httptest.NewRecorder()
 	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
 	return w
+}
+
+func TestDebRetentionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"pkg:deb/curl", "pkg:deb/curl", true},
+		{"pkg:deb/debian/curl", "pkg:deb/curl", true},
+		{"pkg:deb/ubuntu/Curl", "pkg:deb/curl", true},
+		{"pkg:deb/debian/libstdc++6", "pkg:deb/libstdc%2B%2B6", true},
+		{"pkg:deb/debian/main/curl", "", false},
+		{"pkg:deb/debian/pool%2Fcurl", "", false},
+		{"pkg:apk/debian/curl", "", false},
+	}
+	for _, tt := range tests {
+		p, err := purl.Parse(tt.key)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tt.key, err)
+		}
+		got, ok := debRetentionKey(p)
+		if ok != tt.ok || (ok && got != tt.want) {
+			t.Errorf("debRetentionKey(%s) = %q, %v, want %q, %v", tt.key, got, ok, tt.want, tt.ok)
+		}
+	}
+	if _, ok := debRetentionKey(nil); ok {
+		t.Error("debRetentionKey(nil) accepted")
+	}
 }

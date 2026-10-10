@@ -8,12 +8,34 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
 	debianUpstream = "http://deb.debian.org/debian"
 	debMatchCount  = 4 // full match + name + version + arch
 )
+
+// Packages are stored as pkg:deb/{name}, without a vendor and whichever
+// configured archive they came from. Package rules may name a vendor the way
+// PURLs usually do, pkg:deb/debian/curl or pkg:deb/ubuntu/curl; it is dropped,
+// so the rule covers the package from every archive.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "deb", CanonicalPackage: debRetentionKey})
+}
+
+// debRetentionKey maps a package rule to the stored package PURL. A name with
+// a slash, or a namespace with more than one segment, can never match a stored
+// package and is refused.
+func debRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil || p.Type != "deb" || strings.Contains(p.Namespace, "/") || strings.Contains(p.Name, "/") {
+		return "", false
+	}
+	canonical := purl.MakePURLString("deb", p.Name, "")
+	return canonical, canonical != ""
+}
 
 // DebianHandler handles APT/Debian repository protocol requests.
 // It proxies requests to upstream Debian/Ubuntu repositories and caches .deb packages.
