@@ -98,7 +98,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `gem` | no | - |
 | `golang` | yes | `pkg:golang/github.com/stretchr/testify`, the module path as in `go.mod`; case doesn't matter. A major version like `/v2` (or `.v3` on gopkg.in) is a module of its own and needs its own rule. The `!`-escaped form from proxy URLs and the module cache (`github.com/!azure/...`) is refused. |
 | `helm` | yes | No package rules: charts are cached per repository and digest, not under the chart name. The `helm` rule and `default` cover charts from HTTP repositories; charts pulled over OCI fall under `oci`. |
-| `hex` | no | - |
+| `hex` | yes | `pkg:hex/phoenix`, the package name as published. Package rules don't reach versions like `4.1.5-1` or `0.1.0-dev-10` yet, which the proxy files under a wrong package name; the hex rule and `default` still cover them. |
 | `julia` | yes | No package rules: a julia PURL needs a `uuid` qualifier, which the cache doesn't store. The `julia` rule and `default` cover package tarballs, artifacts and registry snapshots alike. |
 | `maven` | yes | `pkg:maven/com.google.guava/guava`, group and artifact as published, case included. Gradle build cache entries are not covered; they use `gradle.build_cache.max_age`. |
 | `npm` | yes | `pkg:npm/lodash`, `pkg:npm/@babel/core`; the name has to match exactly, case included, so `pkg:npm/jsonstream` doesn't cover `JSONStream`. |

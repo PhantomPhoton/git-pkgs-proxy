@@ -10,12 +10,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/git-pkgs/proxy/internal/retention"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
 const (
 	hexUpstream = "https://repo.hex.pm"
 )
+
+// Tarballs are stored under pkg:hex/{name} with the name from the tarball
+// filename, and purl keeps hex names as they are, so package rules use the
+// default key mapping. parseTarballFilename splits at the last hyphen before
+// a digit, so a version like 4.1.5-1 lands under a wrong package name that
+// package rules don't reach.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "hex", CanonicalPackage: retention.DefaultCanonical("hex")})
+}
 
 // HexHandler handles Hex.pm registry protocol requests.
 type HexHandler struct {
