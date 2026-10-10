@@ -19,7 +19,13 @@ import (
 	"golang.org/x/mod/sumdb/tlog"
 )
 
-const testSumDBName = "sum.example"
+const (
+	testSumDBName = "sum.example"
+	// testSumDBTree looks like a signed tree as far as the proxy checks.
+	testSumDBTree = "go.sum database tree\n1\nhash\n\n— sum.example signature\n"
+	// testSumDBRecord looks like a lookup answer as far as the proxy checks.
+	testSumDBRecord = "1\ngolang.org/x/text v0.14.0 h1:hash=\ngolang.org/x/text v0.14.0/go.mod h1:hash=\n\n" + testSumDBTree
+)
 
 // hashTile returns a hash tile body of the given width.
 func hashTile(width int, fill string) string {
@@ -127,7 +133,7 @@ func TestGoSumDB_DefaultsToSumGolangOrg(t *testing.T) {
 }
 
 func TestGoSumDB_SupportedProbe(t *testing.T) {
-	db := newFakeSumDB(t, map[string]string{"/latest": "signed tree"})
+	db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
 	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
 
 	for range 2 {
@@ -144,6 +150,9 @@ func TestGoSumDB_SupportedProbe(t *testing.T) {
 	if n := db.totalRequests(); n != 1 {
 		t.Errorf("upstream requests = %d, want 1: the probe fetches latest once, then uses the cache", n)
 	}
+	if h.sumDBProbes.recentlyFailed(testSumDBName) {
+		t.Error("a probe served from the fresh cache was recorded as a failure")
+	}
 }
 
 // TestGoSumDB_SupportedFallsBackWhenUnreachable covers the go command's only
@@ -152,7 +161,7 @@ func TestGoSumDB_SupportedProbe(t *testing.T) {
 func TestGoSumDB_SupportedFallsBackWhenUnreachable(t *testing.T) {
 	for _, cacheMetadata := range []bool{true, false} {
 		t.Run(fmt.Sprintf("cache_metadata=%v", cacheMetadata), func(t *testing.T) {
-			db := newFakeSumDB(t, map[string]string{"/latest": "signed tree"})
+			db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
 			db.down.Store(true)
 			h := newSumDBTestHandler(t, db.server.URL, cacheMetadata, time.Hour)
 
@@ -171,15 +180,242 @@ func TestGoSumDB_SupportedFallsBackWhenUnreachable(t *testing.T) {
 // TestGoSumDB_SupportedWithCachedTreeWhileUnreachable keeps the offline case:
 // a proxy that has served the database before can still serve it from cache.
 func TestGoSumDB_SupportedWithCachedTreeWhileUnreachable(t *testing.T) {
-	db := newFakeSumDB(t, map[string]string{"/latest": "signed tree"})
+	t.Run("fresh tree", func(t *testing.T) {
+		db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
+		h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
+		if w := serveGoRequest(h, "/sumdb/sum.example/latest"); w.Code != http.StatusOK {
+			t.Fatalf("latest: status = %d, want 200", w.Code)
+		}
+		db.down.Store(true)
+		if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusOK {
+			t.Errorf("supported with a fresh cached tree: status = %d, want 200", w.Code)
+		}
+	})
+
+	// A stale tree does not count: clients that can reach the database
+	// themselves should go there.
+	t.Run("stale tree", func(t *testing.T) {
+		db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
+		h := newSumDBTestHandler(t, db.server.URL, true, time.Nanosecond)
+		if w := serveGoRequest(h, "/sumdb/sum.example/latest"); w.Code != http.StatusOK {
+			t.Fatalf("latest: status = %d, want 200", w.Code)
+		}
+		db.down.Store(true)
+		for i := range 2 { // second probe hits the remembered failure
+			if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusNotFound {
+				t.Errorf("probe %d: status = %d, want 404", i, w.Code)
+			}
+		}
+		if n := db.requests("/latest"); n != 2 {
+			t.Errorf("upstream requests = %d, want 2: the failure is remembered", n)
+		}
+	})
+}
+
+// TestGoSumDB_SupportedGivesUpOnSilentDatabase: a database that accepts the
+// connection but never answers (a firewall dropping packets) must not hold
+// the go command, which waits for supported without a timeout of its own.
+func TestGoSumDB_SupportedGivesUpOnSilentDatabase(t *testing.T) {
+	release := make(chan struct{})
+	db := newFakeSumDB(t, nil)
+	t.Cleanup(func() { close(release) }) // runs before the server closes
+	db.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
+	h.sumDBProbes.timeout = 50 * time.Millisecond
+
+	answered := make(chan *httptest.ResponseRecorder, 1)
+	go func() { answered <- serveGoRequest(h, "/sumdb/sum.example/supported") }()
+	select {
+	case w := <-answered:
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", w.Code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("supported still waiting for the database after a second")
+	}
+}
+
+// TestGoSumDB_SupportedWithStaleTreeWhileSilent: a silent database holds
+// the fetch past the probe timeout. The stale tree does not count, and the
+// second probe must answer at once from the remembered failure.
+func TestGoSumDB_SupportedWithStaleTreeWhileSilent(t *testing.T) {
+	release := make(chan struct{})
+	db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
+	t.Cleanup(func() { close(release) })
 	h := newSumDBTestHandler(t, db.server.URL, true, time.Nanosecond)
+	h.sumDBProbes.timeout = 50 * time.Millisecond
 
 	if w := serveGoRequest(h, "/sumdb/sum.example/latest"); w.Code != http.StatusOK {
 		t.Fatalf("latest: status = %d, want 200", w.Code)
 	}
-	db.down.Store(true)
+	db.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	})
+
+	for i := range 2 { // second probe hits the remembered failure
+		answered := make(chan *httptest.ResponseRecorder, 1)
+		go func() { answered <- serveGoRequest(h, "/sumdb/sum.example/supported") }()
+		select {
+		case w := <-answered:
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("probe %d: status = %d, want 404", i, w.Code)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("probe %d: supported still waiting after a second", i)
+		}
+	}
+}
+
+// TestGoSumDB_SlowProbeSuccessClearsFailure: a database that answers after
+// the probe timeout gets a 404 the first time, but once its answer is in
+// the cache, supported says yes without waiting for the next backoff.
+func TestGoSumDB_SlowProbeSuccessClearsFailure(t *testing.T) {
+	db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
+	inner := db.server.Config.Handler
+	db.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		inner.ServeHTTP(w, r)
+	})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
+	h.sumDBProbes.timeout = 10 * time.Millisecond
+
+	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusNotFound {
+		t.Fatalf("first probe: status = %d, want 404", w.Code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.sumDBProbes.recentlyFailed(testSumDBName) {
+		if time.Now().After(deadline) {
+			t.Fatal("the late fetch never cleared the failure")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusOK {
-		t.Errorf("supported with a cached tree: status = %d, want 200", w.Code)
+		t.Errorf("after the late answer: status = %d, want 200", w.Code)
+	}
+	if n := db.requests("/latest"); n != 1 {
+		t.Errorf("upstream requests = %d, want 1: the second probe is a cache hit", n)
+	}
+}
+
+// TestGoSumDB_StaleFallbackIsNotAnAnswer: the fetch reports no error when
+// it falls back to the cached tree after the database failed. That must
+// not count as the database answering, or the failure would be forgotten
+// and every probe would wait for the timeout again.
+func TestGoSumDB_StaleFallbackIsNotAnAnswer(t *testing.T) {
+	db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Nanosecond)
+	h.sumDBProbes.timeout = 10 * time.Millisecond
+
+	if w := serveGoRequest(h, "/sumdb/sum.example/latest"); w.Code != http.StatusOK {
+		t.Fatalf("latest: status = %d, want 200", w.Code)
+	}
+	inner := db.server.Config.Handler
+	db.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		inner.ServeHTTP(w, r)
+	})
+	db.down.Store(true)
+
+	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+	time.Sleep(300 * time.Millisecond) // the fetch has failed and fallen back by now
+	if !h.sumDBProbes.recentlyFailed(testSumDBName) {
+		t.Error("the stale fallback cleared the remembered failure")
+	}
+}
+
+// TestGoSumDB_AnswerCountsWhenCacheWriteFails: an answer from the database
+// is an answer even when it could not be cached afterwards, whether or not
+// a stale tree was cached before.
+func TestGoSumDB_AnswerCountsWhenCacheWriteFails(t *testing.T) {
+	for _, staleTree := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stale tree cached=%v", staleTree), func(t *testing.T) {
+			db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
+			h := newSumDBTestHandler(t, db.server.URL, true, time.Nanosecond)
+			if staleTree {
+				if w := serveGoRequest(h, "/sumdb/sum.example/latest"); w.Code != http.StatusOK {
+					t.Fatalf("latest: status = %d, want 200", w.Code)
+				}
+			}
+			h.proxy.Storage.(*mockStorage).storeErr = errors.New("disk full")
+
+			if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200: the database answered", w.Code)
+			}
+			if h.sumDBProbes.recentlyFailed(testSumDBName) {
+				t.Error("an answered probe was recorded as a failure")
+			}
+		})
+	}
+}
+
+func TestGoSumDBProbes_TimeoutDoesNotOverwriteLaterSuccess(t *testing.T) {
+	var probes goSumDBProbes
+	start := time.Now()
+	probes.record(testSumDBName, true)
+	probes.recordTimeout(testSumDBName, start)
+	if probes.recentlyFailed(testSumDBName) {
+		t.Error("a success recorded after the probe started was overwritten by its timeout")
+	}
+	probes.recordTimeout(testSumDBName, time.Now().Add(time.Second))
+	if !probes.recentlyFailed(testSumDBName) {
+		t.Error("a timeout with no later success was not recorded")
+	}
+}
+
+// TestGoSumDB_SupportedRefusesBlockPage: egress proxies answer blocked hosts
+// with a 200 page. That is not a reachable database, and must not be cached
+// as its signed tree either.
+func TestGoSumDB_SupportedRefusesBlockPage(t *testing.T) {
+	db := newFakeSumDB(t, map[string]string{"/latest": "<html>access to this site is blocked</html>"})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
+
+	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusNotFound {
+		t.Errorf("supported: status = %d, want 404", w.Code)
+	}
+	if w := serveGoRequest(h, "/sumdb/sum.example/latest"); w.Code != http.StatusBadGateway {
+		t.Errorf("latest: status = %d, want 502 for a block page", w.Code)
+	}
+
+	// The page was not cached: once the database answers, its tree is served.
+	db.setFile("/latest", testSumDBTree)
+	w := serveGoRequest(h, "/sumdb/sum.example/latest")
+	if w.Code != http.StatusOK || w.Body.String() != testSumDBTree {
+		t.Errorf("latest after recovery: status = %d, body = %q, want the signed tree", w.Code, w.Body.String())
+	}
+}
+
+// TestGoSumDB_LookupRefusesBlockPage: a block page in place of a lookup must
+// not be cached, where it would replace the copy served during an outage.
+// That includes a page that happens to start like a record.
+func TestGoSumDB_LookupRefusesBlockPage(t *testing.T) {
+	const lookup = "/lookup/golang.org/x/text@v0.14.0"
+	pages := map[string]string{
+		"html":                "<html>access to this site is blocked</html>",
+		"record without tree": "1\ngolang.org/x/text v0.14.0 h1:hash=\n\n<html>access to this site is blocked</html>",
+	}
+	for name, page := range pages {
+		t.Run(name, func(t *testing.T) {
+			db := newFakeSumDB(t, map[string]string{lookup: testSumDBRecord})
+			h := newSumDBTestHandler(t, db.server.URL, true, time.Nanosecond)
+
+			if w := serveGoRequest(h, "/sumdb/sum.example"+lookup); w.Code != http.StatusOK {
+				t.Fatalf("lookup: status = %d, want 200", w.Code)
+			}
+			db.setFile(lookup, page)
+			if w := serveGoRequest(h, "/sumdb/sum.example"+lookup); w.Code != http.StatusOK || w.Body.String() != testSumDBRecord {
+				t.Errorf("behind a block page: status = %d, body = %q, want the cached record", w.Code, w.Body.String())
+			}
+
+			// The page did not replace the record: it is still there in an outage.
+			db.down.Store(true)
+			if w := serveGoRequest(h, "/sumdb/sum.example"+lookup); w.Code != http.StatusOK || w.Body.String() != testSumDBRecord {
+				t.Errorf("in an outage: status = %d, body = %q, want the cached record", w.Code, w.Body.String())
+			}
+		})
 	}
 }
 
@@ -192,7 +428,7 @@ func TestGoSumDB_RequestsGoToTheDatabase(t *testing.T) {
 	defer moduleUpstream.Close()
 
 	const lookup = "/lookup/golang.org/x/text@v0.14.0"
-	db := newFakeSumDB(t, map[string]string{lookup: "lookup record"})
+	db := newFakeSumDB(t, map[string]string{lookup: testSumDBRecord})
 
 	proxy, _, _, _ := setupTestProxy(t)
 	proxy.HTTPClient = http.DefaultClient
@@ -200,7 +436,7 @@ func TestGoSumDB_RequestsGoToTheDatabase(t *testing.T) {
 	h.SetSumDBs(map[string]string{testSumDBName: db.server.URL + "/"})
 
 	w := serveGoRequest(h, "/sumdb/sum.example"+lookup)
-	if w.Code != http.StatusOK || w.Body.String() != "lookup record" {
+	if w.Code != http.StatusOK || w.Body.String() != testSumDBRecord {
 		t.Fatalf("status = %d, body = %q; want 200 with the database's response", w.Code, w.Body.String())
 	}
 	if n := db.requests(lookup); n != 1 {
@@ -213,12 +449,12 @@ func TestGoSumDB_RequestsGoToTheDatabase(t *testing.T) {
 
 func TestGoSumDB_LookupCachedWithinTTL(t *testing.T) {
 	const lookup = "/lookup/golang.org/x/text@v0.14.0"
-	db := newFakeSumDB(t, map[string]string{lookup: "lookup record"})
+	db := newFakeSumDB(t, map[string]string{lookup: testSumDBRecord})
 	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
 
 	for i := range 2 {
 		w := serveGoRequest(h, "/sumdb/sum.example"+lookup)
-		if w.Code != http.StatusOK || w.Body.String() != "lookup record" {
+		if w.Code != http.StatusOK || w.Body.String() != testSumDBRecord {
 			t.Fatalf("request %d: status = %d, body = %q", i, w.Code, w.Body.String())
 		}
 	}
@@ -233,7 +469,7 @@ func TestGoSumDB_CompleteTilesSkipRevalidation(t *testing.T) {
 		"/tile/8/data/000":     "complete data tile",
 		"/tile/8/0/001.p/5":    hashTile(5, "b"),
 		"/tile/8/data/001.p/5": "partial data tile",
-		"/latest":              "signed tree",
+		"/latest":              testSumDBTree,
 	}
 	wantRequests := map[string]int{
 		"/tile/8/0/000":        1,
@@ -289,6 +525,53 @@ func TestGoSumDB_BadTilesAreNotCached(t *testing.T) {
 	}
 }
 
+// TestGoSumDB_DamagedCachedTileIsFetchedAgain guards the check on the cached
+// copy: a complete tile is never revalidated, so a damaged blob would
+// otherwise be served for good. The database sends an ETag, so past the TTL
+// a request that asks whether the tile changed would get 304 and the damaged
+// copy back.
+func TestGoSumDB_DamagedCachedTileIsFetchedAgain(t *testing.T) {
+	const tile = "/tile/8/0/000"
+	want := hashTile(256, "a")
+	for _, ttl := range []time.Duration{time.Hour, time.Nanosecond} {
+		t.Run(fmt.Sprintf("ttl=%s", ttl), func(t *testing.T) {
+			db := newFakeSumDB(t, map[string]string{tile: want})
+			inner := db.server.Config.Handler
+			db.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"tile"`)
+				if r.Header.Get("If-None-Match") == `"tile"` {
+					w.WriteHeader(http.StatusNotModified)
+					return
+				}
+				inner.ServeHTTP(w, r)
+			})
+			h := newSumDBTestHandler(t, db.server.URL, true, ttl)
+
+			if w := serveGoRequest(h, "/sumdb/sum.example"+tile); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+
+			store := h.proxy.Storage.(*mockStorage)
+			blob := metadataStoragePath(goEcosystem, goSumDBCacheKey(testSumDBName, db.server.URL, "tile/8/0/000"))
+			store.mu.Lock()
+			if _, ok := store.files[blob]; !ok {
+				store.mu.Unlock()
+				t.Fatalf("tile not stored at %s", blob)
+			}
+			store.files[blob] = []byte(want[:100])
+			store.mu.Unlock()
+
+			w := serveGoRequest(h, "/sumdb/sum.example"+tile)
+			if w.Code != http.StatusOK || w.Body.String() != want {
+				t.Fatalf("after damage: status = %d, body length %d, want the %d-byte tile", w.Code, w.Body.Len(), len(want))
+			}
+			if n := db.requests(tile); n != 2 {
+				t.Errorf("upstream requests = %d, want 2: the damaged copy was fetched again", n)
+			}
+		})
+	}
+}
+
 func TestGoSumDB_CompleteTilesNotStoredWithoutMetadataCache(t *testing.T) {
 	const tile = "/tile/8/0/000"
 	db := newFakeSumDB(t, map[string]string{tile: hashTile(256, "a")})
@@ -306,8 +589,8 @@ func TestGoSumDB_CompleteTilesNotStoredWithoutMetadataCache(t *testing.T) {
 
 func TestGoSumDB_OfflineFallback(t *testing.T) {
 	files := map[string]string{
-		"/lookup/golang.org/x/text@v0.14.0": "lookup record",
-		"/latest":                           "signed tree",
+		"/lookup/golang.org/x/text@v0.14.0": testSumDBRecord,
+		"/latest":                           testSumDBTree,
 		"/tile/8/0/000":                     hashTile(256, "a"),
 		"/tile/8/0/001.p/5":                 hashTile(5, "b"),
 	}
