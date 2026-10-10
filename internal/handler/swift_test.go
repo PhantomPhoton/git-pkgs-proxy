@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/git-pkgs/proxy/internal/packageurl"
+	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -546,5 +547,39 @@ func TestSwiftIdentifierValidation(t *testing.T) {
 				t.Errorf("validation of %q = %v, want %v", test.value, got, test.want)
 			}
 		})
+	}
+}
+
+func TestSwiftRetentionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"pkg:swift/apple/swift-nio", "pkg:generic/swift-registry/apple.swift-nio", true},
+		{"pkg:swift/Apple/Swift-NIO", "pkg:generic/swift-registry/apple.swift-nio", true},
+		{"pkg:generic/swift-registry/apple.swift-nio", "pkg:generic/swift-registry/apple.swift-nio", true},
+		{"pkg:generic/swift-registry/Apple.Swift-NIO", "pkg:generic/swift-registry/apple.swift-nio", true},
+		{"pkg:generic/Swift-Registry/apple.swift-nio", "pkg:generic/swift-registry/apple.swift-nio", true},
+		{"pkg:swift/github.com/apple/swift-nio", "", false},
+		{"pkg:generic/swift-registry/swift-nio", "", false},
+		{"pkg:generic/swift-registry/apple.swift.nio", "", false},
+		{"pkg:swift/apple/-nio", "", false},
+		{"pkg:generic/apple.swift-nio", "", false},
+		{"pkg:generic/other/apple.swift-nio", "", false},
+		{"pkg:npm/apple/swift-nio", "", false},
+	}
+	for _, tt := range tests {
+		p, err := purl.Parse(tt.key)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tt.key, err)
+		}
+		got, ok := swiftRetentionKey(p)
+		if ok != tt.ok || (ok && got != tt.want) {
+			t.Errorf("swiftRetentionKey(%s) = %q, %v, want %q, %v", tt.key, got, ok, tt.want, tt.ok)
+		}
+	}
+	if _, ok := swiftRetentionKey(nil); ok {
+		t.Error("swiftRetentionKey(nil) accepted")
 	}
 }
