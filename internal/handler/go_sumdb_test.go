@@ -16,36 +16,45 @@ import (
 
 	"golang.org/x/mod/sumdb"
 	"golang.org/x/mod/sumdb/note"
+	"golang.org/x/mod/sumdb/tlog"
 )
 
 const testSumDBName = "sum.example"
 
+// hashTile returns a hash tile body of the given width.
+func hashTile(width int, fill string) string {
+	return strings.Repeat(fill, width*tlog.HashSize)
+}
+
 // fakeSumDB is a checksum database upstream serving fixed files. Unknown
 // paths get 404 with the body from notFound, or a default text.
 type fakeSumDB struct {
-	server   *httptest.Server
+	server *httptest.Server
+
+	mu       sync.Mutex
 	files    map[string]string
 	notFound map[string]string
-
-	mu   sync.Mutex
-	hits map[string]int
-	down atomic.Bool
+	hits     map[string]int
+	down     atomic.Bool
 }
 
 func newFakeSumDB(t *testing.T, files map[string]string) *fakeSumDB {
 	t.Helper()
+	if files == nil {
+		files = map[string]string{}
+	}
 	db := &fakeSumDB{files: files, notFound: map[string]string{}, hits: map[string]int{}}
 	db.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		db.mu.Lock()
 		db.hits[r.URL.Path]++
+		body, ok := db.files[r.URL.Path]
+		text, custom := db.notFound[r.URL.Path]
 		db.mu.Unlock()
 		if db.down.Load() {
 			http.Error(w, "unavailable", http.StatusInternalServerError)
 			return
 		}
-		body, ok := db.files[r.URL.Path]
 		if !ok {
-			text, custom := db.notFound[r.URL.Path]
 			if !custom {
 				text = "not found: " + r.URL.Path
 			}
@@ -59,6 +68,18 @@ func newFakeSumDB(t *testing.T, files map[string]string) *fakeSumDB {
 	}))
 	t.Cleanup(db.server.Close)
 	return db
+}
+
+func (db *fakeSumDB) setFile(path, body string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.files[path] = body
+}
+
+func (db *fakeSumDB) setNotFound(path, text string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.notFound[path] = text
 }
 
 func (db *fakeSumDB) requests(path string) int {
@@ -208,9 +229,9 @@ func TestGoSumDB_LookupCachedWithinTTL(t *testing.T) {
 
 func TestGoSumDB_CompleteTilesSkipRevalidation(t *testing.T) {
 	files := map[string]string{
-		"/tile/8/0/000":        "complete hash tile",
+		"/tile/8/0/000":        hashTile(256, "a"),
 		"/tile/8/data/000":     "complete data tile",
-		"/tile/8/0/001.p/5":    "partial hash tile",
+		"/tile/8/0/001.p/5":    hashTile(5, "b"),
 		"/tile/8/data/001.p/5": "partial data tile",
 		"/latest":              "signed tree",
 	}
@@ -240,9 +261,37 @@ func TestGoSumDB_CompleteTilesSkipRevalidation(t *testing.T) {
 	}
 }
 
+// TestGoSumDB_BadTilesAreNotCached guards complete tiles, which are never
+// revalidated once cached: a response of the wrong size must not be stored.
+func TestGoSumDB_BadTilesAreNotCached(t *testing.T) {
+	const tile = "/tile/8/0/000"
+	db := newFakeSumDB(t, map[string]string{
+		tile:                   "<html>please log in</html>",
+		"/tile/8/data/000.p/3": "",
+	})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
+
+	if w := serveGoRequest(h, "/sumdb/sum.example"+tile); w.Code != http.StatusBadGateway {
+		t.Fatalf("wrong-size tile: status = %d, want 502", w.Code)
+	}
+	if w := serveGoRequest(h, "/sumdb/sum.example/tile/8/data/000.p/3"); w.Code != http.StatusBadGateway {
+		t.Errorf("empty data tile: status = %d, want 502", w.Code)
+	}
+
+	want := hashTile(256, "a")
+	db.setFile(tile, want)
+	w := serveGoRequest(h, "/sumdb/sum.example"+tile)
+	if w.Code != http.StatusOK || w.Body.String() != want {
+		t.Fatalf("after upstream recovered: status = %d, body length %d, want the %d-byte tile", w.Code, w.Body.Len(), len(want))
+	}
+	if n := db.requests(tile); n != 2 {
+		t.Errorf("upstream requests = %d, want 2: the bad response was not cached", n)
+	}
+}
+
 func TestGoSumDB_CompleteTilesNotStoredWithoutMetadataCache(t *testing.T) {
 	const tile = "/tile/8/0/000"
-	db := newFakeSumDB(t, map[string]string{tile: "complete hash tile"})
+	db := newFakeSumDB(t, map[string]string{tile: hashTile(256, "a")})
 	h := newSumDBTestHandler(t, db.server.URL, false, time.Hour)
 
 	for range 2 {
@@ -259,8 +308,8 @@ func TestGoSumDB_OfflineFallback(t *testing.T) {
 	files := map[string]string{
 		"/lookup/golang.org/x/text@v0.14.0": "lookup record",
 		"/latest":                           "signed tree",
-		"/tile/8/0/000":                     "complete hash tile",
-		"/tile/8/0/001.p/5":                 "partial hash tile",
+		"/tile/8/0/000":                     hashTile(256, "a"),
+		"/tile/8/0/001.p/5":                 hashTile(5, "b"),
 	}
 	db := newFakeSumDB(t, files)
 	h := newSumDBTestHandler(t, db.server.URL, true, time.Nanosecond)
@@ -287,7 +336,7 @@ func TestGoSumDB_NotFoundRelaysUpstreamText(t *testing.T) {
 	for _, cacheMetadata := range []bool{true, false} {
 		t.Run(fmt.Sprintf("cache_metadata=%v", cacheMetadata), func(t *testing.T) {
 			db := newFakeSumDB(t, nil)
-			db.notFound[lookup] = reason
+			db.setNotFound(lookup, reason)
 			h := newSumDBTestHandler(t, db.server.URL, cacheMetadata, time.Hour)
 
 			w := serveGoRequest(h, "/sumdb/sum.example"+lookup)
@@ -302,7 +351,7 @@ func TestGoSumDB_NotFoundRelaysUpstreamText(t *testing.T) {
 
 	t.Run("long text is cut", func(t *testing.T) {
 		db := newFakeSumDB(t, nil)
-		db.notFound[lookup] = strings.Repeat("x", upstreamNotFoundBodyLimit+1000)
+		db.setNotFound(lookup, strings.Repeat("x", upstreamNotFoundBodyLimit+1000))
 		h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
 
 		w := serveGoRequest(h, "/sumdb/sum.example"+lookup)

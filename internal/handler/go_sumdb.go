@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,10 +99,15 @@ func (h *GoHandler) handleSumDB(w http.ResponseWriter, r *http.Request, rest str
 	}
 
 	cacheKey := goSumDBCacheKey(name, sumDBURL, path)
-	if immutable && h.serveCachedSumDBTile(w, r, cacheKey) {
+	check := goSumDBTileCheck(path)
+	served, damaged := false, false
+	if immutable {
+		served, damaged = h.serveCachedSumDBTile(w, r, cacheKey, check)
+	}
+	if served {
 		return
 	}
-	h.proxySumDB(w, r, sumDBURL+"/"+path, cacheKey)
+	h.proxySumDB(w, r, sumDBURL+"/"+path, cacheKey, check, damaged)
 }
 
 // sumDBReachable reports whether the proxy can serve a checksum database: it
@@ -145,6 +152,28 @@ func parseGoSumDBPath(path string) (immutable, valid bool) {
 	return tile.W == 1<<tile.H, true
 }
 
+// goSumDBTileCheck returns a check for a tile response, or nil when path is
+// not a tile. A hash tile holds exactly W hashes, so a body of any other size
+// (an error page from a proxy in between, a cut-off response) is refused
+// rather than cached; complete tiles are never revalidated, so a bad one
+// would otherwise stay. Data tiles have no fixed size and only must not be
+// empty.
+func goSumDBTileCheck(path string) func([]byte) error {
+	tile, err := tlog.ParseTilePath(path)
+	if err != nil {
+		return nil
+	}
+	return func(body []byte) error {
+		if tile.L >= 0 && len(body) != tile.W*tlog.HashSize {
+			return fmt.Errorf("checksum database tile %s has %d bytes, want %d", path, len(body), tile.W*tlog.HashSize)
+		}
+		if len(body) == 0 {
+			return fmt.Errorf("checksum database tile %s is empty", path)
+		}
+		return nil
+	}
+}
+
 // validGoSumDBLookup checks an escaped module@version the way the checksum
 // database does. Requiring a semantic version also keeps characters such as
 // '#' and '%' out of the upstream URL.
@@ -169,20 +198,24 @@ func goSumDBCacheKey(name, sumDBURL, path string) string {
 }
 
 // serveCachedSumDBTile serves a complete tile from the metadata cache
-// regardless of its age, since its content never changes. It reports false
-// when the tile is not cached.
-func (h *GoHandler) serveCachedSumDBTile(w http.ResponseWriter, r *http.Request, cacheKey string) bool {
+// regardless of its age, since its content never changes. It reports
+// served false when the tile is not cached, and damaged as well when the
+// cached copy fails check.
+func (h *GoHandler) serveCachedSumDBTile(w http.ResponseWriter, r *http.Request, cacheKey string, check func([]byte) error) (served, damaged bool) {
 	p := h.proxy
 	if !p.CacheMetadata || p.DB == nil {
-		return false
+		return false, false
 	}
 	entry, err := p.DB.GetMetadataCache(goEcosystem, cacheKey)
 	if err != nil || entry == nil {
-		return false
+		return false, false
 	}
 	body, contentType, err := p.readCachedMetadata(r.Context(), entry, nil)
 	if err != nil {
-		return false
+		return false, false
+	}
+	if check != nil && check(body) != nil {
+		return false, true
 	}
 	metrics.RecordCacheHit(goEcosystem)
 
@@ -190,7 +223,7 @@ func (h *GoHandler) serveCachedSumDBTile(w http.ResponseWriter, r *http.Request,
 		w.Header().Set(headerETag, entry.ETag.String)
 		if ifNoneMatchHits(r.Header.Get("If-None-Match"), entry.ETag.String) {
 			w.WriteHeader(http.StatusNotModified)
-			return true
+			return true, false
 		}
 	}
 	w.Header().Set(headerContentType, contentType)
@@ -200,20 +233,22 @@ func (h *GoHandler) serveCachedSumDBTile(w http.ResponseWriter, r *http.Request,
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
-	return true
+	return true, false
 }
 
 // proxySumDB fetches a checksum database response through the metadata
 // cache. Unlike ProxyCached it relays the start of an upstream 404 body: the
-// go command prints it, and it says why a module version is missing.
-func (h *GoHandler) proxySumDB(w http.ResponseWriter, r *http.Request, upstreamURL, cacheKey string) {
+// go command prints it, and it says why a module version is missing. check,
+// when set, must accept a response before it is cached or served. damaged
+// says the cached copy failed check.
+func (h *GoHandler) proxySumDB(w http.ResponseWriter, r *http.Request, upstreamURL, cacheKey string, check func([]byte) error, damaged bool) {
 	p := h.proxy
 	if !p.CacheMetadata {
 		p.proxyMetadataStream(w, r, upstreamURL, "identity", "*/*")
 		return
 	}
 
-	body, contentType, contentEncoding, err := p.fetchOrCacheMetadata(r.Context(), goEcosystem, cacheKey, upstreamURL, "identity", nil, "*/*")
+	body, contentType, contentEncoding, err := h.fetchSumDB(r.Context(), upstreamURL, cacheKey, check, damaged)
 	if err != nil {
 		var notFound *upstreamNotFoundError
 		switch {
@@ -232,4 +267,17 @@ func (h *GoHandler) proxySumDB(w http.ResponseWriter, r *http.Request, upstreamU
 	}
 
 	p.writeMetadataCachedResponseWithEncoding(w, r, goEcosystem, cacheKey, body, contentType, contentEncoding)
+}
+
+// fetchSumDB fetches a checksum database response through the metadata
+// cache. A cached copy that failed check is fetched again without
+// revalidating it: past the TTL, a database that sends an ETag would answer
+// 304 and hand back the damaged copy for good.
+func (h *GoHandler) fetchSumDB(ctx context.Context, upstreamURL, cacheKey string, check func([]byte) error, damaged bool) ([]byte, string, string, error) {
+	p := h.proxy
+	if damaged {
+		res := p.fetchMetadataFromUpstream(ctx, goEcosystem, cacheKey, upstreamURL, "*/*", "identity", check, nil)
+		return res.body, res.contentType, res.contentEncoding, res.err
+	}
+	return p.fetchOrCacheMetadata(ctx, goEcosystem, cacheKey, upstreamURL, "identity", check, "*/*")
 }
