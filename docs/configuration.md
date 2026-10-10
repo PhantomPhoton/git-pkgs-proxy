@@ -93,7 +93,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `composer` | no | - |
 | `conan` | no | - |
 | `conda` | no | - |
-| `cran` | no | - |
+| `cran` | yes | `pkg:cran/ggplot2`, the package name as published, case included (`pkg:cran/Rcpp`). A rule covers source and binary builds alike. |
 | `deb` | no | - |
 | `gem` | no | - |
 | `golang` | no | - |
