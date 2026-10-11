@@ -40,7 +40,7 @@ func TestNewMirrorProxyFollowsBearerChallenge(t *testing.T) {
 	registry := newTokenRegistry(t)
 	cfg := config.Default()
 	cfg.Upstream.AllowLoopback = true
-	proxy := NewMirrorProxy(cfg, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	proxy, _ := NewMirrorProxy(cfg, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	resp, err := proxy.HTTPClient.Get(registry.URL + "/v2/library/app/manifests/1.0")
 	if err != nil {
@@ -54,7 +54,7 @@ func TestNewMirrorProxyFollowsBearerChallenge(t *testing.T) {
 
 func TestNewMirrorProxyRefusesLoopbackByDefault(t *testing.T) {
 	registry := newTokenRegistry(t)
-	proxy := NewMirrorProxy(config.Default(), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	proxy, _ := NewMirrorProxy(config.Default(), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	resp, err := proxy.HTTPClient.Get(registry.URL + "/v2/library/app/manifests/1.0")
 	if err == nil {
