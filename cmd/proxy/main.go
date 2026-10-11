@@ -113,11 +113,9 @@ import (
 	"github.com/git-pkgs/proxy/internal/config"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
-	"github.com/git-pkgs/proxy/internal/handler"
 	"github.com/git-pkgs/proxy/internal/mirror"
 	"github.com/git-pkgs/proxy/internal/server"
 	"github.com/git-pkgs/proxy/internal/storage"
-	"github.com/git-pkgs/registries/fetch"
 )
 
 const defaultTopN = 10
@@ -518,10 +516,8 @@ func runMirror() {
 		os.Exit(1) //nolint:gocritic // db closed above
 	}
 
-	// Build proxy (reuses same pipeline as serve)
-	fetcher := fetch.NewFetcher()
-	resolver := fetch.NewResolver()
-	proxy := handler.NewProxy(db, store, fetcher, resolver, logger)
+	// Build proxy with the same upstream clients and authentication as serve
+	proxy := server.NewMirrorProxy(cfg, db, store, logger)
 	proxy.Denylist, err = denylist.New(cfg.Denylist.Packages)
 	if err != nil {
 		_ = db.Close()

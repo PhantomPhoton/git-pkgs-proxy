@@ -220,22 +220,10 @@ func (s *Server) Start(listeners ...net.Listener) error {
 }
 
 func (s *Server) serve(listener net.Listener) error {
-	// Use one authentication-aware transport for metadata and artifacts so
-	// configured credentials and cached OCI challenges apply consistently.
-	safeClient := newUpstreamClient(s.cfg.Upstream)
-	baseTransport := safeClient.Transport
-	if s.accessLog != nil {
-		baseTransport = upstreamhttp.NewAccessLogTransport(baseTransport, s.accessLog, s.logger)
-	}
-	authTransport := upstreamhttp.NewTransport(baseTransport, upstreamhttp.AuthFunc(s.authForURL))
-	metadataClient := *safeClient
-	metadataClient.Timeout = s.cfg.ParseHTTPTimeout()
-	metadataClient.Transport = authTransport
-	artifactClient := metadataClient
-	artifactClient.Timeout = serverWriteTimeout
+	metadataClient, artifactClient := s.newUpstreamClients(serverWriteTimeout)
 
 	// Create shared components with circuit breaker.
-	baseFetcher := fetch.NewFetcher(fetch.WithHTTPClient(&artifactClient))
+	baseFetcher := fetch.NewFetcher(fetch.WithHTTPClient(artifactClient))
 	fetcher := fetch.NewCircuitBreakerFetcher(baseFetcher)
 	s.breakers = newBreakerMonitor(fetcher, s.logger)
 	resolver := fetch.NewResolver()
@@ -245,7 +233,7 @@ func (s *Server) serve(listener net.Listener) error {
 		Packages:   s.cfg.Cooldown.NormalizedPackages(),
 	}
 	proxy := handler.NewProxy(s.db, s.storage, fetcher, resolver, s.logger)
-	proxy.HTTPClient = &metadataClient
+	proxy.HTTPClient = metadataClient
 	proxy.AuthForURL = s.authForURL
 	cooldownPolicy, err := cooldownpolicy.New(cd, s.cfg.Cooldown.PackagePatterns)
 	if err != nil {
@@ -481,6 +469,36 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 // configureScanning builds the scanner group from cfg and wires it into
 // proxy, returning the group so the caller can decide whether to mount the
 // internal scan-fetch route.
+// newUpstreamClients builds the metadata and artifact clients. Both share one
+// authentication-aware transport so configured credentials and cached OCI
+// challenges apply consistently. An artifactTimeout of zero means no limit.
+func (s *Server) newUpstreamClients(artifactTimeout time.Duration) (metadataClient, artifactClient *http.Client) {
+	safeClient := newUpstreamClient(s.cfg.Upstream)
+	baseTransport := safeClient.Transport
+	if s.accessLog != nil {
+		baseTransport = upstreamhttp.NewAccessLogTransport(baseTransport, s.accessLog, s.logger)
+	}
+	authTransport := upstreamhttp.NewTransport(baseTransport, upstreamhttp.AuthFunc(s.authForURL))
+	metadata := *safeClient
+	metadata.Timeout = s.cfg.ParseHTTPTimeout()
+	metadata.Transport = authTransport
+	artifact := metadata
+	artifact.Timeout = artifactTimeout
+	return &metadata, &artifact
+}
+
+// NewMirrorProxy builds the proxy for the mirror command with the same
+// upstream clients, SSRF guard and upstream authentication as serve. Artifact
+// downloads have no overall time limit; the caller cancels through ctx.
+func NewMirrorProxy(cfg *config.Config, db *database.DB, store storage.Storage, logger *slog.Logger) *handler.Proxy {
+	s := &Server{cfg: cfg, db: db, storage: store, logger: logger, ecr: newECRTokens(logger)}
+	metadataClient, artifactClient := s.newUpstreamClients(0)
+	proxy := handler.NewProxy(db, store, fetch.NewFetcher(fetch.WithHTTPClient(artifactClient)), fetch.NewResolver(), logger)
+	proxy.HTTPClient = metadataClient
+	proxy.AuthForURL = s.authForURL
+	return proxy
+}
+
 func configureScanning(proxy *handler.Proxy, cfg config.ScanningConfig, baseURL string, logger *slog.Logger) (*scanner.Group, error) {
 	scanGroup, err := scanner.NewGroup(cfg, logger)
 	if err != nil {
