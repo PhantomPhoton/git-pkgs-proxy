@@ -547,11 +547,30 @@ Configure APT to use the proxy in `/etc/apt/sources.list.d/proxy.list`:
 deb http://localhost:8080/debian stable main contrib
 ```
 
-Replace your existing sources.list entries, then:
+Or in deb822 format, in `/etc/apt/sources.list.d/proxy.sources`:
+
+```
+Types: deb
+URIs: http://localhost:8080/debian
+Suites: stable
+Components: main contrib
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+```
+
+Replace your existing sources.list entries (on newer releases also
+`debian.sources` or `ubuntu.sources` in `/etc/apt/sources.list.d/`), then:
 
 ```bash
 sudo apt update
 ```
+
+There is no proxy key to install. The proxy serves the upstream's signed
+`InRelease` and `Release` files unchanged, so APT verifies them with the
+upstream archive's own key from the distribution's keyring package:
+`debian-archive-keyring` on Debian, `ubuntu-keyring` on Ubuntu
+(`/usr/share/keyrings/ubuntu-archive-keyring.gpg`). `Signed-By:` in a
+`.sources` file, or `[signed-by=...]` in a `.list` line, restricts the source
+to that key. For a third-party upstream, use the key its vendor publishes.
 
 The upstream defaults to `http://deb.debian.org/debian`. To proxy a different APT repository (e.g. Ubuntu), set `upstream.debian` in the config file or `PROXY_UPSTREAM_DEBIAN` in the environment:
 
