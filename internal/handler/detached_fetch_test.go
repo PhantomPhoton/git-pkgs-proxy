@@ -137,3 +137,29 @@ func TestDetachedFetch_UnmarkedContextStillCancels(t *testing.T) {
 		t.Error("cancelled undetached fetch was still committed to the cache")
 	}
 }
+
+// TestDetachedFetch_CapFallsBackToClientContext checks the cap on detached
+// fetches: with every slot taken, a cancelled client cancels its fetch again,
+// as it did before fetches were detached.
+func TestDetachedFetch_CapFallsBackToClientContext(t *testing.T) {
+	proxy, _, _, _ := setupTestProxy(t)
+	fetcher := newGatedFetcher("package bytes")
+	proxy.Fetcher = fetcher
+
+	for range maxDetachedFetches {
+		if !proxy.acquireDetachSlot() {
+			t.Fatal("could not take a free detach slot")
+		}
+	}
+	err := startCancelledFetch(t, proxy, fetcher, DetachUpstreamFetch(context.Background()))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled once the detach slots are used up", err)
+	}
+
+	for range maxDetachedFetches {
+		proxy.releaseDetachSlot()
+	}
+	if !proxy.acquireDetachSlot() {
+		t.Error("slots not available again after release")
+	}
+}

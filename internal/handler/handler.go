@@ -198,6 +198,11 @@ type Proxy struct {
 	fetchMu  sync.Mutex
 	inFlight map[string]*inflightFetch
 
+	// detachSlots caps the artifact fetches that keep running after their
+	// client went away (see DetachUpstreamFetch). Guarded by fetchMu while it
+	// is created.
+	detachSlots chan struct{}
+
 	// inFlightMeta does the same for metadata misses. Keyed by
 	// metadataCoalesceKey.
 	metaMu       sync.Mutex
@@ -672,7 +677,8 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	}
 
 	commitCtx := ctx
-	if upstreamFetchDetached(ctx) {
+	if upstreamFetchDetached(ctx) && p.acquireDetachSlot() {
+		defer p.releaseDetachSlot()
 		commitCtx = context.WithoutCancel(ctx)
 	}
 	stored, path, err := commit(commitCtx)
@@ -690,8 +696,9 @@ type detachUpstreamFetchKey struct{}
 // requests: a client that gives up on a slow cache miss (pacman aborts after
 // 10 s without data) would otherwise cancel the fetch, and every retry would
 // start again from zero, so a large artifact never reaches the cache. The
-// fetch stays bounded by the artifact HTTP client's timeout. Mirror jobs leave
-// it unset so cancelling a job still aborts its fetches.
+// fetch stays bounded by the artifact HTTP client's timeout, and at most
+// maxDetachedFetches run detached at once. Mirror jobs leave it unset so
+// cancelling a job still aborts its fetches.
 func DetachUpstreamFetch(ctx context.Context) context.Context {
 	return context.WithValue(ctx, detachUpstreamFetchKey{}, true)
 }
@@ -699,6 +706,33 @@ func DetachUpstreamFetch(ctx context.Context) context.Context {
 func upstreamFetchDetached(ctx context.Context) bool {
 	detached, _ := ctx.Value(detachUpstreamFetchKey{}).(bool)
 	return detached
+}
+
+// maxDetachedFetches caps the artifact fetches that may outlive their client.
+// Without a cap a client could start any number of large uncached downloads
+// and hang up straight away, leaving each to run to the artifact client's
+// timeout. Fetches beyond the cap stay tied to their client, as before
+// detaching existed.
+const maxDetachedFetches = 64
+
+func (p *Proxy) acquireDetachSlot() bool {
+	p.fetchMu.Lock()
+	if p.detachSlots == nil {
+		p.detachSlots = make(chan struct{}, maxDetachedFetches)
+	}
+	slots := p.detachSlots
+	p.fetchMu.Unlock()
+
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Proxy) releaseDetachSlot() {
+	<-p.detachSlots
 }
 
 // fetchedArtifact is what a shared fetch hands its callers: metadata and a
