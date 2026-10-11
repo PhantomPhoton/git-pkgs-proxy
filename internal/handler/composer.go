@@ -20,6 +20,7 @@ const (
 	composerMinified   = "composer/2.0"
 	composerUnset      = "__unset"
 	composerDevReset   = "~dev"
+	composerDevFile    = "~dev" // suffix of the metadata file holding dev versions
 	vendorPackageParts = 2
 )
 
@@ -31,6 +32,7 @@ type ComposerHandler struct {
 	upstreamURL string
 	repoURL     string
 	proxyURL    string
+	routes      packageRoutes
 }
 
 // NewComposerHandler creates a new Composer protocol handler.
@@ -49,6 +51,13 @@ func NewComposerHandlerWithUpstreams(proxy *Proxy, proxyURL, upstreamURL, repoUR
 	h := NewComposerHandler(proxy, proxyURL)
 	h.upstreamURL = configuredUpstreamURL(upstreamURL, composerUpstream)
 	h.repoURL = configuredUpstreamURL(repoURL, composerRepo)
+	return h
+}
+
+// WithPackageRoutes sends packages matching a pattern to a dedicated Composer
+// repository instead of the default one. See packageRoutes.
+func (h *ComposerHandler) WithPackageRoutes(routes map[string]string) *ComposerHandler {
+	h.routes = newPackageRoutes(routes)
 	return h
 }
 
@@ -87,6 +96,18 @@ func (h *ComposerHandler) handleServiceIndex(w http.ResponseWriter, r *http.Requ
 	_ = json.NewEncoder(w).Encode(index)
 }
 
+// sourceFor returns the repository serving a package and the key its metadata
+// is cached under. packageName may carry the ~dev suffix of the file holding
+// the package's dev versions: routes match the package without it, so its dev
+// versions come from the same repository, while the cache key keeps it so the
+// two files stay apart.
+func (h *ComposerHandler) sourceFor(packageName string) (repoURL, cacheKey string) {
+	if route, routed := h.routes.match(strings.TrimSuffix(packageName, composerDevFile)); routed {
+		return route.url, route.cacheKey(packageName)
+	}
+	return h.repoURL, packageName
+}
+
 // handlePackageMetadata proxies and rewrites package metadata.
 func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Request) {
 	// Parse path: /p2/{vendor}/{package}.json
@@ -103,15 +124,16 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 
 	h.proxy.Logger.Info("composer metadata request", "package", packageName)
 
-	upstreamURL := fmt.Sprintf("%s/p2/%s/%s.json", h.repoURL, vendor, pkg)
+	repoURL, cacheKey := h.sourceFor(packageName)
+	upstreamURL := fmt.Sprintf("%s/p2/%s/%s.json", repoURL, vendor, pkg)
 
-	if rewritten, ok := h.proxy.storedRewrite("composer", packageName, h.proxyURL, packageName); ok {
+	if rewritten, ok := h.proxy.storedRewrite("composer", cacheKey, h.proxyURL, cacheKey); ok {
 		w.Header().Set(headerContentType, "application/json")
 		_, _ = w.Write(rewritten)
 		return
 	}
 
-	body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "composer", packageName, upstreamURL)
+	body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "composer", cacheKey, upstreamURL)
 	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -122,7 +144,7 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	rewritten, err := h.proxy.cachedRewrite(r.Context(), "composer", h.proxyURL, packageName, body, h.rewriteMetadata)
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "composer", h.proxyURL, cacheKey, body, h.rewriteMetadata)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return // the client left while waiting on a shared rewrite
@@ -193,6 +215,7 @@ func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, v
 	packagePURL := canonicalPackagePURL("composer", packageName)
 	upstream, written := newComposerFields(), newComposerFields()
 	devReset, first := false, true
+	_, routed := h.routes.match(packageName)
 
 	out.WriteByte('[')
 	err := forEachJSONElement(versions, func(entry []byte) error {
@@ -225,6 +248,9 @@ func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, v
 		if devReset {
 			out.WriteString(`"` + composerDevReset + `",`)
 			devReset = false
+		}
+		if routed {
+			disableDefaultNotification(upstream)
 		}
 		h.writeVersion(out, packageName, version, upstream, written)
 		return nil
@@ -295,6 +321,17 @@ func (h *ComposerHandler) shouldFilterVersion(packagePURL, packageName, version 
 	}
 
 	return false
+}
+
+// disableDefaultNotification stops Composer from reporting installs of a routed
+// package to the default repository's notify-batch URL, which would disclose
+// the package name to it. Composer only falls back to notify-batch when a
+// version has no notification-url of its own, and skips an empty one. Setting
+// it on the expanded fields keeps it set for the versions that inherit them.
+func disableDefaultNotification(fields *composerFields) {
+	if fields.get("notification-url") == nil {
+		fields.set("notification-url", []byte(`"notification-url"`), []byte(`""`))
+	}
 }
 
 // rewriteDist returns a version's dist object with its url pointing at this
@@ -527,7 +564,8 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		"package", packageName, "version", version,
 		"download_url", downloadURL)
 
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "composer", packageName, version, filename, downloadURL)
+	cacheFilename := h.routes.cacheFilename(packageName, filename)
+	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "composer", packageName, version, cacheFilename, downloadURL)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return
@@ -549,8 +587,9 @@ func isDevVersion(version string) bool {
 // file, tagged releases from the regular file; the other file is included as a
 // fallback so an unexpected classification still resolves.
 func (h *ComposerHandler) metadataURLsForVersion(vendor, pkg, version string) []string {
-	stable := fmt.Sprintf("%s/p2/%s/%s.json", h.repoURL, vendor, pkg)
-	dev := fmt.Sprintf("%s/p2/%s/%s~dev.json", h.repoURL, vendor, pkg)
+	repoURL, _ := h.sourceFor(vendor + "/" + pkg)
+	stable := fmt.Sprintf("%s/p2/%s/%s.json", repoURL, vendor, pkg)
+	dev := fmt.Sprintf("%s/p2/%s/%s~dev.json", repoURL, vendor, pkg)
 
 	if isDevVersion(version) {
 		return []string{dev, stable}
