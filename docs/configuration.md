@@ -91,7 +91,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `alpine` | yes | `pkg:apk/curl` or `pkg:apk/alpine/curl`; case doesn't matter. A rule covers the package in every configured APK repository. Alpine mirrors keep only the current build of each package per release, so an evicted older one can't be fetched again. |
 | `cargo` | yes | `pkg:cargo/serde`, the crate name as published; case, `-` and `_` have to match, so `pkg:cargo/inflector` doesn't cover `Inflector`. |
 | `composer` | yes | `pkg:composer/symfony/console`; case doesn't matter. A key without a vendor is refused. |
-| `conan` | no | - |
+| `conan` | yes | `pkg:conan/zlib`, the recipe name; a rule covers every version, revision and user/channel of it. |
 | `conda` | no | - |
 | `cran` | yes | `pkg:cran/ggplot2`, the package name as published, case included (`pkg:cran/Rcpp`). A rule covers source and binary builds alike. |
 | `deb` | no | - |
