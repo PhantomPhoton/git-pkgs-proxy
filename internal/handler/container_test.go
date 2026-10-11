@@ -889,7 +889,7 @@ func TestContainerHandler_ManifestDigestMismatchIsNotCached(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "DIGEST_INVALID") {
 		t.Errorf("body = %q, want DIGEST_INVALID", w.Body.String())
 	}
-	cacheKey := h.containerManifestCacheKey(upstream.URL, "homebrew/core/jq", digest, containerManifestAccept(req))
+	cacheKey := h.containerManifestSharedCacheKey(upstream.URL, "homebrew/core/jq", digest, normalizeContainerManifestAccept(containerManifestAccept(req)))
 	entry, err := db.GetMetadataCache(containerManifestCacheEcosystem, cacheKey)
 	if err != nil {
 		t.Fatalf("checking manifest cache: %v", err)
@@ -951,7 +951,7 @@ func TestContainerHandler_ManifestTagWithInvalidDigestIsNotAliased(t *testing.T)
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadGateway, w.Body.String())
 	}
-	cacheKey := h.containerManifestCacheKey(upstream.URL, "homebrew/core/jq", invalidDigest, containerManifestAccept(req))
+	cacheKey := h.containerManifestSharedCacheKey(upstream.URL, "homebrew/core/jq", invalidDigest, normalizeContainerManifestAccept(containerManifestAccept(req)))
 	entry, err := db.GetMetadataCache(containerManifestCacheEcosystem, cacheKey)
 	if err != nil {
 		t.Fatalf("checking manifest cache: %v", err)
@@ -1075,9 +1075,9 @@ func TestContainerHandler_ManifestMigratesLegacyAcceptCacheKey(t *testing.T) {
 	accept := "application/vnd.oci.image.index.v1+json;q=1, application/vnd.oci.image.manifest.v1+json;q=1"
 	cacheAccept := normalizeContainerManifestAccept(accept)
 	legacyCacheKey := h.containerManifestCacheKey(upstream.URL, "library/nginx", "latest", accept)
-	cacheKey := h.containerManifestCacheKey(upstream.URL, "library/nginx", "latest", cacheAccept)
+	cacheKey := h.containerManifestSharedCacheKey(upstream.URL, "library/nginx", "latest", cacheAccept)
 	if legacyCacheKey == cacheKey {
-		t.Fatal("legacy and normalized cache keys are equal")
+		t.Fatal("legacy and shared cache keys are equal")
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/library/nginx/manifests/latest", nil)
@@ -1108,7 +1108,7 @@ func TestContainerHandler_ManifestMigratesLegacyAcceptCacheKey(t *testing.T) {
 		t.Fatalf("load migrated manifest: %v", err)
 	}
 	if migrated == nil {
-		t.Error("normalized cache entry was not created")
+		t.Error("shared cache entry was not created")
 	}
 }
 
