@@ -612,7 +612,9 @@ type inflightFetch struct {
 // commit runs on that caller's context, so cancellation behaves as it did
 // uncoalesced and mirroring still relies on it aborting the fetch. If that
 // caller goes away, everyone sharing the fetch gets its error and the key is
-// released for a later retry.
+// released for a later retry. A context marked with DetachUpstreamFetch is the
+// exception: there commit keeps running after the caller goes away, so the
+// artifact still lands in the cache.
 //
 // Every sharing caller still records a cache miss, so the gap between
 // proxy_cache_misses_total and upstream fetch observations is what coalescing
@@ -669,12 +671,34 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		}
 	}
 
-	stored, path, err := commit(ctx)
+	commitCtx := ctx
+	if upstreamFetchDetached(ctx) {
+		commitCtx = context.WithoutCancel(ctx)
+	}
+	stored, path, err := commit(commitCtx)
 	f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, err
 	if err != nil {
 		return nil, err
 	}
 	return p.openStoredArtifact(ctx, stored, path)
+}
+
+type detachUpstreamFetchKey struct{}
+
+// DetachUpstreamFetch marks ctx so that an artifact fetch started under it
+// runs to completion even when ctx is cancelled. The server sets it on client
+// requests: a client that gives up on a slow cache miss (pacman aborts after
+// 10 s without data) would otherwise cancel the fetch, and every retry would
+// start again from zero, so a large artifact never reaches the cache. The
+// fetch stays bounded by the artifact HTTP client's timeout. Mirror jobs leave
+// it unset so cancelling a job still aborts its fetches.
+func DetachUpstreamFetch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, detachUpstreamFetchKey{}, true)
+}
+
+func upstreamFetchDetached(ctx context.Context) bool {
+	detached, _ := ctx.Value(detachUpstreamFetchKey{}).(bool)
+	return detached
 }
 
 // fetchedArtifact is what a shared fetch hands its callers: metadata and a

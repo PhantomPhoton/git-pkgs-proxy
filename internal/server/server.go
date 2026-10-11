@@ -290,6 +290,11 @@ func (s *Server) serve(listener net.Listener) error {
 			next.ServeHTTP(w, r)
 		})
 	})
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(handler.DetachUpstreamFetch(r.Context())))
+		})
+	})
 
 	// Mount protocol handlers
 	s.mountProtocolHandlers(r, proxy)
