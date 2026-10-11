@@ -646,6 +646,12 @@ type UpstreamConfig struct {
 	// Default when empty: {"alpine": "https://dl-cdn.alpinelinux.org/alpine"}.
 	APK map[string]string `json:"apk" yaml:"apk"`
 
+	// Arch maps repository names to Arch Linux pacman mirror base URLs,
+	// served at /arch/{name}/. The remaining request path mirrors the
+	// upstream layout, e.g. /arch/archlinux/core/os/x86_64/core.db.
+	// Default when empty: {"archlinux": "https://geo.mirror.pkgbuild.com"}.
+	Arch map[string]string `json:"arch" yaml:"arch"`
+
 	// OCI maps names to OCI registry URLs. Requests to a named registry use
 	// the repository prefix upstream/{name}/, for example
 	// oci://proxy.example.com/upstream/ghcr/owner/chart.
@@ -715,6 +721,9 @@ func (u *UpstreamConfig) Validate() error {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.apk", u.APK); err != nil {
+		return err
+	}
+	if err := validateNamedUpstreams("upstream.arch", u.Arch); err != nil {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.oci", u.OCI); err != nil {

@@ -134,6 +134,7 @@ func supportedEcosystems() []string {
 	// expected order
 	return []string{
 		"alpine",
+		"arch",
 		"cargo",
 		"composer",
 		"conan",
@@ -204,6 +205,8 @@ func ecosystemColorClasses(ecosystem string) string {
 		return "bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-300"
 	case "alpine":
 		return "bg-lime-100 text-lime-800 dark:bg-lime-900/50 dark:text-lime-300"
+	case "arch":
+		return "bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-300"
 	default:
 		return "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"
 	}
@@ -520,6 +523,18 @@ sudo dnf update</code></pre>`),
 
 # Then run:
 apk update</code></pre>`),
+		},
+		{
+			ID:       "arch",
+			Name:     "Arch Linux pacman",
+			Language: "Arch Linux",
+			Endpoint: "/arch/",
+			Instructions: template.HTML(`<p class="config-note">Configure pacman to use the proxy:</p>
+<pre><code># In /etc/pacman.d/mirrorlist, above any other Server line
+Server = ` + baseURL + `/arch/archlinux/$repo/os/$arch
+
+# Then run:
+pacman -Syu</code></pre>`),
 		},
 	}
 }

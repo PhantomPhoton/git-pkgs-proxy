@@ -21,6 +21,7 @@ func TestClientName(t *testing.T) {
 		{"docker/24.0.7 go/go1.20.10 kernel/6.5.0 os/linux", "docker"},
 		{"Debian APT-HTTP/1.3 (2.6.1)", "apt"},
 		{"bundler/2.4.22 rubygems/3.4.22", "bundler"},
+		{"pacman/7.0.0 (Linux x86_64) libalpm/15.0.0", "pacman"},
 		// Unknown and hostile input collapses, so a User-Agent cannot mint a
 		// new Prometheus time series.
 		{"", unknownClient},

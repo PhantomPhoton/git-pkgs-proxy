@@ -1364,11 +1364,15 @@ func TestValidateNamedUpstreams(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "valid Helm, OCI, APK, and generic upstreams",
+			name: "valid Helm, OCI, APK, Arch, and generic upstreams",
 			modify: func(cfg *Config) {
 				cfg.Upstream.Helm = map[string]string{"bitnami": "https://charts.bitnami.com/bitnami"}
 				cfg.Upstream.OCI = map[string]string{"ghcr": "https://ghcr.io"}
 				cfg.Upstream.APK = map[string]string{"alpine": "https://dl-cdn.alpinelinux.org/alpine"}
+				cfg.Upstream.Arch = map[string]string{
+					"archlinux":    "https://geo.mirror.pkgbuild.com",
+					"archlinuxarm": "https://de3.mirror.archlinuxarm.org",
+				}
 				cfg.Upstream.Generic = map[string]string{
 					"github":     "https://github.com",
 					"github-api": "https://api.github.com",
@@ -1492,6 +1496,20 @@ func TestValidateNamedUpstreams(t *testing.T) {
 			name: "APK upstream URL is not absolute",
 			modify: func(cfg *Config) {
 				cfg.Upstream.APK = map[string]string{"private": "apk.example.com"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "Arch upstream name contains path separator",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Arch = map[string]string{"arch/linux": "https://geo.mirror.pkgbuild.com"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "Arch upstream URL is not absolute",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Arch = map[string]string{"archlinux": "geo.mirror.pkgbuild.com"}
 			},
 			wantErr: true,
 		},
