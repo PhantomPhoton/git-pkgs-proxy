@@ -59,7 +59,9 @@ func (h *ArchHandler) Routes() http.Handler {
 
 		path := strings.TrimPrefix(r.URL.Path, "/")
 
-		if containsPathTraversal(path) {
+		// A decoded '?' or '#' would cut the upstream path short and cache one
+		// file under another file's name.
+		if containsPathTraversal(path) || strings.ContainsAny(path, "?#") {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
@@ -161,7 +163,7 @@ func (h *ArchHandler) handleMetadata(w http.ResponseWriter, r *http.Request, rep
 
 // handleDatabaseSignature lets a database's .sig follow the database instead
 // of its own TTL, since pacman rejects a mismatched pair. A signature older
-// than the cached database is fetched again.
+// than the cached database is fetched again and never served as a fallback.
 func (h *ArchHandler) handleDatabaseSignature(w http.ResponseWriter, r *http.Request, repository, upstreamURL, path string) {
 	p := h.proxy
 	sigKey := h.metadataCacheKey(repository, upstreamURL, path)
@@ -191,7 +193,8 @@ func (h *ArchHandler) handleDatabaseSignature(w http.ResponseWriter, r *http.Req
 	// Own key: a regular fetch would return the cached copy within its TTL.
 	key := metadataCoalesceKey(archEcosystem, sigKey, signatureURL, archAccept, "identity", false) + "\x00follow-database"
 	res, _ := p.coalesceMetadata(r.Context(), key, func(fetchCtx context.Context) metadataResult {
-		return p.fetchMetadataFromUpstream(fetchCtx, archEcosystem, sigKey, signatureURL, archAccept, "identity", nil, sigEntry)
+		// No entry: a 304 or stale fallback would return the old signature.
+		return p.fetchMetadataFromUpstream(fetchCtx, archEcosystem, sigKey, signatureURL, archAccept, "identity", nil, nil)
 	})
 	if res.err != nil {
 		if errors.Is(res.err, ErrUpstreamNotFound) {

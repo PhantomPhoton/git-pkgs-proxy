@@ -685,8 +685,10 @@ Repository databases (`core.db`, `core.files` and their `.tar.*` forms),
 database signatures, packages and package signatures are served byte-for-byte
 unchanged, so pacman's signature checks keep working. Databases use the
 metadata cache (`metadata_ttl`, stale fallback); a database signature is
-refreshed together with its database rather than on its own TTL, so the two
-always match. Packages and their `.sig` files are stored in the shared artifact
+refreshed together with its database rather than on its own TTL, and a
+signature that belongs to an older database is never served in its place. Enable `cache_metadata` (or set `PROXY_CACHE_METADATA=true`) so
+`pacman -Sy` keeps working while the upstream is down; without it databases are
+fetched fresh on every request. Packages and their `.sig` files are stored in the shared artifact
 cache and remain available when the upstream is unreachable.
 
 The proxy only starts sending a package once it has the whole file, and pacman

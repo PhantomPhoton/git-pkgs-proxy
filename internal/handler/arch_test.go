@@ -312,6 +312,72 @@ func TestArchHandler_DatabaseSignatureFollowsDatabase(t *testing.T) {
 	}
 }
 
+// TestArchHandler_OutdatedSignatureNeverServed covers a signature refetch that
+// fails after the database was refreshed. The cached signature belongs to
+// the old database, and pacman rejects a present but invalid signature even
+// with DatabaseOptional, so the proxy must answer 404 or 502 rather than fall
+// back to it.
+func TestArchHandler_OutdatedSignatureNeverServed(t *testing.T) {
+	const dbPath, sigPath = "/custom/os/x86_64/custom.db", "/custom/os/x86_64/custom.db.sig"
+
+	for _, tt := range []struct {
+		name     string
+		breakSig func(u *archUpstream)
+		want     int
+	}{
+		{"signature removed upstream", func(u *archUpstream) {
+			u.mu.Lock()
+			delete(u.files, sigPath)
+			u.mu.Unlock()
+		}, http.StatusNotFound},
+		{"upstream down after database refresh", func(u *archUpstream) { u.available.Store(false) }, http.StatusBadGateway},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := newArchUpstream(t, map[string][]byte{dbPath: []byte("db v1"), sigPath: []byte("sig v1")})
+			proxy := newArchTestProxy(t, upstream)
+			h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"custom": upstream.URL})
+
+			assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v1", []byte("db v1"))
+			assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig v1", []byte("sig v1"))
+
+			upstream.set(dbPath, []byte("db v2"))
+			ageMetadata(t, proxy, h, "custom", upstream.URL, dbPath[1:], 2*time.Hour)
+			assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v2", []byte("db v2"))
+
+			tt.breakSig(upstream)
+			for i := range 2 {
+				w := serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil)
+				if w.Code != tt.want {
+					t.Errorf("request %d: status = %d, body = %q, want %d", i, w.Code, w.Body.String(), tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestArchHandler_RejectsQueryAndFragmentInPath covers a decoded '?' or '#'
+// in the path, which would otherwise fetch one file and cache it under the
+// name that follows.
+func TestArchHandler_RejectsQueryAndFragmentInPath(t *testing.T) {
+	upstream := newArchUpstream(t, map[string][]byte{})
+	proxy := newArchTestProxy(t, upstream)
+	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"archlinux": upstream.URL})
+
+	for _, target := range []string{
+		"/archlinux/core/os/x86_64/bash-5.2-1-x86_64.pkg.tar.zst%3F/foo-9-9-any.pkg.tar.zst",
+		"/archlinux/core/os/x86_64/bash-5.2-1-x86_64.pkg.tar.zst%23/foo-9-9-any.pkg.tar.zst",
+	} {
+		if w := serveArchRequest(h, http.MethodGet, target, nil); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", target, w.Code)
+		}
+	}
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	if len(upstream.hits) != 0 {
+		t.Errorf("upstream was asked for %v", upstream.hits)
+	}
+}
+
 // ageMetadata moves a cached metadata entry's fetch time into the past, as if
 // it had been fetched age ago.
 func ageMetadata(t *testing.T, proxy *Proxy, h *ArchHandler, repository, upstreamURL, path string, age time.Duration) {
