@@ -206,6 +206,11 @@ type Proxy struct {
 	// rewrites caches metadata documents after their handler rewrites them.
 	// Nil leaves every request to rewrite its own copy.
 	rewrites *rewriteCache
+
+	// now is the clock rewritten metadata is dated by, and started the time
+	// the process started; see metadataDate.
+	now     func() time.Time
+	started time.Time
 }
 
 // CooldownPolicy supplies version-age filtering and package-specific durations.
@@ -230,6 +235,8 @@ func NewProxy(db *database.DB, store storage.Storage, fetcher fetch.FetcherInter
 		HTTPClient: &http.Client{
 			Timeout: defaultHTTPTimeout,
 		},
+		now:     time.Now,
+		started: time.Now(),
 	}
 }
 

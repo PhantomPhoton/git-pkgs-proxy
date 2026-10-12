@@ -33,34 +33,17 @@ import (
 // the key, and the denylist is loaded at startup.
 //
 // Each entry keeps the ETag of its output, so clients can revalidate their
-// copy without the output being hashed again on every request. The cache also
-// dates what it serves for each package; see lastModified.
+// copy without the output being hashed again on every request. Dates are not
+// the cache's to give: they must agree across replicas, so the database holds
+// them (see metadataDate).
 type rewriteCache struct {
 	maxBytes int64
-	now      func() time.Time
 
 	mu       sync.Mutex
 	size     int64
 	order    *list.List // most recently used at the front
 	entries  map[string]*list.Element
 	inFlight map[string]*inflightRewrite
-	// serving holds the rewrite each package is serving, keyed by its cache
-	// key without the digest, while that rewrite is cached.
-	serving map[string]servedRewrite
-	// forgotten is the latest second in which the cache may have dated a
-	// rewrite of a package it no longer has in serving: the second it started,
-	// as the previous process may have dated one then, or a later one.
-	forgotten time.Time
-}
-
-// servedRewrite is the rewrite a package is serving and since when.
-type servedRewrite struct {
-	etag string
-	// switched is the second the package started serving it.
-	switched time.Time
-	// since is its Last-Modified: the first second, from switched on, that
-	// can have dated no other rewrite of the package. Zero until there is one.
-	since time.Time
 }
 
 type rewriteEntry struct {
@@ -136,13 +119,10 @@ func newRewriteCache(maxBytes int64) *rewriteCache {
 		return nil
 	}
 	return &rewriteCache{
-		maxBytes:  maxBytes,
-		now:       time.Now,
-		order:     list.New(),
-		entries:   make(map[string]*list.Element),
-		inFlight:  make(map[string]*inflightRewrite),
-		serving:   make(map[string]servedRewrite),
-		forgotten: time.Now().Truncate(time.Second),
+		maxBytes: maxBytes,
+		order:    list.New(),
+		entries:  make(map[string]*list.Element),
+		inFlight: make(map[string]*inflightRewrite),
 	}
 }
 
@@ -154,13 +134,12 @@ func rewriteCacheKey(ecosystem, proxyURL, name string, in []byte) string {
 }
 
 // rewriteCacheKeyForDigest is rewriteCacheKey for upstream bytes known only by
-// their digest, in the form the metadata cache records it. The digest comes
-// last, so the key without it names the package the rewrite is for.
+// their digest, in the form the metadata cache records it.
 func rewriteCacheKeyForDigest(ecosystem, proxyURL, name, digest string) string {
 	return strings.Join([]string{ecosystem, proxyURL, name, digest}, "\x00")
 }
 
-// get returns the cached rewrite for key and its validators, if there is one.
+// get returns the cached rewrite for key and its ETag, if there is one.
 func (c *rewriteCache) get(key string) ([]byte, metadataValidators, bool) {
 	if c == nil {
 		return nil, metadataValidators{}, false
@@ -173,10 +152,10 @@ func (c *rewriteCache) get(key string) ([]byte, metadataValidators, bool) {
 	}
 	c.order.MoveToFront(el)
 	e := el.Value.(*rewriteEntry)
-	return e.out, c.validators(e), true
+	return e.out, metadataValidators{etag: e.etag}, true
 }
 
-// rewrite returns rewrite(in) and its validators, from the cache when it can.
+// rewrite returns rewrite(in) and its ETag, from the cache when it can.
 // Callers must treat the returned bytes as read-only: a cached result is
 // shared. A caller waiting on another's rewrite leaves when ctx ends; the
 // rewrite itself always runs to completion, so the result is cached for the
@@ -189,9 +168,9 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 	c.mu.Lock()
 	if el, ok := c.entries[key]; ok {
 		c.order.MoveToFront(el)
-		v := c.validators(el.Value.(*rewriteEntry))
+		e := el.Value.(*rewriteEntry)
 		c.mu.Unlock()
-		return el.Value.(*rewriteEntry).out, v, nil
+		return e.out, metadataValidators{etag: e.etag}, nil
 	}
 	if f, ok := c.inFlight[key]; ok {
 		c.mu.Unlock()
@@ -199,7 +178,7 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 		case <-ctx.Done():
 			return nil, metadataValidators{}, ctx.Err()
 		case <-f.done:
-			return f.out, c.servedValidators(key, f.etag), f.err
+			return f.out, metadataValidators{etag: f.etag}, f.err
 		}
 	}
 	f := &inflightRewrite{done: make(chan struct{}), err: errSharedRewriteAbandoned}
@@ -214,7 +193,6 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 		}
 		c.mu.Unlock()
 		close(f.done)
-		out, v, err = f.out, c.servedValidators(key, f.etag), f.err
 	}()
 	var fv metadataValidators
 	f.out, fv, f.err = rewriteWithETag(in, rewrite)
@@ -222,83 +200,7 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 	return f.out, fv, f.err
 }
 
-// servedValidators returns the validators to serve the rewrite made for key
-// with, if it was cached, and its bare ETag otherwise.
-func (c *rewriteCache) servedValidators(key, etag string) metadataValidators {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if el, ok := c.entries[key]; ok && el.Value.(*rewriteEntry).etag == etag {
-		return c.validators(el.Value.(*rewriteEntry))
-	}
-	return metadataValidators{etag: etag}
-}
-
-// validators returns the validators to serve cached rewrite e with, and
-// records that its package is serving it. Called with mu held.
-func (c *rewriteCache) validators(e *rewriteEntry) metadataValidators {
-	return metadataValidators{etag: e.etag, lastModified: c.lastModified(rewritePackage(e.key), e.etag)}
-}
-
-// rewritePackage returns the part of a rewrite cache key that names the
-// package, without the digest of the upstream document.
-func rewritePackage(key string) string {
-	return key[:strings.LastIndexByte(key, 0)]
-}
-
-// lastModified returns the Last-Modified to serve the rewrite of pkg with
-// the given ETag with, or zero for none, and records that pkg is serving it.
-//
-// The date is the second pkg started serving the rewrite, which is later than
-// any date given to a rewrite pkg served before, so a client holding one never
-// gets 304 for another. Upstream's date cannot serve, since the rewrite also
-// depends on configuration read at startup, and a rewrite cached earlier and
-// served again keeps no date of its own. Dates are never ahead of the clock,
-// so they hold across a restart. When pkg switches rewrites in a second that
-// already dated one, the new one shares that second with a date a client may
-// hold, so it goes undated until the next second. Called with mu held.
-func (c *rewriteCache) lastModified(pkg, etag string) time.Time {
-	now := c.now().Truncate(time.Second)
-	cur, ok := c.serving[pkg]
-	switch {
-	case ok && cur.etag == etag:
-		if cur.since.IsZero() && now.After(cur.switched) {
-			cur.since = now
-		}
-	case ok:
-		since := now
-		if !cur.switched.Before(now) || !cur.since.Before(now) {
-			since = time.Time{}
-		}
-		cur = servedRewrite{etag: etag, switched: now, since: since}
-	default:
-		since := now
-		if !now.After(c.forgotten) {
-			since = time.Time{}
-		}
-		cur = servedRewrite{etag: etag, switched: now, since: since}
-	}
-	c.serving[pkg] = cur
-	return cur.since
-}
-
-// forget drops what serving records for e's package when e is the rewrite
-// the package is serving, so the map holds only packages with a cached
-// rewrite. Called with mu held, as e is evicted.
-func (c *rewriteCache) forget(e *rewriteEntry) {
-	pkg := rewritePackage(e.key)
-	cur, ok := c.serving[pkg]
-	if !ok || cur.etag != e.etag {
-		return
-	}
-	delete(c.serving, pkg)
-	now := c.now().Truncate(time.Second)
-	if !cur.switched.Before(now) || !cur.since.Before(now) {
-		c.forgotten = now
-	}
-}
-
-// rewriteWithETag runs rewrite and computes the ETag of what it returns. It
-// gives no Last-Modified: nothing records when an uncached rewrite was served.
+// rewriteWithETag runs rewrite and computes the ETag of what it returns.
 func rewriteWithETag(in []byte, rewrite func([]byte) ([]byte, error)) ([]byte, metadataValidators, error) {
 	out, err := rewrite(in)
 	if err != nil {
@@ -322,7 +224,6 @@ func (c *rewriteCache) add(e *rewriteEntry) {
 		e := oldest.Value.(*rewriteEntry)
 		c.order.Remove(oldest)
 		delete(c.entries, e.key)
-		c.forget(e)
 		c.size -= int64(len(e.out))
 	}
 }
@@ -343,7 +244,8 @@ func (c *rewriteCache) len() int {
 // on the current time, so with cooldown on a cached rewrite could keep hiding
 // a version past its cooldown; those rewrites always run, with no
 // Last-Modified, and when digest is known their ETag comes from their inputs
-// rather than from hashing each output again.
+// rather than from hashing each output again. Their ETag also changes with
+// every restart, so replicas would never agree on a date for them.
 func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name string, in []byte, digest string, rewrite keepingRewrite) (rewrittenMetadata, error) {
 	if p.cooldownEnabled() && digest != "" {
 		out, kept, err := rewrite(in)
@@ -363,6 +265,9 @@ func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name str
 		out, v, err = rewriteWithETag(in, rewriteOnly)
 	} else {
 		out, v, err = p.rewrites.rewrite(ctx, rewriteCacheKey(ecosystem, proxyURL, name, in), in, rewriteOnly)
+	}
+	if err == nil && !p.cooldownEnabled() {
+		v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
 	}
 	return rewrittenMetadata{out, v}, err
 }
@@ -395,6 +300,7 @@ func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) (rewri
 	if !ok {
 		return rewrittenMetadata{}, false
 	}
+	v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
 	metrics.RecordCacheHit(ecosystem)
 	return rewrittenMetadata{out, v}, true
 }
