@@ -97,7 +97,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `deb` | no | - |
 | `gem` | no | - |
 | `golang` | yes | `pkg:golang/github.com/stretchr/testify`, the module path as in `go.mod`; case doesn't matter. A major version like `/v2` (or `.v3` on gopkg.in) is a module of its own and needs its own rule. The `!`-escaped form from proxy URLs and the module cache (`github.com/!azure/...`) is refused. |
-| `helm` | no | - |
+| `helm` | yes | No package rules: charts are cached per repository and digest, not under the chart name. The `helm` rule and `default` cover charts from HTTP repositories; charts pulled over OCI fall under `oci`. |
 | `hex` | no | - |
 | `julia` | no | - |
 | `maven` | yes | `pkg:maven/com.google.guava/guava`, group and artifact as published, case included. Gradle build cache entries are not covered; they use `gradle.build_cache.max_age`. |

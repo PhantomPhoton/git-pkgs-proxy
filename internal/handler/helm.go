@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
@@ -19,6 +21,15 @@ const (
 	helmIndexFilename     = "index.yaml"
 	sha256HexLength       = 64
 )
+
+// Helm takes no package rules: charts are cached under the configured
+// repository's name and the chart digest, not under the chart name, so a key
+// like pkg:helm/nginx would name a repository. The helm rule and the default
+// cover charts from HTTP repositories; charts pulled over OCI go through the
+// container handler and fall under oci.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "helm"})
+}
 
 // HelmHandler serves read-only HTTP Helm chart repositories. Each configured
 // repository is mounted at /helm/{repository}/.
