@@ -88,7 +88,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 
 | Ecosystem key | Retention supported | Package rule form |
 |---------------|---------------------|-------------------|
-| `alpine` | no | - |
+| `alpine` | yes | `pkg:apk/curl` or `pkg:apk/alpine/curl`; case doesn't matter. A rule covers the package in every configured APK repository. Alpine mirrors keep only the current build of each package per release, so an evicted older one can't be fetched again. |
 | `cargo` | no | - |
 | `composer` | no | - |
 | `conan` | no | - |
