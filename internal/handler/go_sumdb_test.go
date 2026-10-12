@@ -521,7 +521,15 @@ func TestGoSumDB_FreshTreeIsNotAnAnswer(t *testing.T) {
 		t.Fatalf("supported: status = %d, want 200", w.Code)
 	}
 
+	// Coarse clocks (Windows) can give the first probe's success and start
+	// the same time; start must come after it.
+	h.sumDBProbes.mu.Lock()
+	succeeded := h.sumDBProbes.succeeded[testSumDBName]
+	h.sumDBProbes.mu.Unlock()
 	start := time.Now()
+	for !start.After(succeeded) {
+		start = time.Now()
+	}
 	db.down.Store(true)
 	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusOK {
 		t.Fatalf("supported with a fresh cached tree: status = %d, want 200", w.Code)
