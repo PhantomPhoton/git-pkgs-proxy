@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/BurntSushi/toml"
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
@@ -27,6 +28,14 @@ var (
 	juliaHexPattern  = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
 	juliaUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
+
+// Julia takes no package rules: its PURLs need a uuid qualifier the cache
+// doesn't store. The julia rule and the default cover package tarballs,
+// artifacts and registry snapshots alike; all are content-addressed, so an
+// evicted one comes back unchanged.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "julia"})
+}
 
 // JuliaHandler handles Julia Pkg server protocol requests.
 //
