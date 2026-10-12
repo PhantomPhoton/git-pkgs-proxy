@@ -1005,6 +1005,11 @@ func TestGetOrFetchArtifactFromURL_FetchError(t *testing.T) {
 	if diff := testutil.ToFloat64(metrics.UpstreamErrors.WithLabelValues("pypi", "fetch_failed")) - errorsBefore; diff != 1 {
 		t.Errorf("upstream errors delta = %.0f, want 1", diff)
 	}
+	recent := metrics.RecentFailures("proxy_upstream_errors_total", map[string]string{"ecosystem": "pypi", "error_type": "fetch_failed"})
+	if len(recent) == 0 || recent[0].PURL != "pkg:pypi/fail@1.0.0" ||
+		recent[0].URL != "https://pypi.org/files/fail-1.0.0.tar.gz" || recent[0].Error != "connection refused" {
+		t.Errorf("latest upstream failure = %+v, want the failed package, its URL and the error", recent)
+	}
 }
 
 func TestGetOrFetchArtifactFromURL_StoreError(t *testing.T) {
@@ -1025,6 +1030,11 @@ func TestGetOrFetchArtifactFromURL_StoreError(t *testing.T) {
 	}
 	if diff := testutil.ToFloat64(metrics.StorageErrors.WithLabelValues("write")) - errorsBefore; diff != 1 {
 		t.Errorf("storage errors delta = %.0f, want 1", diff)
+	}
+	recent := metrics.RecentFailures("proxy_storage_errors_total", map[string]string{"operation": "write"})
+	if len(recent) == 0 || recent[0].PURL != "pkg:pypi/fail@1.0.0" || recent[0].Filename != "fail-1.0.0.tar.gz" ||
+		recent[0].Path == "" || recent[0].Error != "disk full" {
+		t.Errorf("latest storage failure = %+v, want the failed package, its storage path and the error", recent)
 	}
 }
 

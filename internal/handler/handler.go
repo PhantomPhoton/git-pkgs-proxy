@@ -367,7 +367,8 @@ func (p *Proxy) checkCache(ctx context.Context, pkgPURL, versionPURL, filename s
 	reader, err := p.Storage.Open(ctx, artifact.StoragePath)
 	metrics.RecordStorageOperation("read", time.Since(start))
 	if err != nil {
-		metrics.RecordStorageError("read")
+		metrics.RecordStorageError("read", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, Path: artifact.StoragePath, Err: err})
 		p.Logger.Warn("cached artifact missing from storage, will refetch",
 			"path", artifact.StoragePath, "error", err)
 		return nil, nil
@@ -378,7 +379,8 @@ func (p *Proxy) checkCache(ctx context.Context, pkgPURL, versionPURL, filename s
 			p.Logger.Error("cached artifact failed integrity check",
 				"purl", versionPURL, "filename", filename,
 				"path", artifact.StoragePath, "reason", reason)
-			metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem))
+			metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem), metrics.FailureDetail{
+				PURL: versionPURL, Filename: filename, Path: artifact.StoragePath, Err: errors.New(reason)})
 			if err := p.DB.DiscardArtifact(versionPURL, filename, artifact.StoragePath); err != nil {
 				p.Logger.Warn("failed to clear corrupt artifact from cache", "error", err)
 			}
@@ -421,7 +423,8 @@ func (p *Proxy) rejectUnusableCacheRecord(artifact *database.CachedArtifact, ver
 	p.Logger.Warn("cached artifact has unusable integrity metadata",
 		"purl", versionPURL, "filename", filename,
 		"path", artifact.StoragePath, "error", cause)
-	metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem))
+	metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem), metrics.FailureDetail{
+		PURL: versionPURL, Filename: filename, Path: artifact.StoragePath, Err: cause})
 	if err := p.DB.DiscardArtifact(versionPURL, filename, artifact.StoragePath); err != nil {
 		p.Logger.Warn("failed to clear unusable artifact from cache", "error", err)
 	}
@@ -459,7 +462,8 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 
 	if err != nil {
 		metrics.RecordUpstreamFetch(ecosystem, fetchDuration)
-		metrics.RecordUpstreamError(ecosystem, "fetch_failed")
+		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: info.URL, Err: err})
 		if errors.Is(err, fetch.ErrNotFound) {
 			return artifacts.Artifact{}, "", ErrUpstreamNotFound
 		}
@@ -491,7 +495,8 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	_ = artifact.Body.Close()
 	metrics.RecordStorageOperation("write", time.Since(storeStart))
 	if err != nil {
-		metrics.RecordStorageError("write")
+		metrics.RecordStorageError("write", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: upstreamURL, Path: storagePath, Err: err})
 		return artifacts.Artifact{}, "", fmt.Errorf("storing artifact: %w", err)
 	}
 
@@ -546,7 +551,8 @@ func (p *Proxy) openStoredArtifact(ctx context.Context, artifact artifacts.Artif
 	metrics.RecordStorageOperation("read", time.Since(readStart))
 
 	if err != nil {
-		metrics.RecordStorageError("read")
+		metrics.RecordStorageError("read", metrics.FailureDetail{
+			PURL: artifact.PURL, Filename: artifact.Filename, Path: storagePath, Err: err})
 		return nil, fmt.Errorf("opening cached artifact: %w", err)
 	}
 
@@ -1711,7 +1717,8 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 	artifact, err := p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
-		metrics.RecordUpstreamError(ecosystem, "fetch_failed")
+		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: downloadURL, Err: err})
 		if errors.Is(err, fetch.ErrNotFound) {
 			return artifacts.Artifact{}, "", ErrUpstreamNotFound
 		}
@@ -1736,7 +1743,8 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 	artifact, err := fetchArtifact(ctx)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
-		metrics.RecordUpstreamError(ecosystem, "fetch_failed")
+		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: err})
 		if errors.Is(err, fetch.ErrNotFound) {
 			return nil, ErrUpstreamNotFound
 		}
@@ -1748,7 +1756,8 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 		onError: func(read int64, err error) {
 			p.Logger.Warn("streaming artifact from upstream failed",
 				"purl", versionPURL, "filename", filename, "url", upstreamURL, "bytes", read, "error", err)
-			metrics.RecordUpstreamError(ecosystem, "stream_failed")
+			metrics.RecordUpstreamError(ecosystem, "stream_failed", metrics.FailureDetail{
+				PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: err})
 		},
 	}
 	result := &CacheResult{
@@ -1773,7 +1782,8 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 	result.Reader, err = checks.wrapFailOnMismatch(body, func(reason string) {
 		p.Logger.Error("streamed artifact failed integrity check",
 			"purl", versionPURL, "filename", filename, "url", upstreamURL, "reason", reason)
-		metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(ecosystem))
+		metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(ecosystem), metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: errors.New(reason)})
 	})
 	if err != nil {
 		_ = artifact.Body.Close()

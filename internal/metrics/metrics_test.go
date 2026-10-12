@@ -32,8 +32,8 @@ func TestRecordCacheOperations(t *testing.T) {
 func TestRecordUpstreamOperations(t *testing.T) {
 	RecordUpstreamFetch("npm", 500*time.Millisecond)
 	RecordUpstreamFetch("pypi", 1*time.Second)
-	RecordUpstreamError("npm", "fetch_failed")
-	RecordUpstreamError("pypi", "not_found")
+	RecordUpstreamError("npm", "fetch_failed", FailureDetail{})
+	RecordUpstreamError("pypi", "not_found", FailureDetail{})
 
 	// No panics = success
 }
@@ -41,8 +41,8 @@ func TestRecordUpstreamOperations(t *testing.T) {
 func TestRecordStorageOperations(t *testing.T) {
 	RecordStorageOperation("read", 10*time.Millisecond)
 	RecordStorageOperation("write", 50*time.Millisecond)
-	RecordStorageError("read")
-	RecordStorageError("write")
+	RecordStorageError("read", FailureDetail{})
+	RecordStorageError("write", FailureDetail{})
 
 	// No panics = success
 }
