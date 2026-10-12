@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
@@ -19,6 +21,14 @@ const (
 	cargoIndexLen2 = 2
 	cargoIndexLen3 = 3
 )
+
+// Crates are stored under pkg:cargo/{name}, with the name cargo puts in the
+// download URL, which is the name as published. purl keeps cargo names as
+// they are, so package rules use the default key mapping and have to match
+// that name exactly.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "cargo", CanonicalPackage: retention.DefaultCanonical("cargo")})
+}
 
 // CargoHandler handles cargo registry protocol requests.
 type CargoHandler struct {
