@@ -511,6 +511,27 @@ func TestGoSumDBDataTileRecords(t *testing.T) {
 	}
 }
 
+// TestGoSumDB_FreshTreeIsNotAnAnswer: a supported check answered from a
+// fresh cached tree did not reach the database, so it must not cancel a
+// failure that a lookup started earlier reports afterwards.
+func TestGoSumDB_FreshTreeIsNotAnAnswer(t *testing.T) {
+	db := newFakeSumDB(t, map[string]string{"/latest": testSumDBTree})
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
+	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusOK {
+		t.Fatalf("supported: status = %d, want 200", w.Code)
+	}
+
+	start := time.Now()
+	db.down.Store(true)
+	if w := serveGoRequest(h, "/sumdb/sum.example/supported"); w.Code != http.StatusOK {
+		t.Fatalf("supported with a fresh cached tree: status = %d, want 200", w.Code)
+	}
+	h.sumDBProbes.recordFailure(testSumDBName, start)
+	if !h.sumDBProbes.recentlyFailed(testSumDBName) {
+		t.Error("a supported check answered from the cache counted as reaching the database")
+	}
+}
+
 func TestGoSumDBProbes_TimeoutDoesNotOverwriteLaterSuccess(t *testing.T) {
 	var probes goSumDBProbes
 	start := time.Now()

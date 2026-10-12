@@ -195,9 +195,14 @@ func (h *GoHandler) sumDBReachable(r *http.Request, name, sumDBURL string) bool 
 }
 
 // probeSumDB fetches the database's latest tree and records whether the
-// database answered. A tree served from the cache within its TTL counts as
-// an answer; one served because upstream failed does not.
+// database answered. A tree still fresh in the cache is enough for supported
+// but records nothing, since the database was not asked: counting it as an
+// answer would keep lookups that fail during an outage from being
+// remembered. A tree served because upstream failed is not an answer.
 func (h *GoHandler) probeSumDB(ctx context.Context, name, cacheKey, sumDBURL string, check func([]byte) error) error {
+	if entry, _, _, ok := h.readCachedSumDB(ctx, cacheKey, check); ok && h.treeFresh(entry) {
+		return nil
+	}
 	res := h.proxy.lookupMetadata(ctx, goEcosystem, cacheKey, sumDBURL+"/latest", "*/*", "identity", check)
 	err := res.err
 	if err == nil && res.stale {
