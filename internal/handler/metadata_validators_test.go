@@ -76,18 +76,61 @@ var validatorCases = []validatorCase{
 
 func validatorProxy(t *testing.T, u *validatorUpstream, ttl time.Duration) *Proxy {
 	t.Helper()
-	proxy, _ := validatorProxyWithDB(t, u, ttl)
+	proxy, _, _ := validatorProxyWithDB(t, u, ttl)
 	return proxy
 }
 
-func validatorProxyWithDB(t *testing.T, u *validatorUpstream, ttl time.Duration) (*Proxy, *database.DB) {
+// validatorProxyWithDB returns a proxy whose rewrite cache runs on a clock
+// the test moves, starting a second after the process start it models.
+func validatorProxyWithDB(t *testing.T, u *validatorUpstream, ttl time.Duration) (*Proxy, *database.DB, *testClock) {
 	t.Helper()
 	proxy, db, _, _ := setupTestProxy(t)
 	proxy.HTTPClient = u.Client()
 	proxy.CacheMetadata = true
 	proxy.MetadataTTL = ttl
+	clock := &testClock{t: time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)}
+	restartRewriteCache(proxy, clock)
+	clock.advance(time.Second)
+	return proxy, db, clock
+}
+
+// restartRewriteCache gives proxy a new, empty rewrite cache started at the
+// clock's current time, as a restart of the process would.
+func restartRewriteCache(proxy *Proxy, clock *testClock) {
 	proxy.SetMetadataRewriteCacheSize(1 << 20)
-	return proxy, db
+	proxy.rewrites.useClock(clock.now)
+}
+
+// useClock makes the cache read time from now, as if it was made at now().
+func (c *rewriteCache) useClock(now func() time.Time) {
+	c.now = now
+	c.forgotten = now().Truncate(time.Second)
+}
+
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *testClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// npmV and composerV are upstream documents with a single version v.
+func npmV(v string) string {
+	return `{"name":"left-pad","versions":{"` + v + `":{"dist":{"tarball":"https://registry.npmjs.org/left-pad/-/left-pad-` + v + `.tgz"}}}}`
+}
+
+func composerV(v string) string {
+	return `{"packages":{"vendor/pkg":[{"version":"` + v + `","dist":{"type":"zip","url":"https://example.com/pkg-` + v + `.zip"}}]}}`
 }
 
 // expireMetadata ages a metadata cache row past any TTL, so the next request
@@ -172,25 +215,28 @@ func TestRewrittenMetadataETagFollowsUpstream(t *testing.T) {
 }
 
 // TestRewrittenMetadataLastModified checks the validator Composer revalidates
-// with. It is when this process made the rewrite, not upstream's date: the
-// rewrite also depends on configuration read at startup, so the same upstream
-// document can be rewritten differently after a restart.
+// with. It is when this process started serving the rewrite, not upstream's
+// date: the rewrite also depends on configuration read at startup, so the
+// same upstream document can be rewritten differently after a restart. It
+// stays the same while the rewrite does.
 func TestRewrittenMetadataLastModified(t *testing.T) {
 	for _, c := range validatorCases {
 		for _, ttl := range []time.Duration{time.Hour, 0} {
 			t.Run(c.ecosystem+"/ttl="+ttl.String(), func(t *testing.T) {
 				u := newValidatorUpstream(t)
-				handler := c.handler(validatorProxy(t, u, ttl), u)
+				proxy, _, clock := validatorProxyWithDB(t, u, ttl)
+				handler := c.handler(proxy, u)
 
-				before := time.Now().Truncate(time.Second)
+				clock.advance(400 * time.Millisecond)
 				first := serve(handler, c.path, nil)
 				lastModified, err := http.ParseTime(first.Header().Get("Last-Modified"))
 				if err != nil {
 					t.Fatalf("Last-Modified %q: %v", first.Header().Get("Last-Modified"), err)
 				}
-				if lastModified.Before(before) || lastModified.After(time.Now()) {
-					t.Errorf("Last-Modified %v, want the time of the rewrite, at or after %v", lastModified, before)
+				if want := clock.now().Truncate(time.Second); !lastModified.Equal(want) {
+					t.Errorf("Last-Modified %v, want %v, the second of the rewrite", lastModified, want)
 				}
+				clock.advance(time.Hour)
 
 				current := serve(handler, c.path, http.Header{"If-Modified-Since": {first.Header().Get("Last-Modified")}})
 				if current.Code != http.StatusNotModified || current.Body.Len() != 0 {
@@ -225,7 +271,7 @@ func TestRewrittenMetadataLastModifiedFollowsRefresh(t *testing.T) {
 		for _, ttl := range []time.Duration{time.Hour, 0} {
 			t.Run(c.ecosystem+"/ttl="+ttl.String(), func(t *testing.T) {
 				u := newValidatorUpstream(t)
-				proxy, db := validatorProxyWithDB(t, u, ttl)
+				proxy, db, clock := validatorProxyWithDB(t, u, ttl)
 				handler := c.handler(proxy, u)
 
 				first := serve(handler, c.path, nil)
@@ -234,10 +280,8 @@ func TestRewrittenMetadataLastModifiedFollowsRefresh(t *testing.T) {
 					t.Fatalf("first response: status %d, Last-Modified %q; want 200 with a Last-Modified", first.Code, firstModified)
 				}
 
-				u.set(
-					`{"name":"left-pad","versions":{"1.3.1":{"dist":{"tarball":"https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz"}}}}`,
-					`{"packages":{"vendor/pkg":[{"version":"1.0.1","dist":{"type":"zip","url":"https://example.com/pkg-1.0.1.zip"}}]}}`,
-				)
+				clock.advance(time.Minute)
+				u.set(npmV("1.3.1"), composerV("1.0.1"))
 				u.setLastModified(u.lastModified.Add(24 * time.Hour))
 				expireMetadata(t, db, c.ecosystem, c.name)
 
@@ -256,6 +300,121 @@ func TestRewrittenMetadataLastModifiedFollowsRefresh(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRewrittenMetadataLastModifiedReturningDocument is a regression test
+// for a false 304. Upstream serves A, then B, then A again; A's cached
+// rewrite must not bring back the date it was first served with, which is
+// earlier than B's, or a client holding B gets 304 for A.
+func TestRewrittenMetadataLastModifiedReturningDocument(t *testing.T) {
+	for _, c := range validatorCases {
+		for _, ttl := range []time.Duration{time.Hour, 0} {
+			t.Run(c.ecosystem+"/ttl="+ttl.String(), func(t *testing.T) {
+				u := newValidatorUpstream(t)
+				proxy, db, clock := validatorProxyWithDB(t, u, ttl)
+				handler := c.handler(proxy, u)
+				change := func(v string) {
+					clock.advance(10 * time.Second)
+					u.set(npmV(v), composerV(v))
+					if ttl > 0 {
+						expireMetadata(t, db, c.ecosystem, c.name)
+					}
+				}
+
+				u.set(npmV("1.0.0"), composerV("1.0.0"))
+				a := serve(handler, c.path, nil)
+				change("2.0.0")
+				b := serve(handler, c.path, nil)
+				if b.Body.String() == a.Body.String() || b.Header().Get("Last-Modified") == "" {
+					t.Fatalf("B: Last-Modified %q, body changed %t; want a new body with a date", b.Header().Get("Last-Modified"), b.Body.String() != a.Body.String())
+				}
+				change("1.0.0")
+
+				rec := serve(handler, c.path, http.Header{"If-Modified-Since": {b.Header().Get("Last-Modified")}})
+				if rec.Code != http.StatusOK || rec.Body.String() != a.Body.String() {
+					t.Fatalf("A again, If-Modified-Since B's date: status %d, body is A %t; want 200 with A", rec.Code, rec.Body.String() == a.Body.String())
+				}
+				was, _ := http.ParseTime(b.Header().Get("Last-Modified"))
+				if now, err := http.ParseTime(rec.Header().Get("Last-Modified")); err != nil || !now.After(was) {
+					t.Errorf("A again: Last-Modified %q, want later than B's %q", rec.Header().Get("Last-Modified"), b.Header().Get("Last-Modified"))
+				}
+			})
+		}
+	}
+}
+
+// TestRewrittenMetadataLastModifiedSameSecond checks that a document that
+// replaces another within the second the other was dated gets no date of
+// its own until a later second, rather than one ahead of the clock. The
+// clock-time date it would share is one a client may already hold.
+func TestRewrittenMetadataLastModifiedSameSecond(t *testing.T) {
+	for _, c := range validatorCases {
+		t.Run(c.ecosystem, func(t *testing.T) {
+			u := newValidatorUpstream(t)
+			proxy, _, clock := validatorProxyWithDB(t, u, 0)
+			handler := c.handler(proxy, u)
+
+			a := serve(handler, c.path, nil)
+			aModified := a.Header().Get("Last-Modified")
+			u.set(npmV("2.0.0"), composerV("2.0.0"))
+			for i, header := range []http.Header{nil, {"If-Modified-Since": {aModified}}} {
+				rec := serve(handler, c.path, header)
+				if rec.Code != http.StatusOK || rec.Body.String() == a.Body.String() {
+					t.Fatalf("request %d for B: status %d; want 200 with B", i, rec.Code)
+				}
+				if lm := rec.Header().Get("Last-Modified"); lm != "" {
+					t.Errorf("request %d for B in A's second: Last-Modified %q, want none", i, lm)
+				}
+			}
+
+			clock.advance(time.Second)
+			rec := serve(handler, c.path, nil)
+			lastModified, err := http.ParseTime(rec.Header().Get("Last-Modified"))
+			if want := clock.now().Truncate(time.Second); err != nil || !lastModified.Equal(want) {
+				t.Errorf("B a second later: Last-Modified %q, want %v", rec.Header().Get("Last-Modified"), want)
+			}
+		})
+	}
+}
+
+// TestRewrittenMetadataLastModifiedAcrossRestart is a regression test for a
+// false 304 after a restart. Dates are never ahead of the clock, and the
+// restarted process dates nothing in the second it starts, the last in which
+// the previous process may have dated a document.
+func TestRewrittenMetadataLastModifiedAcrossRestart(t *testing.T) {
+	for _, c := range validatorCases {
+		t.Run(c.ecosystem, func(t *testing.T) {
+			u := newValidatorUpstream(t)
+			proxy, _, clock := validatorProxyWithDB(t, u, 0)
+			handler := c.handler(proxy, u)
+
+			// Two documents in one second; the client keeps the latest date.
+			latest := serve(handler, c.path, nil).Header().Get("Last-Modified")
+			u.set(npmV("2.0.0"), composerV("2.0.0"))
+			if lm := serve(handler, c.path, nil).Header().Get("Last-Modified"); lm != "" {
+				latest = lm
+			}
+			if held, _ := http.ParseTime(latest); held.After(clock.now()) {
+				t.Errorf("Last-Modified %q is ahead of the clock at %v", latest, clock.now())
+			}
+
+			restartRewriteCache(proxy, clock)
+			u.set(npmV("3.0.0"), composerV("3.0.0"))
+			rec := serve(handler, c.path, http.Header{"If-Modified-Since": {latest}})
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "3.0.0") {
+				t.Fatalf("changed document after a restart, If-Modified-Since %q: status %d; want 200 with it", latest, rec.Code)
+			}
+			if lm := rec.Header().Get("Last-Modified"); lm != "" {
+				t.Errorf("Last-Modified %q in the second the process started, want none", lm)
+			}
+
+			clock.advance(time.Second)
+			rec = serve(handler, c.path, http.Header{"If-Modified-Since": {latest}})
+			if rec.Code != http.StatusOK || rec.Header().Get("Last-Modified") == "" {
+				t.Errorf("a second after the restart: status %d, Last-Modified %q; want 200 with a date", rec.Code, rec.Header().Get("Last-Modified"))
+			}
+		})
 	}
 }
 
@@ -328,58 +487,76 @@ func TestRewriteCacheETag(t *testing.T) {
 }
 
 // TestRewriteCacheLastModified checks the Last-Modified the rewrite cache
-// gives each rewrite: the second it was made, kept while it stays cached, and
-// always later than any earlier rewrite of the same package, so that a client
-// holding one representation never gets 304 for another.
+// serves each rewrite with: the second the package started serving it, so a
+// client holding one representation never gets 304 for another. A date is
+// never ahead of the clock, so none is given in a second that may already
+// have dated another representation of the package.
 func TestRewriteCacheLastModified(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 10, 10, 12, 0, 0, 400_000_000, time.UTC)}
 	c := newRewriteCache(8)
-	clock := time.Date(2026, 10, 10, 12, 0, 0, 400_000_000, time.UTC)
-	c.now = func() time.Time { return clock }
-	second := clock.Truncate(time.Second)
+	c.useClock(clock.now)
+	second := func() time.Time { return clock.now().Truncate(time.Second) }
 	identity := func(b []byte) ([]byte, error) { return b, nil }
+	key := func(name, doc string) string { return rewriteCacheKey("npm", "http://proxy", name, []byte(doc)) }
 	rewrite := func(name, doc string) time.Time {
 		t.Helper()
-		_, v, err := c.rewrite(t.Context(), rewriteCacheKey("npm", "http://proxy", name, []byte(doc)), []byte(doc), identity)
+		_, v, err := c.rewrite(t.Context(), key(name, doc), []byte(doc), identity)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return v.lastModified
 	}
+	expect := func(what string, got, want time.Time) {
+		t.Helper()
+		if !got.Equal(want) {
+			t.Errorf("%s: Last-Modified %v, want %v", what, got, want)
+		}
+	}
+	var undated time.Time
 
-	if got := rewrite("demo", "a"); !got.Equal(second) {
-		t.Errorf("first rewrite: Last-Modified %v, want %v", got, second)
-	}
-	clock = clock.Add(300 * time.Millisecond)
-	if got := rewrite("demo", "a"); !got.Equal(second) {
-		t.Errorf("cached rewrite: Last-Modified %v, want %v as before", got, second)
+	expect("in the second the cache started", rewrite("demo", "a"), undated)
+	clock.advance(time.Second)
+	a := second()
+	expect("a second later", rewrite("demo", "a"), a)
+	clock.advance(300 * time.Millisecond)
+	if _, v, ok := c.get(key("demo", "a")); !ok || !v.lastModified.Equal(a) {
+		t.Errorf("get: Last-Modified %v, %v; want %v", v.lastModified, ok, a)
 	}
 
-	// A new document in the same second must not share the date.
-	b := rewrite("demo", "b")
-	if !b.After(second) {
-		t.Errorf("new document in the same second: Last-Modified %v, want later than %v", b, second)
-	}
+	// A new document in the second a was dated gets no date, and neither
+	// does a, back in the same second, until a later one.
+	expect("new document in the same second", rewrite("demo", "b"), undated)
+	expect("a back in the same second", rewrite("demo", "a"), undated)
 	// Another package is not held back by it.
-	if got := rewrite("other", "x"); !got.Equal(second) {
-		t.Errorf("other package: Last-Modified %v, want %v", got, second)
-	}
+	expect("other package", rewrite("other", "x"), a)
+	clock.advance(time.Second)
+	expect("a in the next second", rewrite("demo", "a"), second())
 
-	// Evicting what came before does not let a later rewrite reuse its date.
+	// A cached document coming back is dated when it comes back.
+	clock.advance(10 * time.Second)
+	b := second()
+	expect("b", rewrite("demo", "b"), b)
+	clock.advance(10 * time.Second)
+	expect("a after b", rewrite("demo", "a"), second())
+
+	// Evicting the package's current document forgets the package. Its next
+	// document can be dated at once unless the forgotten one was dated in
+	// this second.
+	clock.advance(10 * time.Second)
 	for _, doc := range []string{"ccc", "ddd", "eee"} {
 		rewrite("filler", doc)
 	}
-	if _, _, ok := c.get(rewriteCacheKey("npm", "http://proxy", "demo", []byte("b"))); ok {
-		t.Fatal("expected b to be evicted")
+	if _, _, ok := c.get(key("demo", "a")); ok {
+		t.Fatal("expected a to be evicted")
 	}
-	if got := rewrite("demo", "b"); !got.After(b) {
-		t.Errorf("rewrite after eviction: Last-Modified %v, want later than %v", got, b)
+	if _, ok := c.serving[rewritePackage(key("demo", "a"))]; ok {
+		t.Error("the package is still recorded after its rewrite was evicted")
 	}
-
-	// Once the clock moves on, dates follow it again instead of drifting ahead.
-	clock = clock.Add(10 * time.Second)
-	if got, want := rewrite("demo", "f"), clock.Truncate(time.Second); !got.Equal(want) {
-		t.Errorf("later rewrite: Last-Modified %v, want %v", got, want)
+	expect("after a clean eviction", rewrite("demo", "f"), second())
+	for _, doc := range []string{"ggg", "hhh", "iii"} {
+		rewrite("filler", doc)
 	}
+	expect("after an eviction in the second f was dated", rewrite("demo", "j"), undated)
 }
 
 // TestRewrittenMetadataLastModifiedNeedsRewriteCache checks that without the
