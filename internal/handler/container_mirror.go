@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 const (
@@ -160,7 +161,11 @@ func (h *ContainerHandler) MirrorImage(ctx context.Context, ref ImageRef, platfo
 	}
 	var digests []string
 	for _, reference := range ref.References {
-		digest, err := m.mirrorManifest(ctx, reference, 0)
+		mirror := m.mirrorTag
+		if mirrorDigestPattern.MatchString(reference) {
+			mirror = func(ctx context.Context, digest string) (string, error) { return m.mirrorManifest(ctx, digest, 0) }
+		}
+		digest, err := mirror(ctx, reference)
 		if err != nil {
 			return m.result, fmt.Errorf("%s:%s: %w", ref.Name, reference, err)
 		}
@@ -195,6 +200,86 @@ func normalizeImageRef(ref ImageRef, defaultRegistryURL string) (ImageRef, error
 		}
 	}
 	return ref, nil
+}
+
+// errTagUpstreamUnavailable marks tag lookups that failed because the
+// upstream could not be reached or answered with 429 or 5xx.
+var errTagUpstreamUnavailable = errors.New("upstream unavailable")
+
+// mirrorTag resolves a tag upstream without caching it, mirrors the manifest
+// it names by digest, and stores the tag only after that manifest and
+// everything it references are cached. A failed mirror leaves the previously
+// cached tag as it was. If the upstream is unreachable, the cached tag is
+// mirrored as it is.
+func (m *imageMirror) mirrorTag(ctx context.Context, tag string) (string, error) {
+	accept := containerManifestAccept(&http.Request{Header: http.Header{}})
+	cacheAccept := normalizeContainerManifestAccept(accept)
+	before := m.h.loadContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, tag, accept, cacheAccept)
+
+	manifest, err := m.fetchTagManifest(ctx, tag, accept)
+	if err != nil {
+		if before == nil || !errors.Is(err, errTagUpstreamUnavailable) {
+			return "", fmt.Errorf("manifest %s: %w", tag, err)
+		}
+		m.result.Warnings = append(m.result.Warnings, fmt.Sprintf("manifest %s served from stale cache, upstream unreachable", tag))
+		_, err := m.mirrorManifest(ctx, before.contentDigest, 0)
+		return before.contentDigest, err
+	}
+
+	// The digest entry is immutable, so it can be stored right away; the
+	// walk below then reads it from cache instead of fetching it again.
+	digest := manifest.contentDigest
+	if before == nil || before.contentDigest != digest {
+		m.result.Fetched++
+	}
+	m.h.storeContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, digest, accept, cacheAccept, manifest)
+	if _, err := m.mirrorManifest(ctx, digest, 0); err != nil {
+		return "", err
+	}
+	m.h.storeContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, tag, accept, cacheAccept, manifest)
+	return digest, nil
+}
+
+// fetchTagManifest fetches and verifies the manifest a tag points to without
+// caching it.
+func (m *imageMirror) fetchTagManifest(ctx context.Context, tag, accept string) (*cachedContainerManifest, error) {
+	upstreamURL := fmt.Sprintf("%s/v2/%s/manifests/%s", m.registryURL, m.upstreamName, tag)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept", accept)
+	response, err := m.h.proxy.HTTPClient.Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("%w: %w", errTagUpstreamUnavailable, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		if shouldServeStaleManifest(response.StatusCode) {
+			return nil, fmt.Errorf("%w: status %d", errTagUpstreamUnavailable, response.StatusCode)
+		}
+		return nil, fmt.Errorf("upstream status %d", response.StatusCode)
+	}
+	body, err := m.h.proxy.ReadMetadata(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading manifest: %w", err)
+	}
+	digest := sha256Digest(body)
+	if contentDigest := response.Header.Get("Docker-Content-Digest"); strings.HasPrefix(contentDigest, "sha256:") && contentDigest != digest {
+		return nil, fmt.Errorf("digest verification failed: upstream says %s, body is %s", contentDigest, digest)
+	}
+	return &cachedContainerManifest{
+		body:          body,
+		contentType:   response.Header.Get(headerContentType),
+		contentDigest: digest,
+		etag:          response.Header.Get(headerETag),
+		size:          int64(len(body)),
+		lastModified:  parseHTTPTime(response.Header.Get(headerLastModified)),
+		fetchedAt:     time.Now(),
+	}, nil
 }
 
 // mirrorManifest stores the manifest for reference through the handler's own

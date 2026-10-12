@@ -293,3 +293,41 @@ func TestNormalizeImageRef(t *testing.T) {
 		})
 	}
 }
+
+func TestMirrorImageKeepsPreviousTagWhenMovedTagIsIncomplete(t *testing.T) {
+	registry, image := newFakeImageRegistry(t)
+	proxy := newMirrorTestProxy(t, registry)
+	h := NewContainerHandlerWithRegistry(proxy, "http://proxy.example", registry.server.URL)
+	ref := ImageRef{Name: "team/app", References: []string{"single"}}
+
+	if _, err := h.MirrorImage(context.Background(), ref, nil); err != nil {
+		t.Fatalf("first MirrorImage: %v", err)
+	}
+	previous := registry.manifests["/v2/team/app/manifests/single"]
+
+	// Move the tag to an image whose layer the registry cannot serve.
+	broken, err := json.Marshal(map[string]any{
+		"schemaVersion": 2, "mediaType": ociManifestMediaType,
+		"config": map[string]any{"mediaType": "application/vnd.oci.image.config.v1+json", "digest": image.singleLayer},
+		"layers": []map[string]any{{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": sha256Digest([]byte("missing layer"))}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokenDoc := fakeManifest{contentType: ociManifestMediaType, body: string(broken)}
+	registry.manifests["/v2/team/app/manifests/single"] = brokenDoc
+	registry.manifests["/v2/team/app/manifests/"+sha256Digest(broken)] = brokenDoc
+
+	if _, err := h.MirrorImage(context.Background(), ref, nil); err == nil {
+		t.Fatal("mirroring the incomplete image did not fail")
+	}
+	registry.offline.Store(true)
+
+	response := pull(t, h, "/team/app/manifests/single", dockerManifestAccept)
+	if response.Code != http.StatusOK {
+		t.Fatalf("offline tag status = %d: %s", response.Code, response.Body.String())
+	}
+	if response.Body.String() != previous.body {
+		t.Errorf("offline tag points to %s, want the previously mirrored image", sha256Digest(response.Body.Bytes()))
+	}
+}
