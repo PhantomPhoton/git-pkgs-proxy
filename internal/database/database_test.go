@@ -613,7 +613,7 @@ func createTestPostgresDB(t *testing.T) *DB {
 	// Drop and recreate every table CreateSchema creates for clean test state;
 	// leftover migration records make the next CreateSchema fail on the
 	// migrations primary key.
-	tables := []string{"artifacts", "pending_deletes", "versions", "packages", "vulnerabilities", "metadata_cache", "migrations", "schema_info"}
+	tables := []string{"artifacts", "pending_deletes", "versions", "packages", "vulnerabilities", "metadata_cache", "metadata_dates", "migrations", "schema_info"}
 	for _, table := range tables {
 		_, _ = db.Exec("DROP TABLE IF EXISTS " + table + " CASCADE")
 	}
