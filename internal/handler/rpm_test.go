@@ -2,6 +2,8 @@ package handler
 
 import (
 	"testing"
+
+	"github.com/git-pkgs/purl"
 )
 
 func TestRPMHandler_parseRPMPath(t *testing.T) {
@@ -20,4 +22,33 @@ func TestRPMHandler_parseRPMPath(t *testing.T) {
 func TestRPMHandler_Routes(t *testing.T) {
 	h := NewRPMHandler(nil, "http://localhost:8080")
 	assertRoutesBasics(t, h.Routes(), "/repodata/repomd.xml", "/releases/../../../etc/passwd")
+}
+
+func TestRPMRetentionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"pkg:rpm/curl", "pkg:rpm/curl", true},
+		{"pkg:rpm/fedora/curl", "pkg:rpm/curl", true},
+		{"pkg:rpm/Fedora/NetworkManager", "pkg:rpm/NetworkManager", true},
+		{"pkg:rpm/fedora/libstdc++", "pkg:rpm/libstdc%2B%2B", true},
+		{"pkg:rpm/fedora/40/curl", "", false},
+		{"pkg:rpm/fedora/Packages%2Fcurl", "", false},
+		{"pkg:deb/fedora/curl", "", false},
+	}
+	for _, tt := range tests {
+		p, err := purl.Parse(tt.key)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tt.key, err)
+		}
+		got, ok := rpmRetentionKey(p)
+		if ok != tt.ok || (ok && got != tt.want) {
+			t.Errorf("rpmRetentionKey(%s) = %q, %v, want %q, %v", tt.key, got, ok, tt.want, tt.ok)
+		}
+	}
+	if _, ok := rpmRetentionKey(nil); ok {
+		t.Error("rpmRetentionKey(nil) accepted")
+	}
 }
