@@ -3,11 +3,21 @@ package handler
 import (
 	"net/http"
 	"strings"
+
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
 	cranUpstream = "https://cloud.r-project.org"
 )
+
+// Source and binary packages are stored under pkg:cran/{name}, the name from
+// the filename with its case kept, whether they came from src/contrib, its
+// Archive or a binary tree. purl keeps cran names as they are, so package
+// rules use the default key mapping.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "cran", CanonicalPackage: retention.DefaultCanonical("cran")})
+}
 
 // CRANHandler handles CRAN (R) registry protocol requests.
 type CRANHandler struct {

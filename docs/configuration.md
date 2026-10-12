@@ -93,7 +93,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `composer` | yes | `pkg:composer/symfony/console`; case doesn't matter. A key without a vendor is refused. |
 | `conan` | no | - |
 | `conda` | no | - |
-| `cran` | no | - |
+| `cran` | yes | `pkg:cran/ggplot2`, the package name as published, case included (`pkg:cran/Rcpp`). A rule covers source and binary builds alike. |
 | `deb` | no | - |
 | `gem` | no | - |
 | `golang` | yes | `pkg:golang/github.com/stretchr/testify`, the module path as in `go.mod`; case doesn't matter. A major version like `/v2` (or `.v3` on gopkg.in) is a module of its own and needs its own rule. The `!`-escaped form from proxy URLs and the module cache (`github.com/!azure/...`) is refused. |
