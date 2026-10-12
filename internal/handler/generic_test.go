@@ -112,7 +112,7 @@ func TestGenericHandler_BuiltinArtifactPatterns(t *testing.T) {
 		"golang": "https://dl.google.com/go",
 		"mirror": "https://mirror.example.com",
 	}, map[string][]string{
-		"apache": {`extra/(?P<version>[^/]+)/(?P<file>[^/]+)`},
+		"apache": {`extra/(?P<version>[^/]+)/(?P<file>[^/]+)`, testMavenPattern},
 	})
 
 	tests := []struct {
@@ -121,10 +121,13 @@ func TestGenericHandler_BuiltinArtifactPatterns(t *testing.T) {
 		want       genericArtifact
 		ok         bool
 	}{
+		// The configured testMavenPattern overlaps the built-in and takes precedence.
 		{"apache", "dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz",
-			genericArtifact{name: "maven/maven-3", version: "3.9.9", filename: "apache-maven-3.9.9-bin.tar.gz"}, true},
+			genericArtifact{name: "maven", version: "3.9.9", filename: "apache-maven-3.9.9-bin.tar.gz"}, true},
 		{"apache", "dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz.sha512",
-			genericArtifact{name: "maven/maven-3", version: "3.9.9", filename: "apache-maven-3.9.9-bin.tar.gz.sha512"}, true},
+			genericArtifact{name: "maven", version: "3.9.9", filename: "apache-maven-3.9.9-bin.tar.gz.sha512"}, true},
+		{"apache", "dist/maven/maven-4/4.0.0/binaries/apache-maven-4.0.0-bin.tar.gz",
+			genericArtifact{name: "maven/maven-4", version: "4.0.0", filename: "apache-maven-4.0.0-bin.tar.gz"}, true},
 		{"apache", "dist/maven/mvnd/1.0.6/maven-mvnd-1.0.6-linux-amd64.tar.gz",
 			genericArtifact{name: "maven/mvnd", version: "1.0.6", filename: "maven-mvnd-1.0.6-linux-amd64.tar.gz"}, true},
 		{"apache", "dist/maven/maven-3/", genericArtifact{}, false},

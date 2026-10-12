@@ -371,7 +371,8 @@ the upstream is named:
 | `https://dl.google.com/go` | `go{version}.{os}-{arch}.tar.gz`, `.zip` and their `.sha256` | the upstream name |
 
 Other upstreams can declare their own version-pinned paths in
-`generic_artifacts`, which add to any built-in ones. Each pattern is a regular expression that must match the
+`generic_artifacts`. These are tried before any built-in ones, so a configured
+pattern that overlaps a built-in decides the package name. Each pattern is a regular expression that must match the
 whole path after `/generic/{name}/`, with `version` and `file` named groups
 (single path segments) and an optional `name` group for the package name,
 which otherwise is the upstream name. Matching downloads are cached like

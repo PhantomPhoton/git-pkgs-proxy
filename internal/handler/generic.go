@@ -30,7 +30,7 @@ var githubReleaseAssetPattern = regexp.MustCompile(`^([^/]+)/([^/]+)/releases/do
 
 // builtinGenericArtifacts maps well-known download hosts to patterns for
 // their version-pinned paths. They apply to any generic upstream configured
-// with that base URL, before the upstream's own generic_artifacts.
+// with that base URL, after the upstream's own generic_artifacts.
 var builtinGenericArtifacts = map[string][]string{
 	// dist/{project dirs}/{version}/[binaries/]{file}, e.g. maven/maven-3 or maven/mvnd.
 	"https://archive.apache.org": {
@@ -78,14 +78,16 @@ func NewGenericHandler(proxy *Proxy, repositories map[string]string, artifactPat
 		artifactPatterns: make(map[string][]*regexp.Regexp),
 	}
 	for name, upstreamURL := range repositories {
-		upstreamURL = strings.TrimSuffix(upstreamURL, "/")
-		h.repositories[name] = upstreamURL
-		h.addArtifactPatterns(name, builtinGenericArtifacts[upstreamURL])
+		h.repositories[name] = strings.TrimSuffix(upstreamURL, "/")
 	}
+	// The first matching pattern wins, so configured patterns go first.
 	if len(artifactPatterns) > 0 {
 		for name, patterns := range artifactPatterns[0] {
 			h.addArtifactPatterns(name, patterns)
 		}
+	}
+	for name, upstreamURL := range h.repositories {
+		h.addArtifactPatterns(name, builtinGenericArtifacts[upstreamURL])
 	}
 	return h
 }
