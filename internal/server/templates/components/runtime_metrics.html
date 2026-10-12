@@ -92,6 +92,14 @@
             </div>
         </div>
 
+        {{if and .HasFailures (not .FailureDetailsOn)}}
+        <p class="text-sm text-gray-500 dark:text-gray-400">
+            Per-failure detail is off. Set <code class="text-xs">ui_failure_details: true</code>
+            to list the packages, URLs and errors behind each failure count here, once
+            <code class="text-xs">/ui</code> is behind authentication; the same detail is in the log.
+        </p>
+        {{end}}
+
         <!-- Who is calling. Addresses are never metric labels: the caller set is
              unbounded, so per-address detail lives here and in the access log. -->
         <div class="border-t border-gray-200 dark:border-gray-800 pt-6">
@@ -191,9 +199,14 @@
     {{if .Rows}}
     <dl class="space-y-2 text-sm">
         {{range .Rows}}
-        <div class="flex items-center justify-between gap-4">
+        <div class="flex flex-wrap items-center justify-between gap-x-4">
             <dt class="min-w-0 truncate {{if .Bad}}text-red-600 dark:text-red-400{{else}}text-gray-500 dark:text-gray-400{{end}}">{{.Label}}</dt>
             <dd class="shrink-0 tabular-nums {{if .Bad}}text-red-600 dark:text-red-400 font-medium{{end}}">{{.Count}}</dd>
+            {{if .Recent}}
+            <dd class="basis-full min-w-0 mt-1">
+                {{template "recent_failures" .Recent}}
+            </dd>
+            {{end}}
         </div>
         {{end}}
     </dl>
@@ -201,6 +214,29 @@
     <p class="text-sm text-gray-500 dark:text-gray-400">{{.Empty}}</p>
     {{end}}
 </div>
+{{end}}
+
+{{/* recent_failures lists the latest failures behind a failure count, newest first. */}}
+{{define "recent_failures"}}
+<details class="group">
+    <summary class="cursor-pointer text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200">
+        Latest {{len .}}
+    </summary>
+    <ul class="mt-2 space-y-2 text-xs border-l border-gray-200 dark:border-gray-800 pl-3">
+        {{range .}}
+        <li class="min-w-0">
+            <div class="flex items-baseline justify-between gap-2">
+                <span class="min-w-0 truncate font-mono">{{if .PURL}}{{.PURL}}{{else if .Path}}{{.Path}}{{else if .URL}}{{.URL}}{{else}}-{{end}}</span>
+                <span class="shrink-0 text-gray-400 dark:text-gray-500">{{.Age}}</span>
+            </div>
+            {{if .Filename}}<div class="truncate text-gray-500 dark:text-gray-400">{{.Filename}}</div>{{end}}
+            {{if and .URL (or .PURL .Path)}}<div class="truncate font-mono text-gray-500 dark:text-gray-400" title="{{.URL}}">{{.URL}}</div>{{end}}
+            {{if and .Path .PURL}}<div class="truncate font-mono text-gray-500 dark:text-gray-400" title="{{.Path}}">{{.Path}}</div>{{end}}
+            {{if .Error}}<div class="break-words text-red-600 dark:text-red-400">{{.Error}}</div>{{end}}
+        </li>
+        {{end}}
+    </ul>
+</details>
 {{end}}
 
 {{/* runtime_stats renders a histogram list: how many observations, and their mean. */}}

@@ -27,7 +27,7 @@ func TestFormatDuration(t *testing.T) {
 }
 
 func TestRuntimeViewNilSnapshot(t *testing.T) {
-	if v := runtimeView(nil); v.Available {
+	if v := runtimeView(nil, false); v.Available {
 		t.Error("a nil snapshot must not report itself as available")
 	}
 }
@@ -63,7 +63,7 @@ func TestRuntimeViewShapesRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GatherFrom: %v", err)
 	}
-	v := runtimeView(snap)
+	v := runtimeView(snap, false)
 
 	if !v.Available {
 		t.Fatal("expected the view to be available")
@@ -142,7 +142,7 @@ func TestRuntimeViewShowsEvictions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GatherFrom: %v", err)
 	}
-	v := runtimeView(snap)
+	v := runtimeView(snap, false)
 
 	if len(v.Evictions) != 1 {
 		t.Fatalf("Evictions = %+v, want only the non-zero row", v.Evictions)
@@ -168,7 +168,7 @@ func TestRuntimeViewDropsZeroCounters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GatherFrom: %v", err)
 	}
-	v := runtimeView(snap)
+	v := runtimeView(snap, false)
 
 	if len(v.StorageErrors) != 1 {
 		t.Fatalf("expected only the non-zero row, got %+v", v.StorageErrors)
@@ -185,7 +185,7 @@ func TestRuntimeViewEmptyRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GatherFrom: %v", err)
 	}
-	v := runtimeView(snap)
+	v := runtimeView(snap, false)
 
 	if !v.Available {
 		t.Error("an empty registry is still a valid snapshot")

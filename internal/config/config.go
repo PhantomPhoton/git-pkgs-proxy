@@ -119,6 +119,14 @@ type Config struct {
 	// is enabled /ui exposes what is cached rather than who called.
 	UIRequestSources bool `json:"ui_request_sources" yaml:"ui_request_sources"`
 
+	// UIFailureDetails lists the latest failures behind each failure counter on
+	// /ui/analytics: the package, its upstream URL or storage path, and the
+	// error. URLs are shown without credentials or query strings.
+	//
+	// Off by default, for the same reason as UIRequestSources: package names and
+	// upstream hosts say what the proxy's users depend on.
+	UIFailureDetails bool `json:"ui_failure_details" yaml:"ui_failure_details"`
+
 	// Storage configures artifact storage.
 	Storage StorageConfig `json:"storage" yaml:"storage"`
 
@@ -1102,6 +1110,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.UIBaseURL, "PROXY_UI_URL")
 	setEnvBool(&c.TrustForwardedFor, "PROXY_TRUST_FORWARDED_FOR")
 	setEnvBool(&c.UIRequestSources, "PROXY_UI_REQUEST_SOURCES")
+	setEnvBool(&c.UIFailureDetails, "PROXY_UI_FAILURE_DETAILS")
 	setEnvString(&c.Storage.URL, "PROXY_STORAGE_URL")
 	setEnvString(&c.Storage.Path, "PROXY_STORAGE_PATH")
 	setEnvString(&c.Storage.MaxSize, "PROXY_STORAGE_MAX_SIZE")

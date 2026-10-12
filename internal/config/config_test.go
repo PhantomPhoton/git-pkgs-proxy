@@ -463,6 +463,7 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("PROXY_ACCESS_LOG_PATH", "/tmp/proxy-access.jsonl")
 	t.Setenv("PROXY_TRUST_FORWARDED_FOR", "true")
 	t.Setenv("PROXY_UI_REQUEST_SOURCES", "true")
+	t.Setenv("PROXY_UI_FAILURE_DETAILS", "true")
 	t.Setenv("PROXY_UPSTREAM_ALLOW_PRIVATE_HOSTS", "registry.internal, 10.0.0.12")
 	t.Setenv("PROXY_UPSTREAM_ALLOW_LOOPBACK", "true")
 	t.Setenv("PROXY_GRADLE_BUILD_CACHE_READ_ONLY", "true")
@@ -499,6 +500,9 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if !cfg.UIRequestSources {
 		t.Error("UIRequestSources = false, want true from the environment")
+	}
+	if !cfg.UIFailureDetails {
+		t.Error("UIFailureDetails = false, want true from the environment")
 	}
 	if got := strings.Join(cfg.Upstream.AllowPrivateHosts, ","); got != "registry.internal,10.0.0.12" {
 		t.Errorf("Upstream.AllowPrivateHosts = %q, want %q", got, "registry.internal,10.0.0.12")

@@ -42,6 +42,13 @@ base_url: "http://localhost:8080"
 # otherwise read the addresses of your build fleet.
 # ui_request_sources: false
 
+# List the latest failures behind each failure count on /ui/analytics (upstream,
+# storage, integrity, health probe and scan errors): the package, its upstream
+# URL or storage path, and the error. URLs lose credentials and query strings.
+#
+# Off by default, for the same reason as ui_request_sources.
+# ui_failure_details: false
+
 # Artifact storage configuration
 storage:
   # Storage backend URL
