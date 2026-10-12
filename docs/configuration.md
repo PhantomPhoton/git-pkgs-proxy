@@ -107,7 +107,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `pub` | yes | `pkg:pub/http`, the package name as published. |
 | `pypi` | yes | `pkg:pypi/requests`; case and single `_`/`-` don't matter. Dots and repeated separators are kept as written, so a project like `zope.interface` can be stored as `zope.interface` and `zope-interface`; add a rule for each. |
 | `rpm` | yes | `pkg:rpm/curl`, the name as packaged, case included (`pkg:rpm/NetworkManager`). A vendor namespace such as `pkg:rpm/fedora/curl` is accepted and dropped. Fedora and EPEL update repositories keep only the latest build of a package, so an evicted older one may not be fetchable again. |
-| `swift` | no | - |
+| `swift` | yes | `pkg:swift/apple/swift-nio`, with the registry scope as the namespace, or the stored form `pkg:generic/swift-registry/apple.swift-nio`; case doesn't matter. A source repository key like `pkg:swift/github.com/apple/swift-nio` is refused, since it doesn't name a registry identity. |
 
 An evicted artifact is fetched again from upstream on the next request. Packages preloaded with `proxy mirror` age from the time they were mirrored, so an unused mirrored package is evicted like any other. Running `proxy mirror` again over a package that is still cached counts as a download and restarts its clock, so packages a scheduled mirror job keeps listing never age out. A registry that removes old releases (Linux distribution archives in particular) cannot serve an evicted version again, so set those ecosystems' rules with that in mind.
 
