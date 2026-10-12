@@ -32,6 +32,17 @@ func hashTile(width int, fill string) string {
 	return strings.Repeat(fill, width*tlog.HashSize)
 }
 
+// dataTile returns a data tile body holding width records, laid out the way
+// sum.golang.org serves it: a blank line between records, none after the
+// last.
+func dataTile(width int) string {
+	records := make([]string, width)
+	for i := range records {
+		records[i] = fmt.Sprintf("example.com/m%d v1.0.0 h1:hash=\nexample.com/m%d v1.0.0/go.mod h1:hash=\n", i, i)
+	}
+	return strings.Join(records, "\n")
+}
+
 // fakeSumDB is a checksum database upstream serving fixed files. Unknown
 // paths get 404 with the body from notFound, or a default text.
 type fakeSumDB struct {
@@ -481,6 +492,25 @@ func TestGoSumDB_ShortcutNeedsOfflineMode(t *testing.T) {
 	}
 }
 
+func TestGoSumDBDataTileRecords(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"sum.golang.org layout", dataTile(3), 3},
+		{"blank line after the last record", dataTile(3) + "\n", 3},
+		{"one record", dataTile(1), 1},
+		{"empty", "", 0},
+		{"no final newline", "<html>please log in</html>", 0},
+	}
+	for _, tt := range tests {
+		if got := goSumDBDataTileRecords([]byte(tt.body)); got != tt.want {
+			t.Errorf("%s: records = %d, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestGoSumDBProbes_TimeoutDoesNotOverwriteLaterSuccess(t *testing.T) {
 	var probes goSumDBProbes
 	start := time.Now()
@@ -595,9 +625,9 @@ func TestGoSumDB_LookupCachedWithinTTL(t *testing.T) {
 func TestGoSumDB_CompleteTilesSkipRevalidation(t *testing.T) {
 	files := map[string]string{
 		"/tile/8/0/000":        hashTile(256, "a"),
-		"/tile/8/data/000":     "complete data tile",
+		"/tile/8/data/000":     dataTile(256),
 		"/tile/8/0/001.p/5":    hashTile(5, "b"),
-		"/tile/8/data/001.p/5": "partial data tile",
+		"/tile/8/data/001.p/5": dataTile(5),
 		"/latest":              testSumDBTree,
 	}
 	wantRequests := map[string]int{
@@ -633,6 +663,7 @@ func TestGoSumDB_BadTilesAreNotCached(t *testing.T) {
 	db := newFakeSumDB(t, map[string]string{
 		tile:                   "<html>please log in</html>",
 		"/tile/8/data/000.p/3": "",
+		"/tile/8/data/000":     "<html>please log in</html>\n",
 	})
 	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
 
@@ -641,6 +672,9 @@ func TestGoSumDB_BadTilesAreNotCached(t *testing.T) {
 	}
 	if w := serveGoRequest(h, "/sumdb/sum.example/tile/8/data/000.p/3"); w.Code != http.StatusBadGateway {
 		t.Errorf("empty data tile: status = %d, want 502", w.Code)
+	}
+	if w := serveGoRequest(h, "/sumdb/sum.example/tile/8/data/000"); w.Code != http.StatusBadGateway {
+		t.Errorf("block page as a data tile: status = %d, want 502", w.Code)
 	}
 
 	want := hashTile(256, "a")
