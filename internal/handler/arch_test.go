@@ -101,21 +101,23 @@ func TestArchHandler_UnknownRepositoryReturns404(t *testing.T) {
 	}
 }
 
-// archUpstream is a fake pacman mirror. Files can be swapped and the mirror
-// taken offline; requests are counted per path.
+// archUpstream is a fake pacman mirror. Files can be swapped, single paths
+// broken and the mirror taken offline; requests are counted per path.
 type archUpstream struct {
 	*httptest.Server
 	mu        sync.Mutex
 	files     map[string][]byte
 	modified  map[string]time.Time
 	hits      map[string]int
+	broken    map[string]bool
+	served    func(path string) // called after a file is served, without mu
 	available atomic.Bool
 	auth      atomic.Value
 }
 
 func newArchUpstream(t *testing.T, files map[string][]byte) *archUpstream {
 	t.Helper()
-	u := &archUpstream{files: files, modified: map[string]time.Time{}, hits: map[string]int{}}
+	u := &archUpstream{files: files, modified: map[string]time.Time{}, hits: map[string]int{}, broken: map[string]bool{}}
 	u.available.Store(true)
 	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !u.available.Load() {
@@ -126,8 +128,14 @@ func newArchUpstream(t *testing.T, files map[string][]byte) *archUpstream {
 		u.mu.Lock()
 		data, ok := u.files[r.URL.Path]
 		modified := u.modified[r.URL.Path]
+		broken := u.broken[r.URL.Path]
+		served := u.served
 		u.hits[r.URL.Path]++
 		u.mu.Unlock()
+		if broken {
+			http.Error(w, "broken", http.StatusInternalServerError)
+			return
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -137,6 +145,9 @@ func newArchUpstream(t *testing.T, files map[string][]byte) *archUpstream {
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(data)
+		if served != nil {
+			served(r.URL.Path)
+		}
 	}))
 	t.Cleanup(u.Close)
 	return u
@@ -206,10 +217,14 @@ func TestArchHandler_DatabasesServedUnchanged(t *testing.T) {
 		t.Errorf("Authorization = %q, want %q", got, "Bearer arch-token")
 	}
 
+	// core.db is fetched twice on its first request: once more after its
+	// signature, to make sure the two belong together.
+	wantHits := map[string]int{"/core/os/x86_64/core.db": 2}
 	for _, path := range paths {
 		assertArchBody(t, serveArchRequest(h, http.MethodGet, "/archlinux"+path, nil), path+" cached", files[path])
-		if got := upstream.hitCount(path); got != 1 {
-			t.Errorf("%s: upstream hits = %d, want 1 (second read from cache)", path, got)
+		want := max(wantHits[path], 1)
+		if got := upstream.hitCount(path); got != want {
+			t.Errorf("%s: upstream hits = %d, want %d (second read from cache)", path, got, want)
 		}
 	}
 
@@ -228,7 +243,7 @@ func TestArchHandler_StaleDatabaseServedWhenUpstreamDown(t *testing.T) {
 	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"archlinux": upstream.URL})
 
 	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/archlinux/core/os/x86_64/core.db", nil), "seed", db)
-	ageMetadata(t, proxy, h, "archlinux", upstream.URL, "core/os/x86_64/core.db", 2*time.Hour)
+	ageMetadata(t, proxy, h, "archlinux", upstream.URL, "core/os/x86_64/core.db")
 	upstream.available.Store(false)
 
 	w := serveArchRequest(h, http.MethodGet, "/archlinux/core/os/x86_64/core.db", nil)
@@ -260,8 +275,8 @@ func TestArchHandler_DatabaseIfModifiedSince(t *testing.T) {
 
 // TestArchHandler_MissingDatabaseSignature covers the official repositories,
 // which sign no databases: pacman with DatabaseOptional asks for core.db.sig
-// and must get a 404 while the upstream is up. With the upstream down the
-// answer is a 502, which pacman also treats as "no signature".
+// and must get a 404. The database refresh found it missing, so the answer
+// needs no upstream and holds offline too.
 func TestArchHandler_MissingDatabaseSignature(t *testing.T) {
 	upstream := newArchUpstream(t, map[string][]byte{"/core/os/x86_64/core.db": []byte("core-db-bytes")})
 	proxy := newArchTestProxy(t, upstream)
@@ -271,11 +286,14 @@ func TestArchHandler_MissingDatabaseSignature(t *testing.T) {
 	if w := serveArchRequest(h, http.MethodGet, "/archlinux/core/os/x86_64/core.db.sig", nil); w.Code != http.StatusNotFound {
 		t.Errorf("missing signature: status = %d, want 404", w.Code)
 	}
+	if got := upstream.hitCount("/core/os/x86_64/core.db.sig"); got != 1 {
+		t.Errorf("signature upstream hits = %d, want 1 (asked once, with the database)", got)
+	}
 
 	upstream.available.Store(false)
 	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/archlinux/core/os/x86_64/core.db", nil), "db offline", []byte("core-db-bytes"))
-	if w := serveArchRequest(h, http.MethodGet, "/archlinux/core/os/x86_64/core.db.sig", nil); w.Code != http.StatusBadGateway {
-		t.Errorf("missing signature offline: status = %d, want 502", w.Code)
+	if w := serveArchRequest(h, http.MethodGet, "/archlinux/core/os/x86_64/core.db.sig", nil); w.Code != http.StatusNotFound {
+		t.Errorf("missing signature offline: status = %d, want 404", w.Code)
 	}
 }
 
@@ -302,7 +320,7 @@ func TestArchHandler_DatabaseSignatureFollowsDatabase(t *testing.T) {
 	// the signature does.
 	upstream.set(dbPath, []byte("db v2"))
 	upstream.set(sigPath, []byte("sig v2"))
-	ageMetadata(t, proxy, h, "custom", upstream.URL, dbPath[1:], 2*time.Hour)
+	ageMetadata(t, proxy, h, "custom", upstream.URL, dbPath[1:])
 
 	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v2", []byte("db v2"))
 	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig after db refresh", []byte("sig v2"))
@@ -312,11 +330,11 @@ func TestArchHandler_DatabaseSignatureFollowsDatabase(t *testing.T) {
 	}
 }
 
-// TestArchHandler_OutdatedSignatureNeverServed covers a signature refetch that
-// fails after the database was refreshed. The cached signature belongs to
-// the old database, and pacman rejects a present but invalid signature even
-// with DatabaseOptional, so the proxy must answer 404 or 502 rather than fall
-// back to it.
+// TestArchHandler_OutdatedSignatureNeverServed covers a signature fetch that
+// fails while the database is refreshed. The cached signature belongs to the
+// old database, and pacman rejects a present but invalid signature even with
+// DatabaseOptional, so the proxy must answer 404 or 502 rather than fall back
+// to it.
 func TestArchHandler_OutdatedSignatureNeverServed(t *testing.T) {
 	const dbPath, sigPath = "/custom/os/x86_64/custom.db", "/custom/os/x86_64/custom.db.sig"
 
@@ -325,12 +343,8 @@ func TestArchHandler_OutdatedSignatureNeverServed(t *testing.T) {
 		breakSig func(u *archUpstream)
 		want     int
 	}{
-		{"signature removed upstream", func(u *archUpstream) {
-			u.mu.Lock()
-			delete(u.files, sigPath)
-			u.mu.Unlock()
-		}, http.StatusNotFound},
-		{"upstream down after database refresh", func(u *archUpstream) { u.available.Store(false) }, http.StatusBadGateway},
+		{"signature removed upstream", func(u *archUpstream) { delete(u.files, sigPath) }, http.StatusNotFound},
+		{"signature fetch fails", func(u *archUpstream) { u.broken[sigPath] = true }, http.StatusBadGateway},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			upstream := newArchUpstream(t, map[string][]byte{dbPath: []byte("db v1"), sigPath: []byte("sig v1")})
@@ -340,11 +354,13 @@ func TestArchHandler_OutdatedSignatureNeverServed(t *testing.T) {
 			assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v1", []byte("db v1"))
 			assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig v1", []byte("sig v1"))
 
-			upstream.set(dbPath, []byte("db v2"))
-			ageMetadata(t, proxy, h, "custom", upstream.URL, dbPath[1:], 2*time.Hour)
+			upstream.mu.Lock()
+			upstream.files[dbPath] = []byte("db v2")
+			tt.breakSig(upstream)
+			upstream.mu.Unlock()
+			ageMetadata(t, proxy, h, "custom", upstream.URL, dbPath[1:])
 			assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v2", []byte("db v2"))
 
-			tt.breakSig(upstream)
 			for i := range 2 {
 				w := serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil)
 				if w.Code != tt.want {
@@ -353,6 +369,67 @@ func TestArchHandler_OutdatedSignatureNeverServed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestArchHandler_DelayedSignatureMatchesCachedDatabase covers a signature
+// first requested after the upstream moved on: it must be the one for the
+// database the proxy still serves, not the upstream's new one.
+func TestArchHandler_DelayedSignatureMatchesCachedDatabase(t *testing.T) {
+	const dbPath, sigPath = "/custom/os/x86_64/custom.db", "/custom/os/x86_64/custom.db.sig"
+	upstream := newArchUpstream(t, map[string][]byte{dbPath: []byte("db v1"), sigPath: []byte("sig v1")})
+	proxy := newArchTestProxy(t, upstream)
+	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"custom": upstream.URL})
+
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v1", []byte("db v1"))
+
+	upstream.set(dbPath, []byte("db v2"))
+	upstream.set(sigPath, []byte("sig v2"))
+
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db within TTL", []byte("db v1"))
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "first signature request", []byte("sig v1"))
+}
+
+// TestArchHandler_SignatureSurvivesUnchangedRefresh covers a database refresh
+// that returns the same bytes: the cached signature still matches and must be
+// served offline afterwards.
+func TestArchHandler_SignatureSurvivesUnchangedRefresh(t *testing.T) {
+	const dbPath, sigPath = "/custom/os/x86_64/custom.db", "/custom/os/x86_64/custom.db.sig"
+	upstream := newArchUpstream(t, map[string][]byte{dbPath: []byte("db v1"), sigPath: []byte("sig v1")})
+	proxy := newArchTestProxy(t, upstream)
+	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"custom": upstream.URL})
+
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db", []byte("db v1"))
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig", []byte("sig v1"))
+
+	ageMetadata(t, proxy, h, "custom", upstream.URL, dbPath[1:])
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db refreshed unchanged", []byte("db v1"))
+
+	upstream.available.Store(false)
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig offline", []byte("sig v1"))
+	if got := upstream.hitCount(sigPath); got != 1 {
+		t.Errorf("signature upstream hits = %d, want 1", got)
+	}
+}
+
+// TestArchHandler_DatabaseReplacedDuringRefresh covers a mirror that swaps
+// database and signature between the proxy's two fetches. The proxy must
+// notice and store the new pair, not the old database with the new signature.
+func TestArchHandler_DatabaseReplacedDuringRefresh(t *testing.T) {
+	const dbPath, sigPath = "/custom/os/x86_64/custom.db", "/custom/os/x86_64/custom.db.sig"
+	upstream := newArchUpstream(t, map[string][]byte{dbPath: []byte("db v1"), sigPath: []byte("sig v1")})
+	var swapped atomic.Bool
+	upstream.served = func(path string) {
+		if path == sigPath && swapped.CompareAndSwap(false, true) {
+			upstream.set(dbPath, []byte("db v2"))
+			upstream.set(sigPath, []byte("sig v2"))
+		}
+	}
+	proxy := newArchTestProxy(t, upstream)
+	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"custom": upstream.URL})
+
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db", []byte("db v2"))
+	upstream.available.Store(false)
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig", []byte("sig v2"))
 }
 
 // TestArchHandler_RejectsQueryAndFragmentInPath covers a decoded '?' or '#'
@@ -378,15 +455,14 @@ func TestArchHandler_RejectsQueryAndFragmentInPath(t *testing.T) {
 	}
 }
 
-// ageMetadata moves a cached metadata entry's fetch time into the past, as if
-// it had been fetched age ago.
-func ageMetadata(t *testing.T, proxy *Proxy, h *ArchHandler, repository, upstreamURL, path string, age time.Duration) {
+// ageMetadata moves a metadata entry's fetch time past the one-hour TTL.
+func ageMetadata(t *testing.T, proxy *Proxy, h *ArchHandler, repository, upstreamURL, path string) {
 	t.Helper()
 	entry, err := proxy.DB.GetMetadataCache(archEcosystem, h.metadataCacheKey(repository, upstreamURL, path))
 	if err != nil || entry == nil {
 		t.Fatalf("metadata entry for %s: %v", path, err)
 	}
-	entry.FetchedAt.Time = time.Now().Add(-age)
+	entry.FetchedAt.Time = time.Now().Add(-2 * time.Hour)
 	if err := proxy.DB.UpsertMetadataCache(entry); err != nil {
 		t.Fatalf("aging metadata entry: %v", err)
 	}

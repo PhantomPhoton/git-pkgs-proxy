@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/git-pkgs/proxy/internal/database"
+	"github.com/git-pkgs/proxy/internal/metrics"
 )
 
 const (
@@ -75,7 +78,7 @@ func (h *ArchHandler) Routes() http.Handler {
 
 		switch {
 		case isArchDatabase(rest):
-			h.handleMetadata(w, r, repository, upstreamURL, rest)
+			h.handleDatabase(w, r, repository, upstreamURL, rest)
 		case isArchDatabaseSignature(rest):
 			h.handleDatabaseSignature(w, r, repository, upstreamURL, rest)
 		case isArchPackage(rest) || isArchPackageSignature(rest):
@@ -161,51 +164,204 @@ func (h *ArchHandler) handleMetadata(w http.ResponseWriter, r *http.Request, rep
 		h.metadataCacheKey(repository, upstreamURL, path), archAccept)
 }
 
-// handleDatabaseSignature lets a database's .sig follow the database instead
-// of its own TTL, since pacman rejects a mismatched pair. A signature older
-// than the cached database is fetched again and never served as a fallback.
-func (h *ArchHandler) handleDatabaseSignature(w http.ResponseWriter, r *http.Request, repository, upstreamURL, path string) {
+// archDatabase names a database and its signature in the cache.
+type archDatabase struct {
+	dbKey, dbURL   string
+	sigKey, sigURL string
+}
+
+func (h *ArchHandler) database(repository, upstreamURL, path string) archDatabase {
+	return archDatabase{
+		dbKey:  h.metadataCacheKey(repository, upstreamURL, path),
+		dbURL:  upstreamURL + "/" + path,
+		sigKey: h.metadataCacheKey(repository, upstreamURL, path+archSignatureSuffix),
+		sigURL: upstreamURL + "/" + path + archSignatureSuffix,
+	}
+}
+
+func (d archDatabase) coalesceKey(kind string) string {
+	return metadataCoalesceKey(archEcosystem, d.dbKey, d.dbURL, archAccept, "identity", false) + "\x00" + kind
+}
+
+// handleDatabase serves a database. Each refresh fetches the signature too, so
+// a signature requested later still matches the database the client got.
+func (h *ArchHandler) handleDatabase(w http.ResponseWriter, r *http.Request, repository, upstreamURL, path string) {
 	p := h.proxy
-	sigKey := h.metadataCacheKey(repository, upstreamURL, path)
 	if !p.CacheMetadata || p.DB == nil {
 		h.handleMetadata(w, r, repository, upstreamURL, path)
 		return
 	}
+	d := h.database(repository, upstreamURL, path)
+	if _, hit := p.cachedMetadataState(r.Context(), archEcosystem, d.dbKey, nil); hit != nil {
+		metrics.RecordCacheHit(archEcosystem)
+		h.writeMetadata(w, r, d.dbKey, *hit)
+		return
+	}
+	p.recordMetadataCacheMiss(archEcosystem)
+	res, _ := p.coalesceMetadata(r.Context(), d.coalesceKey("database"), func(ctx context.Context) metadataResult {
+		entry, hit := p.cachedMetadataState(ctx, archEcosystem, d.dbKey, nil)
+		if hit != nil {
+			return *hit
+		}
+		res, _ := h.refresh(ctx, d, entry)
+		return res
+	})
+	h.writeMetadata(w, r, d.dbKey, res)
+}
 
-	dbKey := h.metadataCacheKey(repository, upstreamURL, strings.TrimSuffix(path, archSignatureSuffix))
-	dbEntry, _ := p.DB.GetMetadataCache(archEcosystem, dbKey)
-	sigEntry, _ := p.DB.GetMetadataCache(archEcosystem, sigKey)
-	if dbEntry == nil || sigEntry == nil || !dbEntry.FetchedAt.Valid || !sigEntry.FetchedAt.Valid {
+// handleDatabaseSignature serves the signature stored for the cached
+// database's content, never one fetched for another version of it.
+func (h *ArchHandler) handleDatabaseSignature(w http.ResponseWriter, r *http.Request, repository, upstreamURL, path string) {
+	p := h.proxy
+	if !p.CacheMetadata || p.DB == nil {
 		h.handleMetadata(w, r, repository, upstreamURL, path)
 		return
 	}
-
-	if !sigEntry.FetchedAt.Time.Before(dbEntry.FetchedAt.Time) {
-		body, contentType, err := p.readCachedMetadata(r.Context(), sigEntry, nil)
-		if err == nil {
-			p.writeMetadataCachedResponseWithEncoding(w, r, archEcosystem, sigKey, body, contentType, sigEntry.ContentEncoding.String)
-			return
-		}
-		// The cached bytes are gone; refetch below.
+	d := h.database(repository, upstreamURL, strings.TrimSuffix(path, archSignatureSuffix))
+	if res, ok := h.cachedSignature(r.Context(), d); ok {
+		metrics.RecordCacheHit(archEcosystem)
+		h.writeMetadata(w, r, d.sigKey, res)
+		return
 	}
-
-	signatureURL := upstreamURL + "/" + path
-	// Own key: a regular fetch would return the cached copy within its TTL.
-	key := metadataCoalesceKey(archEcosystem, sigKey, signatureURL, archAccept, "identity", false) + "\x00follow-database"
-	res, _ := p.coalesceMetadata(r.Context(), key, func(fetchCtx context.Context) metadataResult {
-		// No entry: a 304 or stale fallback would return the old signature.
-		return p.fetchMetadataFromUpstream(fetchCtx, archEcosystem, sigKey, signatureURL, archAccept, "identity", nil, nil)
+	p.recordMetadataCacheMiss(archEcosystem)
+	// Nothing stored for this database yet, e.g. the signature fetch failed
+	// during the last refresh: refresh both.
+	res, _ := p.coalesceMetadata(r.Context(), d.coalesceKey("signature"), func(ctx context.Context) metadataResult {
+		if res, ok := h.cachedSignature(ctx, d); ok {
+			return res
+		}
+		entry, _ := p.DB.GetMetadataCache(archEcosystem, d.dbKey)
+		if _, err := h.refresh(ctx, d, entry); err != nil {
+			return metadataResult{err: err}
+		}
+		if res, ok := h.cachedSignature(ctx, d); ok {
+			return res
+		}
+		return metadataResult{err: errArchSignatureUnpaired}
 	})
+	h.writeMetadata(w, r, d.sigKey, res)
+}
+
+var errArchSignatureUnpaired = errors.New("database signature could not be paired with the database")
+
+// archPairAttempts bounds refetches while the mirror replaces the database.
+const archPairAttempts = 3
+
+// refresh fetches the database, then its signature, and stores the signature
+// for the database's content. It returns the database and why no signature
+// could be stored, if so.
+func (h *ArchHandler) refresh(ctx context.Context, d archDatabase, entry *database.MetadataCacheEntry) (metadataResult, error) {
+	p := h.proxy
+	res := p.fetchMetadataFromUpstream(ctx, archEcosystem, d.dbKey, d.dbURL, archAccept, "identity", nil, entry)
+	if res.err != nil {
+		return res, res.err
+	}
+	for range archPairAttempts {
+		current, _ := p.DB.GetMetadataCache(archEcosystem, d.dbKey)
+		if current == nil || !current.ContentDigest.Valid {
+			return res, errArchSignatureUnpaired
+		}
+		dbDigest := current.ContentDigest.String
+		if _, ok := h.storedSignature(ctx, d, dbDigest); ok {
+			return res, nil
+		}
+
+		sig, err := p.fetchUpstreamMetadata(ctx, d.sigURL, nil, archAccept, "identity")
+		if errors.Is(err, ErrUpstreamNotFound) {
+			h.storeSignature(ctx, d, dbDigest, nil)
+			return res, err
+		}
+		if err != nil {
+			return res, err
+		}
+
+		// The mirror may have replaced the database in the meantime.
+		again, err := p.fetchUpstreamMetadata(ctx, d.dbURL, current, archAccept, "identity")
+		if err != nil {
+			return res, err
+		}
+		if archDigest(again.body) == dbDigest {
+			h.storeSignature(ctx, d, dbDigest, sig)
+			return res, nil
+		}
+		p.cacheMetadataBlob(ctx, archEcosystem, d.dbKey, metadataStoragePath(archEcosystem, d.dbKey), again)
+		res = metadataResult{body: again.body, contentType: again.contentType, contentEncoding: again.contentEncoding}
+	}
+	return res, errArchSignatureUnpaired
+}
+
+// cachedSignature returns the signature stored for the cached database.
+func (h *ArchHandler) cachedSignature(ctx context.Context, d archDatabase) (metadataResult, bool) {
+	current, _ := h.proxy.DB.GetMetadataCache(archEcosystem, d.dbKey)
+	if current == nil || !current.ContentDigest.Valid {
+		return metadataResult{}, false
+	}
+	return h.storedSignature(ctx, d, current.ContentDigest.String)
+}
+
+// storedSignature returns the signature stored for dbDigest. The storage
+// path names the digest, so a refresh with unchanged bytes keeps it.
+func (h *ArchHandler) storedSignature(ctx context.Context, d archDatabase, dbDigest string) (metadataResult, bool) {
+	entry, _ := h.proxy.DB.GetMetadataCache(archEcosystem, d.sigKey)
+	if entry == nil {
+		return metadataResult{}, false
+	}
+	switch entry.StoragePath {
+	case archMissingSignaturePath(d, dbDigest):
+		return metadataResult{err: ErrUpstreamNotFound}, true
+	case archSignaturePath(d, dbDigest):
+		body, contentType, err := h.proxy.readCachedMetadata(ctx, entry, nil)
+		if err != nil {
+			return metadataResult{}, false
+		}
+		return metadataResult{body: body, contentType: contentType, contentEncoding: entry.ContentEncoding.String}, true
+	}
+	return metadataResult{}, false
+}
+
+// storeSignature stores sig for dbDigest, or that it is missing when sig is
+// nil, and drops the one stored for an earlier database.
+func (h *ArchHandler) storeSignature(ctx context.Context, d archDatabase, dbDigest string, sig *upstreamMetadata) {
+	p := h.proxy
+	path := archSignaturePath(d, dbDigest)
+	if sig == nil {
+		path = archMissingSignaturePath(d, dbDigest)
+		sig = &upstreamMetadata{contentType: archPackageMediaType}
+	}
+	previous, _ := p.DB.GetMetadataCache(archEcosystem, d.sigKey)
+	p.cacheMetadataBlob(ctx, archEcosystem, d.sigKey, path, sig)
+	if previous == nil || previous.StoragePath == path {
+		return
+	}
+	if current, _ := p.DB.GetMetadataCache(archEcosystem, d.sigKey); current != nil && current.StoragePath == path {
+		_ = p.Storage.Delete(ctx, previous.StoragePath)
+	}
+}
+
+func archSignaturePath(d archDatabase, dbDigest string) string {
+	return "_metadata/" + archEcosystem + "/" + d.sigKey + "/" + strings.TrimPrefix(dbDigest, "sha256:")
+}
+
+func archMissingSignaturePath(d archDatabase, dbDigest string) string {
+	return archSignaturePath(d, dbDigest) + "-missing"
+}
+
+func archDigest(body []byte) string {
+	digest := sha256.Sum256(body)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func (h *ArchHandler) writeMetadata(w http.ResponseWriter, r *http.Request, cacheKey string, res metadataResult) {
 	if res.err != nil {
 		if errors.Is(res.err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		p.Logger.Error("metadata fetch failed", "error", res.err)
+		h.proxy.Logger.Error("metadata fetch failed", "error", res.err)
 		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 		return
 	}
-	p.writeMetadataCachedResponseWithEncoding(w, r, archEcosystem, sigKey, res.body, res.contentType, res.contentEncoding)
+	h.proxy.writeMetadataCachedResponseWithEncoding(w, r, archEcosystem, cacheKey, res.body, res.contentType, res.contentEncoding)
 }
 
 // metadataCacheKey hashes repository, upstream URL and path, as APKHandler does.
