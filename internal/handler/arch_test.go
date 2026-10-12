@@ -389,6 +389,51 @@ func TestArchHandler_DelayedSignatureMatchesCachedDatabase(t *testing.T) {
 	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "first signature request", []byte("sig v1"))
 }
 
+// TestArchHandler_RecoveredSignatureMatchesServedDatabase covers a signature
+// whose fetch failed while the database was served. If the upstream has moved
+// on by the time pacman asks for the signature, the new one cannot verify the
+// database pacman holds, so the proxy must fail rather than serve it.
+func TestArchHandler_RecoveredSignatureMatchesServedDatabase(t *testing.T) {
+	const dbPath, sigPath = "/custom/os/x86_64/custom.db", "/custom/os/x86_64/custom.db.sig"
+	upstream := newArchUpstream(t, map[string][]byte{dbPath: []byte("db v1"), sigPath: []byte("sig v1")})
+	upstream.broken[sigPath] = true
+	proxy := newArchTestProxy(t, upstream)
+	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"custom": upstream.URL})
+
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v1", []byte("db v1"))
+
+	upstream.mu.Lock()
+	upstream.files[dbPath] = []byte("db v2")
+	upstream.files[sigPath] = []byte("sig v2")
+	upstream.broken[sigPath] = false
+	upstream.mu.Unlock()
+
+	if w := serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil); w.Code != http.StatusBadGateway {
+		t.Errorf("signature for db v1: status = %d, body = %q, want 502", w.Code, w.Body.String())
+	}
+
+	// The next sync gets the new pair.
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v2", []byte("db v2"))
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig v2", []byte("sig v2"))
+}
+
+// TestArchHandler_RecoveredSignatureForUnchangedDatabase covers the same
+// failed signature fetch when the database has not changed: the signature is
+// fetched on request and served.
+func TestArchHandler_RecoveredSignatureForUnchangedDatabase(t *testing.T) {
+	const dbPath, sigPath = "/custom/os/x86_64/custom.db", "/custom/os/x86_64/custom.db.sig"
+	upstream := newArchUpstream(t, map[string][]byte{dbPath: []byte("db v1"), sigPath: []byte("sig v1")})
+	upstream.broken[sigPath] = true
+	proxy := newArchTestProxy(t, upstream)
+	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"custom": upstream.URL})
+
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+dbPath, nil), "db v1", []byte("db v1"))
+	upstream.mu.Lock()
+	upstream.broken[sigPath] = false
+	upstream.mu.Unlock()
+	assertArchBody(t, serveArchRequest(h, http.MethodGet, "/custom"+sigPath, nil), "sig v1", []byte("sig v1"))
+}
+
 // TestArchHandler_SignatureSurvivesUnchangedRefresh covers a database refresh
 // that returns the same bytes: the cached signature still matches and must be
 // served offline afterwards.

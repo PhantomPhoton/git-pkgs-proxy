@@ -224,20 +224,27 @@ func (h *ArchHandler) handleDatabaseSignature(w http.ResponseWriter, r *http.Req
 		return
 	}
 	p.recordMetadataCacheMiss(archEcosystem)
-	// Nothing stored for this database yet, e.g. the signature fetch failed
-	// during the last refresh: refresh both.
-	res, _ := p.coalesceMetadata(r.Context(), d.coalesceKey("signature"), func(ctx context.Context) metadataResult {
-		if res, ok := h.cachedSignature(ctx, d); ok {
+	// Nothing stored for the cached database, e.g. its signature fetch failed
+	// during the last refresh. The client may already hold that database, so
+	// only a signature for it will do; if the refresh replaces it, fail.
+	entry, _ := p.DB.GetMetadataCache(archEcosystem, d.dbKey)
+	served := h.databaseDigest(d)
+	res, _ := p.coalesceMetadata(r.Context(), d.coalesceKey("signature\x00"+served), func(ctx context.Context) metadataResult {
+		if res, ok := h.storedSignature(ctx, d, served); ok {
 			return res
 		}
-		entry, _ := p.DB.GetMetadataCache(archEcosystem, d.dbKey)
-		if _, err := h.refresh(ctx, d, entry); err != nil {
-			return metadataResult{err: err}
-		}
-		if res, ok := h.cachedSignature(ctx, d); ok {
+		_, err := h.refresh(ctx, d, entry)
+		if served == "" {
+			if res, ok := h.cachedSignature(ctx, d); ok {
+				return res
+			}
+		} else if res, ok := h.storedSignature(ctx, d, served); ok {
 			return res
 		}
-		return metadataResult{err: errArchSignatureUnpaired}
+		if err == nil || h.databaseDigest(d) != served {
+			err = errArchSignatureUnpaired
+		}
+		return metadataResult{err: err}
 	})
 	h.writeMetadata(w, r, d.sigKey, res)
 }
@@ -292,11 +299,20 @@ func (h *ArchHandler) refresh(ctx context.Context, d archDatabase, entry *databa
 
 // cachedSignature returns the signature stored for the cached database.
 func (h *ArchHandler) cachedSignature(ctx context.Context, d archDatabase) (metadataResult, bool) {
-	current, _ := h.proxy.DB.GetMetadataCache(archEcosystem, d.dbKey)
-	if current == nil || !current.ContentDigest.Valid {
+	dbDigest := h.databaseDigest(d)
+	if dbDigest == "" {
 		return metadataResult{}, false
 	}
-	return h.storedSignature(ctx, d, current.ContentDigest.String)
+	return h.storedSignature(ctx, d, dbDigest)
+}
+
+// databaseDigest returns the cached database's content digest, or "".
+func (h *ArchHandler) databaseDigest(d archDatabase) string {
+	current, _ := h.proxy.DB.GetMetadataCache(archEcosystem, d.dbKey)
+	if current == nil || !current.ContentDigest.Valid {
+		return ""
+	}
+	return current.ContentDigest.String
 }
 
 // storedSignature returns the signature stored for dbDigest. The storage
