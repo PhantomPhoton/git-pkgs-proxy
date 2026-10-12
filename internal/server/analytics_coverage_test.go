@@ -54,6 +54,7 @@ var metricSurface = map[string]string{
 // on the analytics page. The page is meant to be a complete view of what
 // /metrics exposes, so a silently unsurfaced metric is a gap, not a detail.
 func TestEveryMetricIsSurfaced(t *testing.T) {
+	isolateRecentFailures(t)
 	// Touch every metric family so it is present in the registry output, since
 	// a vector with no observed label values gathers as nothing at all.
 	metrics.RecordRequest("npm", 200, 0)

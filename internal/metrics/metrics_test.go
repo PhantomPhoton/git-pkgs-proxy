@@ -30,6 +30,7 @@ func TestRecordCacheOperations(t *testing.T) {
 }
 
 func TestRecordUpstreamOperations(t *testing.T) {
+	isolateRecentFailures(t)
 	RecordUpstreamFetch("npm", 500*time.Millisecond)
 	RecordUpstreamFetch("pypi", 1*time.Second)
 	RecordUpstreamError("npm", "fetch_failed", FailureDetail{})
@@ -39,6 +40,7 @@ func TestRecordUpstreamOperations(t *testing.T) {
 }
 
 func TestRecordStorageOperations(t *testing.T) {
+	isolateRecentFailures(t)
 	RecordStorageOperation("read", 10*time.Millisecond)
 	RecordStorageOperation("write", 50*time.Millisecond)
 	RecordStorageError("read", FailureDetail{})

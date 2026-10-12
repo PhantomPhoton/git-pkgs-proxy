@@ -124,6 +124,7 @@ func TestSnapshotMissingMetric(t *testing.T) {
 // Gather reads the real registry, so every metric this package registers must
 // come back. This is the check that a newly added metric is reachable by the UI.
 func TestGatherSeesRegisteredMetrics(t *testing.T) {
+	isolateRecentFailures(t)
 	RecordCacheHit("npm")
 	RecordScanError("npm", "clamav", "timeout", FailureDetail{})
 

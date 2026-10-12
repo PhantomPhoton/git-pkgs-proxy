@@ -9,8 +9,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// isolateRecentFailures empties the process-wide failure history for the
+// test and again when it ends, so neither earlier tests nor repeated runs
+// reach its assertions.
+func isolateRecentFailures(t *testing.T) {
+	t.Helper()
+	ResetRecentFailures()
+	t.Cleanup(ResetRecentFailures)
+}
+
 func TestRecentFailuresNewestFirst(t *testing.T) {
-	t.Cleanup(resetRecentFailures)
+	isolateRecentFailures(t)
 
 	RecordUpstreamError("npm", "fetch_failed", FailureDetail{PURL: "pkg:npm/left-pad@1.0.0"})
 	RecordUpstreamError("npm", "fetch_failed", FailureDetail{PURL: "pkg:npm/right-pad@2.0.0"})
@@ -28,7 +37,7 @@ func TestRecentFailuresNewestFirst(t *testing.T) {
 }
 
 func TestRecentFailuresAreBoundedPerSeries(t *testing.T) {
-	t.Cleanup(resetRecentFailures)
+	isolateRecentFailures(t)
 
 	for i := range recentFailuresPerSeries + 5 {
 		RecordStorageError("write", FailureDetail{Path: fmt.Sprintf("npm/pkg-%d.tgz", i)})
@@ -44,7 +53,7 @@ func TestRecentFailuresAreBoundedPerSeries(t *testing.T) {
 }
 
 func TestRecentFailuresAreKeptPerSeries(t *testing.T) {
-	t.Cleanup(resetRecentFailures)
+	isolateRecentFailures(t)
 
 	RecordIntegrityFailure("npm", FailureDetail{PURL: "pkg:npm/a@1"})
 	RecordIntegrityFailure("pypi", FailureDetail{PURL: "pkg:pypi/b@1"})
@@ -59,7 +68,7 @@ func TestRecentFailuresAreKeptPerSeries(t *testing.T) {
 }
 
 func TestRecordFailureStillCountsTheMetric(t *testing.T) {
-	t.Cleanup(resetRecentFailures)
+	isolateRecentFailures(t)
 
 	before := testutil.ToFloat64(HealthProbeFailures.WithLabelValues("read"))
 	RecordHealthProbeFailure("read", FailureDetail{Err: errors.New("disk gone")})
@@ -74,7 +83,7 @@ func TestRecordFailureStillCountsTheMetric(t *testing.T) {
 }
 
 func TestScanErrorRecordsDetail(t *testing.T) {
-	t.Cleanup(resetRecentFailures)
+	isolateRecentFailures(t)
 
 	RecordScanError("NPM", "clamav", "timeout", FailureDetail{PURL: "pkg:npm/a@1", Filename: "a-1.tgz"})
 
@@ -88,7 +97,7 @@ func TestScanErrorRecordsDetail(t *testing.T) {
 // The analytics page is unauthenticated, and private registry URLs carry
 // credentials in the userinfo or the query string. Neither may be kept.
 func TestRecentFailuresStripCredentials(t *testing.T) {
-	t.Cleanup(resetRecentFailures)
+	isolateRecentFailures(t)
 
 	RecordUpstreamError("npm", "fetch_failed", FailureDetail{
 		URL: "https://user:s3cret@registry.example.com/pkg/-/pkg-1.0.0.tgz?token=abc#frag",
@@ -113,7 +122,7 @@ func TestRecentFailuresStripCredentials(t *testing.T) {
 }
 
 func TestRecentFailuresReturnsACopy(t *testing.T) {
-	t.Cleanup(resetRecentFailures)
+	isolateRecentFailures(t)
 
 	RecordStorageError("read", FailureDetail{Path: "a"})
 	labels := map[string]string{"operation": "read"}
