@@ -26,6 +26,11 @@ func TestHexParseTarballFilename(t *testing.T) {
 		{"phoenix-1.7.10.tar", "phoenix", "1.7.10"},
 		{"ecto-3.11.0.tar", "ecto", "3.11.0"},
 		{"phoenix_live_view-0.20.1.tar", "phoenix_live_view", "0.20.1"},
+		{"amqp_client-4.1.5-1.tar", "amqp_client", "4.1.5-1"},
+		{"bandit-0.1.0-dev-10.tar", "bandit", "0.1.0-dev-10"},
+		{"ex_doc-0.34.0-rc.1.tar", "ex_doc", "0.34.0-rc.1"},
+		{"-1.0.0.tar", "", ""},
+		{"phoenix-.tar", "", ""},
 		{"invalid", "", ""},
 	}
 
