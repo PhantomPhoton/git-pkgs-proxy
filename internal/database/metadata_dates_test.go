@@ -1,7 +1,8 @@
 package database
 
 import (
-	"path/filepath"
+	"database/sql"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,23 +107,71 @@ func TestMetadataDateIsUTCSeconds(t *testing.T) {
 	})
 }
 
-func TestMetadataDatesTableCreatedByMigration(t *testing.T) {
-	db, err := Create(filepath.Join(t.TempDir(), "test.db"))
+// TestMetadataDatesMigrationKeepsCachedMetadata upgrades a database from
+// before migration 011 that holds cached npm and Composer metadata, and checks
+// that the cached rows come through unchanged and dates can be recorded.
+func TestMetadataDatesMigrationKeepsCachedMetadata(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		rollBackMetadataDates(t, db)
+		seeded := map[string]string{testEcosystemNPM: "left-pad", "composer": "vendor/pkg"}
+		before := make(map[string]*MetadataCacheEntry, len(seeded))
+		for ecosystem, name := range seeded {
+			before[ecosystem] = seedMetadataCache(t, db, ecosystem, name)
+		}
+
+		if err := db.MigrateSchema(); err != nil {
+			t.Fatalf("MigrateSchema() error = %v", err)
+		}
+
+		for ecosystem, name := range seeded {
+			after, err := db.GetMetadataCache(ecosystem, name)
+			if err != nil || after == nil || *after != *before[ecosystem] {
+				t.Errorf("metadata row %s/%s after migration = %+v, %v; want %+v", ecosystem, name, after, err, before[ecosystem])
+			}
+			date := MetadataDate{ETag: `"a"`, LastModified: time.Date(2026, 10, 10, 12, 0, 1, 0, time.UTC)}
+			if inserted, err := db.InsertMetadataDate(ecosystem, testProxyURL, name, date); err != nil || !inserted {
+				t.Errorf("InsertMetadataDate(%s/%s) after migration = %v, %v; want true", ecosystem, name, inserted, err)
+			}
+		}
+	})
+}
+
+// seedMetadataCache stores a metadata row as the metadata cache writes one
+// and returns it as read back.
+func seedMetadataCache(t *testing.T, db *DB, ecosystem, name string) *MetadataCacheEntry {
+	t.Helper()
+	err := db.UpsertMetadataCache(&MetadataCacheEntry{
+		Ecosystem:     ecosystem,
+		Name:          name,
+		StoragePath:   "_metadata/" + ecosystem + "/" + name + "/metadata",
+		ETag:          sql.NullString{String: `"upstream"`, Valid: true},
+		ContentType:   sql.NullString{String: "application/json", Valid: true},
+		ContentDigest: sql.NullString{String: "sha256:" + strings.Repeat("ab", 32), Valid: true},
+		Size:          sql.NullInt64{Int64: 123, Valid: true},
+		LastModified:  sql.NullTime{Time: time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC), Valid: true},
+		FetchedAt:     sql.NullTime{Time: time.Now().UTC().Truncate(time.Second), Valid: true},
+	})
 	if err != nil {
-		t.Fatalf("Create failed: %v", err)
+		t.Fatal(err)
 	}
-	defer func() { _ = db.Close() }()
+	entry, err := db.GetMetadataCache(ecosystem, name)
+	if err != nil || entry == nil {
+		t.Fatalf("GetMetadataCache(%s/%s) = %v, %v", ecosystem, name, entry, err)
+	}
+	return entry
+}
+
+// rollBackMetadataDates returns db to the schema from before migration 011,
+// which only added the metadata_dates table.
+func rollBackMetadataDates(t *testing.T, db *DB) {
+	t.Helper()
 	if _, err := db.Exec("DROP TABLE metadata_dates"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec("DELETE FROM migrations WHERE name = '011_add_metadata_dates'"); err != nil {
 		t.Fatal(err)
 	}
-
-	if err := db.MigrateSchema(); err != nil {
-		t.Fatalf("MigrateSchema() error = %v", err)
-	}
-	if has, err := db.HasTable("metadata_dates"); err != nil || !has {
-		t.Errorf("HasTable(metadata_dates) = %v, %v; want true after migration", has, err)
+	if has, err := db.HasTable("metadata_dates"); err != nil || has {
+		t.Fatalf("HasTable(metadata_dates) after rollback = %v, %v; want false", has, err)
 	}
 }
