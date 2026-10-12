@@ -119,6 +119,15 @@ CREATE TABLE IF NOT EXISTS metadata_cache (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_eco_name ON metadata_cache(ecosystem, name);
 
+CREATE TABLE IF NOT EXISTS metadata_dates (
+	ecosystem TEXT NOT NULL,
+	proxy_url TEXT NOT NULL,
+	name TEXT NOT NULL,
+	etag TEXT NOT NULL,
+	last_modified INTEGER NOT NULL,
+	PRIMARY KEY (ecosystem, proxy_url, name)
+);
+
 CREATE TABLE IF NOT EXISTS migrations (
 	name TEXT NOT NULL PRIMARY KEY,
 	applied_at DATETIME NOT NULL
@@ -227,6 +236,15 @@ CREATE TABLE IF NOT EXISTS metadata_cache (
 	updated_at TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_eco_name ON metadata_cache(ecosystem, name);
+
+CREATE TABLE IF NOT EXISTS metadata_dates (
+	ecosystem TEXT NOT NULL,
+	proxy_url TEXT NOT NULL,
+	name TEXT NOT NULL,
+	etag TEXT NOT NULL,
+	last_modified BIGINT NOT NULL,
+	PRIMARY KEY (ecosystem, proxy_url, name)
+);
 
 CREATE TABLE IF NOT EXISTS migrations (
 	name TEXT NOT NULL PRIMARY KEY,
@@ -382,6 +400,7 @@ var migrations = []migration{
 	{"008_add_metadata_content_encoding", migrateAddMetadataContentEncoding},
 	{"009_add_pending_deletes", migrateAddPendingDeletes},
 	{"010_add_pending_deletes_queued_at_index", migrateAddPendingDeletesQueuedAtIndex},
+	{"011_add_metadata_dates", migrateAddMetadataDates},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -677,6 +696,27 @@ func migrateAddPendingDeletesQueuedAtIndex(db *DB) error {
 	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at)`)
 	if err != nil {
 		return fmt.Errorf("creating pending_deletes queued_at index: %w", err)
+	}
+	return nil
+}
+
+// migrateAddMetadataDates creates the table of Last-Modified dates for
+// rewritten metadata, which replicas sharing the database agree on.
+func migrateAddMetadataDates(db *DB) error {
+	seconds := "INTEGER"
+	if db.dialect == DialectPostgres {
+		seconds = "BIGINT"
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS metadata_dates (
+		ecosystem TEXT NOT NULL,
+		proxy_url TEXT NOT NULL,
+		name TEXT NOT NULL,
+		etag TEXT NOT NULL,
+		last_modified %s NOT NULL,
+		PRIMARY KEY (ecosystem, proxy_url, name)
+	)`, seconds)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating metadata_dates table: %w", err)
 	}
 	return nil
 }

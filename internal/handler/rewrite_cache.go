@@ -3,9 +3,14 @@ package handler
 import (
 	"container/list"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"io"
+	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +31,11 @@ import (
 // are rewritten again rather than served stale. Everything else a rewrite
 // depends on is fixed for the life of the process: the proxy URL is part of
 // the key, and the denylist is loaded at startup.
+//
+// Each entry keeps the ETag of its output, so clients can revalidate their
+// copy without the output being hashed again on every request. Dates are not
+// the cache's to give: they must agree across replicas, so the database holds
+// them (see metadataDate).
 type rewriteCache struct {
 	maxBytes int64
 
@@ -37,18 +47,66 @@ type rewriteCache struct {
 }
 
 type rewriteEntry struct {
-	key string
-	out []byte
+	key  string
+	out  []byte
+	etag string
 }
 
-// inflightRewrite is one rewrite that concurrent callers share. out and err
-// are written before done closes and read only after, so the close is the
-// handoff.
+// inflightRewrite is one rewrite that concurrent callers share. out, etag
+// and err are written before done closes and read only after, so the close is
+// the handoff.
 type inflightRewrite struct {
 	done chan struct{}
 	out  []byte
+	etag string
 	err  error
 }
+
+// metadataValidators are what a client revalidates its copy of rewritten
+// metadata with. lastModified is zero when there is none to give.
+type metadataValidators struct {
+	etag         string
+	lastModified time.Time
+}
+
+// rewrittenMetadata is a rewritten metadata document with its validators.
+type rewrittenMetadata struct {
+	body []byte
+	metadataValidators
+}
+
+// metadataETag returns the strong ETag of a rewritten document.
+func metadataETag(out []byte) string {
+	sum := sha256.Sum256(out)
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+// rewriteConfigNonce stands for the configuration a rewrite reads at startup,
+// such as the denylist and cooldown rules, in ETags derived from a rewrite's
+// inputs. It changes on every start, so no ETag outlives the configuration it
+// was derived under.
+var rewriteConfigNonce = rand.Text()
+
+// keptVersionsETag returns the strong ETag of a rewrite from what fixes its
+// output: the upstream document's digest, the proxy URL and package name its
+// download URLs carry, the versions cooldown and the denylist kept, and the
+// startup configuration. Hashing these costs far less than hashing the
+// rewritten document. Each field is length-prefixed, so different inputs never
+// hash the same bytes.
+func keptVersionsETag(digest, proxyURL, name string, kept []string) string {
+	h := sha256.New()
+	var length []byte
+	for _, field := range append([]string{rewriteConfigNonce, digest, proxyURL, name}, slices.Sorted(slices.Values(kept))...) {
+		length = binary.AppendUvarint(length[:0], uint64(len(field)))
+		_, _ = h.Write(length)
+		_, _ = io.WriteString(h, field)
+	}
+	return `"` + hex.EncodeToString(h.Sum(nil)) + `"`
+}
+
+// keepingRewrite rewrites a metadata document and reports the versions it
+// kept. Together with the document they fix the rewrite's output.
+type keepingRewrite func([]byte) ([]byte, []string, error)
 
 // errSharedRewriteAbandoned is what waiters see if the caller running a
 // shared rewrite panicked out of it.
@@ -81,44 +139,46 @@ func rewriteCacheKeyForDigest(ecosystem, proxyURL, name, digest string) string {
 	return strings.Join([]string{ecosystem, proxyURL, name, digest}, "\x00")
 }
 
-// get returns the cached rewrite for key, if there is one.
-func (c *rewriteCache) get(key string) ([]byte, bool) {
+// get returns the cached rewrite for key and its ETag, if there is one.
+func (c *rewriteCache) get(key string) ([]byte, metadataValidators, bool) {
 	if c == nil {
-		return nil, false
+		return nil, metadataValidators{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.entries[key]
 	if !ok {
-		return nil, false
+		return nil, metadataValidators{}, false
 	}
 	c.order.MoveToFront(el)
-	return el.Value.(*rewriteEntry).out, true
+	e := el.Value.(*rewriteEntry)
+	return e.out, metadataValidators{etag: e.etag}, true
 }
 
-// rewrite returns rewrite(in), from the cache when it can. Callers must treat
-// the returned bytes as read-only: a cached result is shared. A caller waiting
-// on another's rewrite leaves when ctx ends; the rewrite itself always runs
-// to completion, so the result is cached for the next request.
-func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewrite func([]byte) ([]byte, error)) ([]byte, error) {
+// rewrite returns rewrite(in) and its ETag, from the cache when it can.
+// Callers must treat the returned bytes as read-only: a cached result is
+// shared. A caller waiting on another's rewrite leaves when ctx ends; the
+// rewrite itself always runs to completion, so the result is cached for the
+// next request.
+func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewrite func([]byte) ([]byte, error)) (out []byte, v metadataValidators, err error) {
 	if c == nil {
-		return rewrite(in)
+		return rewriteWithETag(in, rewrite)
 	}
 
 	c.mu.Lock()
 	if el, ok := c.entries[key]; ok {
 		c.order.MoveToFront(el)
-		out := el.Value.(*rewriteEntry).out
+		e := el.Value.(*rewriteEntry)
 		c.mu.Unlock()
-		return out, nil
+		return e.out, metadataValidators{etag: e.etag}, nil
 	}
 	if f, ok := c.inFlight[key]; ok {
 		c.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, metadataValidators{}, ctx.Err()
 		case <-f.done:
-			return f.out, f.err
+			return f.out, metadataValidators{etag: f.etag}, f.err
 		}
 	}
 	f := &inflightRewrite{done: make(chan struct{}), err: errSharedRewriteAbandoned}
@@ -129,24 +189,35 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 		c.mu.Lock()
 		delete(c.inFlight, key)
 		if f.err == nil {
-			c.add(key, f.out)
+			c.add(&rewriteEntry{key: key, out: f.out, etag: f.etag})
 		}
 		c.mu.Unlock()
 		close(f.done)
 	}()
-	f.out, f.err = rewrite(in)
-	return f.out, f.err
+	var fv metadataValidators
+	f.out, fv, f.err = rewriteWithETag(in, rewrite)
+	f.etag = fv.etag
+	return f.out, fv, f.err
 }
 
-// add stores out under key and evicts least recently used entries until the
-// cache is back under its limit. Output larger than the whole cache is not
-// stored. Called with mu held.
-func (c *rewriteCache) add(key string, out []byte) {
-	n := int64(len(out))
+// rewriteWithETag runs rewrite and computes the ETag of what it returns.
+func rewriteWithETag(in []byte, rewrite func([]byte) ([]byte, error)) ([]byte, metadataValidators, error) {
+	out, err := rewrite(in)
+	if err != nil {
+		return nil, metadataValidators{}, err
+	}
+	return out, metadataValidators{etag: metadataETag(out)}, nil
+}
+
+// add stores e and evicts least recently used entries until the cache is
+// back under its limit. Output larger than the whole cache is not stored.
+// Called with mu held.
+func (c *rewriteCache) add(e *rewriteEntry) {
+	n := int64(len(e.out))
 	if n > c.maxBytes {
 		return
 	}
-	c.entries[key] = c.order.PushFront(&rewriteEntry{key: key, out: out})
+	c.entries[e.key] = c.order.PushFront(e)
 	c.size += n
 	for c.size > c.maxBytes {
 		oldest := c.order.Back()
@@ -168,14 +239,41 @@ func (c *rewriteCache) len() int {
 }
 
 // cachedRewrite rewrites a metadata document through the proxy's rewrite
-// cache. Cooldown filtering depends on the current time, so with cooldown on
-// a cached rewrite could keep hiding a version past its cooldown; those
-// rewrites always run.
-func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name string, in []byte, rewrite func([]byte) ([]byte, error)) ([]byte, error) {
-	if p.rewrites == nil || (p.Cooldown != nil && p.Cooldown.Enabled()) {
-		return rewrite(in)
+// cache and returns it with its validators. digest identifies in when the
+// metadata cache stored it, and is empty otherwise. Cooldown filtering depends
+// on the current time, so with cooldown on a cached rewrite could keep hiding
+// a version past its cooldown; those rewrites always run, with no
+// Last-Modified, and when digest is known their ETag comes from their inputs
+// rather than from hashing each output again. Their ETag also changes with
+// every restart, so replicas would never agree on a date for them.
+func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name string, in []byte, digest string, rewrite keepingRewrite) (rewrittenMetadata, error) {
+	if p.cooldownEnabled() && digest != "" {
+		out, kept, err := rewrite(in)
+		if err != nil {
+			return rewrittenMetadata{}, err
+		}
+		return rewrittenMetadata{out, metadataValidators{etag: keptVersionsETag(digest, proxyURL, name, kept)}}, nil
 	}
-	return p.rewrites.rewrite(ctx, rewriteCacheKey(ecosystem, proxyURL, name, in), in, rewrite)
+	rewriteOnly := func(b []byte) ([]byte, error) {
+		out, _, err := rewrite(b)
+		return out, err
+	}
+	var out []byte
+	var v metadataValidators
+	var err error
+	if p.rewrites == nil || p.cooldownEnabled() {
+		out, v, err = rewriteWithETag(in, rewriteOnly)
+	} else {
+		out, v, err = p.rewrites.rewrite(ctx, rewriteCacheKey(ecosystem, proxyURL, name, in), in, rewriteOnly)
+	}
+	if err == nil && !p.cooldownEnabled() {
+		v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
+	}
+	return rewrittenMetadata{out, v}, err
+}
+
+func (p *Proxy) cooldownEnabled() bool {
+	return p.Cooldown != nil && p.Cooldown.Enabled()
 }
 
 // storedRewrite returns the cached rewrite of the metadata stored for
@@ -184,25 +282,56 @@ func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name str
 // document, so a repeated request for a large packument costs a database
 // lookup instead of reading and hashing the whole document again. When it
 // reports false the caller takes the usual fetch and rewrite path.
-func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) ([]byte, bool) {
-	if p.rewrites == nil || (p.Cooldown != nil && p.Cooldown.Enabled()) {
-		return nil, false
+func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) (rewrittenMetadata, bool) {
+	if p.rewrites == nil || p.cooldownEnabled() {
+		return rewrittenMetadata{}, false
 	}
 	if !p.CacheMetadata || p.DB == nil || p.MetadataTTL <= 0 {
-		return nil, false
+		return rewrittenMetadata{}, false
 	}
 	entry, err := p.DB.GetMetadataCache(ecosystem, cacheKey)
 	if err != nil || entry == nil || !entry.ContentDigest.Valid || entry.ContentEncoding.String != "" {
-		return nil, false
+		return rewrittenMetadata{}, false
 	}
 	if !entry.FetchedAt.Valid || time.Since(entry.FetchedAt.Time) >= p.MetadataTTL {
-		return nil, false
+		return rewrittenMetadata{}, false
 	}
-	out, ok := p.rewrites.get(rewriteCacheKeyForDigest(ecosystem, proxyURL, name, entry.ContentDigest.String))
-	if ok {
-		metrics.RecordCacheHit(ecosystem)
+	out, v, ok := p.rewrites.get(rewriteCacheKeyForDigest(ecosystem, proxyURL, name, entry.ContentDigest.String))
+	if !ok {
+		return rewrittenMetadata{}, false
 	}
-	return out, ok
+	v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
+	metrics.RecordCacheHit(ecosystem)
+	return rewrittenMetadata{out, v}, true
+}
+
+// serveRewrittenMetadata writes rewritten metadata with its validators, or
+// 304 Not Modified when they show the client's copy is current.
+func serveRewrittenMetadata(w http.ResponseWriter, r *http.Request, m rewrittenMetadata) {
+	w.Header().Set(headerETag, m.etag)
+	if !m.lastModified.IsZero() {
+		w.Header().Set(headerLastModified, m.lastModified.UTC().Format(http.TimeFormat))
+	}
+	if notModified(r, m.etag, m.lastModified) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set(headerContentType, contentTypeJSON)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(m.body)
+}
+
+// notModified reports whether a conditional request's validators match.
+// If-Modified-Since only counts when the request has no If-None-Match.
+func notModified(r *http.Request, etag string, lastModified time.Time) bool {
+	if header := r.Header.Get("If-None-Match"); header != "" {
+		return ifNoneMatchHits(header, etag)
+	}
+	if lastModified.IsZero() {
+		return false
+	}
+	since, err := http.ParseTime(r.Header.Get("If-Modified-Since"))
+	return err == nil && !lastModified.Truncate(time.Second).After(since)
 }
 
 // SetMetadataRewriteCacheSize enables the cache of rewritten metadata with
