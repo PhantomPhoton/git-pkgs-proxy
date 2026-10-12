@@ -248,3 +248,40 @@ func TestNuGetRetentionCoversMirroredPackages(t *testing.T) {
 		t.Error("never-served mirrored package kept past the nuget rule")
 	}
 }
+
+// Mirroring a mixed-case id fills the record clients are served, so their
+// first download comes from the cache.
+func TestNuGetMirrorStoresIDsLowercased(t *testing.T) {
+	upstream, downloads := nugetRetentionUpstream(t)
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, store := setupEvictionTest(t)
+	client := &http.Client{Transport: nugetRewriteTransport{target: target, base: upstream.Client().Transport}}
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(client), fetch.WithMaxRetries(0))
+	t.Cleanup(func() { _ = fetcher.Close() })
+	proxy := handler.NewProxy(db, store, fetcher, fetch.NewResolver(), discardLogger())
+	proxy.HTTPClient = upstream.Client()
+
+	m := mirror.New(proxy, db, store, discardLogger(), 1)
+	progress, err := m.Run(context.Background(), &mirror.PURLSource{PURLs: []string{"pkg:nuget/Serilog@3.1.1"}})
+	if err != nil || progress.Failed != 0 || downloads.Load() != 1 {
+		t.Fatalf("mirror run = %+v, %v, downloads %d; want one successful download", progress, err, downloads.Load())
+	}
+
+	h := handler.NewNuGetHandlerWithUpstreams(proxy, "http://proxy.test", upstream.URL, upstream.URL)
+	srv := httptest.NewServer(h.Routes())
+	t.Cleanup(srv.Close)
+	nugetGet(t, srv.URL+nugetSerilogPath)
+	if got := downloads.Load(); got != 1 {
+		t.Errorf("upstream downloads = %d, want 1: the client was not served the mirrored copy", got)
+	}
+	var n int
+	if err := db.Get(&n, `SELECT COUNT(*) FROM artifacts`); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("artifacts = %d, want 1", n)
+	}
+}

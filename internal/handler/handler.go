@@ -244,6 +244,12 @@ type CacheResult struct {
 
 // GetOrFetchArtifact retrieves an artifact from cache or fetches from upstream.
 func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version, filename string) (*CacheResult, error) {
+	// NuGet ids are case-insensitive and the NuGet handler stores them
+	// lowercased, so a mirrored Newtonsoft.Json must land on the same record
+	// clients are served.
+	if ecosystem == "nuget" {
+		name = strings.ToLower(name)
+	}
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
 		return nil, err
