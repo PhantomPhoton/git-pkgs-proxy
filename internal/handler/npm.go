@@ -183,16 +183,25 @@ func (h *NPMHandler) sourceFor(packageName string) (registryURL, cacheKey string
 
 // handlePackageMetadata proxies package metadata from upstream and rewrites tarball URLs.
 func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Request) {
-	packageName := h.extractPackageName(r)
+	packagePath := h.extractPackageName(r)
+	if packagePath == "" || containsPathTraversal(packagePath) {
+		JSONError(w, http.StatusBadRequest, "invalid package name")
+		return
+	}
+	packageName, registryPath := npmMetadataPath(packagePath)
 	if packageName == "" {
 		JSONError(w, http.StatusBadRequest, "invalid package name")
 		return
 	}
 
-	h.proxy.Logger.Info("npm metadata request", "package", packageName)
+	h.proxy.Logger.Info("npm metadata request", "package", packageName, "path", packagePath)
 
 	registryURL, cacheKey := h.sourceFor(packageName)
-	upstreamURL := fmt.Sprintf("%s/%s", registryURL, url.PathEscape(packageName))
+	// A version or dist-tag is its own path segment. Escaping the whole path
+	// turns "lodash/4.17.21" into "lodash%2F4.17.21", which the registry
+	// rejects with 405.
+	upstreamURL := registryURL + "/" + registryPath
+	metadataCacheKey := npmMetadataCacheKey(cacheKey, packagePath, packageName)
 
 	// Prefer the smaller abbreviated packument format but include application/json
 	// as a fallback so upstreams that reject the abbreviated type (e.g. JFrog
@@ -206,17 +215,27 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		accept = contentTypeJSON
 	}
 
-	if rewritten, ok := h.proxy.storedRewrite("npm", cacheKey, h.proxyURL, cacheKey); ok {
+	if rewritten, ok := h.proxy.storedRewrite("npm", metadataCacheKey, h.proxyURL, metadataCacheKey); ok {
 		w.Header().Set(headerContentType, contentTypeJSON)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(rewritten)
 		return
 	}
 
-	body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", cacheKey, upstreamURL, accept)
+	specifier, versionLookup := npmVersionSpecifier(packagePath, packageName)
+	if versionLookup && h.npmVersionMetadataUsesFilteredPackument(packageName) {
+		h.handleFilteredNPMVersionMetadata(w, r, packageName, specifier, accept, registryURL, cacheKey, metadataCacheKey)
+		return
+	}
+
+	body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", metadataCacheKey, upstreamURL, accept)
 	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
-			JSONError(w, http.StatusNotFound, "package not found")
+			if versionLookup {
+				JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
+			} else {
+				JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
+			}
 			return
 		}
 		h.proxy.Logger.Error("failed to fetch npm metadata", "error", err)
@@ -224,12 +243,20 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	rewritten, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, cacheKey, body, func(b []byte) ([]byte, error) {
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, body, func(b []byte) ([]byte, error) {
 		return h.rewriteMetadata(packageName, b)
 	})
 	if err != nil {
 		if r.Context().Err() != nil {
 			return // the client left while waiting on a shared rewrite
+		}
+		if errors.Is(err, ErrVersionDenied) {
+			JSONError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		if errors.Is(err, ErrVersionNotFound) {
+			JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
+			return
 		}
 		if len(h.proxy.Denylist.Versions(canonicalPackagePURL("npm", packageName))) != 0 {
 			JSONError(w, http.StatusBadGateway, "failed to filter package metadata")
@@ -246,6 +273,112 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 	w.Header().Set(headerContentType, contentTypeJSON)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(rewritten)
+}
+
+// handleFilteredNPMVersionMetadata serves /pkg/<version> and /pkg/<tag> from the
+// filtered packument so cooldown and dist-tags match the root metadata response.
+func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *http.Request, packageName, specifier, accept, registryURL, cacheKey, metadataCacheKey string) {
+	_, packumentPath := npmMetadataPath(packageName)
+	packument, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", cacheKey, registryURL+"/"+packumentPath, accept)
+	if err != nil {
+		if errors.Is(err, ErrUpstreamNotFound) {
+			JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
+			return
+		}
+		h.proxy.Logger.Error("failed to fetch npm metadata", "error", err)
+		JSONError(w, http.StatusBadGateway, "failed to fetch from upstream")
+		return
+	}
+
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, packument, func(b []byte) ([]byte, error) {
+		return h.rewriteNPMVersionFromPackument(packageName, specifier, b)
+	})
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		if errors.Is(err, ErrVersionDenied) {
+			JSONError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		if errors.Is(err, ErrVersionNotFound) {
+			JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
+			return
+		}
+		if len(h.proxy.Denylist.Versions(canonicalPackagePURL("npm", packageName))) != 0 {
+			JSONError(w, http.StatusBadGateway, "failed to filter package metadata")
+			return
+		}
+		h.proxy.Logger.Warn("failed to rewrite npm version metadata", "error", err)
+		JSONError(w, http.StatusBadGateway, "failed to filter package metadata")
+		return
+	}
+
+	w.Header().Set(headerContentType, contentTypeJSON)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(rewritten)
+}
+
+// npmMetadataCacheKey qualifies routed-package metadata cache entries with the
+// requested version or dist-tag when the client asks for a single version.
+func npmMetadataCacheKey(cacheKey, packagePath, packageName string) string {
+	specifier, versionLookup := npmVersionSpecifier(packagePath, packageName)
+	if !versionLookup {
+		return cacheKey
+	}
+	return cacheKey + "/" + specifier
+}
+
+// npmVersionSpecifier returns the version or dist-tag segment after the package
+// name in a metadata path, for example "4.17.21" or "latest".
+func npmVersionSpecifier(packagePath, packageName string) (string, bool) {
+	if packagePath == packageName {
+		return "", false
+	}
+	specifier, ok := strings.CutPrefix(packagePath, packageName+"/")
+	return specifier, ok
+}
+
+func (h *NPMHandler) npmVersionMetadataUsesFilteredPackument(packageName string) bool {
+	if h.proxy.Cooldown != nil && h.proxy.Cooldown.Enabled() {
+		return true
+	}
+	if h.proxy.Denylist != nil {
+		return len(h.proxy.Denylist.Versions(canonicalPackagePURL("npm", packageName))) != 0
+	}
+	return false
+}
+
+// rewriteNPMVersionFromPackument picks one version entry out of an already
+// filtered packument and rewrites its tarball URL.
+func (h *NPMHandler) rewriteNPMVersionFromPackument(packageName, specifier string, packument []byte) ([]byte, error) {
+	filtered, err := h.rewriteMetadata(packageName, packument)
+	if err != nil {
+		return nil, err
+	}
+
+	target := specifier
+	if resolved, ok, err := lookupJSONString(filtered, "dist-tags", specifier); err != nil {
+		return nil, err
+	} else if ok {
+		target = resolved
+	}
+
+	if h.proxy.versionDenied("npm", packageName, target) {
+		return nil, ErrVersionDenied
+	}
+
+	versionRaw, err := lookupJSON(filtered, "versions", target)
+	if err != nil {
+		return nil, err
+	}
+	if len(versionRaw) == 0 {
+		return nil, ErrVersionNotFound
+	}
+
+	var out bytes.Buffer
+	h.writeNPMVersion(&out, packageName, target, versionRaw)
+	return out.Bytes(), nil
 }
 
 // rewriteMetadata rewrites tarball URLs in npm package metadata to point at this proxy.
@@ -266,6 +399,18 @@ func (h *NPMHandler) rewriteMetadata(packageName string, body []byte) ([]byte, e
 
 	versionsRaw := doc.value(doc.versionsAt)
 	if len(versionsRaw) == 0 || versionsRaw[0] != '{' {
+		version, ok, err := lookupJSONString(body, "version")
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			if h.proxy.versionDenied("npm", packageName, version) {
+				return nil, ErrVersionDenied
+			}
+			var out bytes.Buffer
+			h.writeNPMVersion(&out, packageName, version, body)
+			return out.Bytes(), nil
+		}
 		if len(h.proxy.Denylist.Versions(canonicalPackagePURL("npm", packageName))) != 0 {
 			return nil, errors.New("npm metadata has no versions object")
 		}
@@ -620,7 +765,7 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if h.versionInCooldown(packageName, version, metadata) {
 		h.proxy.Logger.Info("cooldown: withholding npm tarball",
 			"package", packageName, "version", version)
-		JSONError(w, http.StatusNotFound, "version not found")
+		JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
 		return
 	}
 
@@ -628,7 +773,7 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrUpstreamNotFound):
-			JSONError(w, http.StatusNotFound, "package not found")
+			JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
 		case errors.Is(err, ErrArtifactBlocked), errors.Is(err, ErrVersionDenied):
 			JSONError(w, http.StatusForbidden, err.Error())
 		default:
@@ -752,6 +897,31 @@ func (h *NPMHandler) versionInCooldown(packageName, version string, metadata fun
 	}
 
 	return !h.proxy.Cooldown.IsAllowed("npm", canonicalPackagePURL("npm", packageName), publishedAt)
+}
+
+// npmMetadataPath returns the package name and the encoded registry path.
+// Examples: lodash → lodash; lodash/4.17.21 → lodash/4.17.21;
+// @babel/core → @babel%2Fcore; @babel/core/7.23.0 → @babel%2Fcore/7.23.0.
+func npmMetadataPath(packagePath string) (packageName, registryPath string) {
+	// GET /npm/ has no package segment; handlePackageMetadata rejects that earlier.
+	if packagePath == "" {
+		return "", ""
+	}
+	if !strings.Contains(packagePath, "/") {
+		return packagePath, url.PathEscape(packagePath)
+	}
+	if strings.HasPrefix(packagePath, "@") {
+		scope, rest, _ := strings.Cut(packagePath, "/")
+		name, version, ok := strings.Cut(rest, "/")
+		packageName = scope + "/" + name
+		registryPath = url.PathEscape(scope) + "%2F" + url.PathEscape(name)
+		if ok {
+			registryPath += "/" + url.PathEscape(version)
+		}
+		return packageName, registryPath
+	}
+	name, version, _ := strings.Cut(packagePath, "/")
+	return name, url.PathEscape(name) + "/" + url.PathEscape(version)
 }
 
 func escapeNPMDownloadPackage(packageName string) string {
