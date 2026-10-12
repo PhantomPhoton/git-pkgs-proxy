@@ -105,7 +105,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `nuget` | no | - |
 | `oci` | yes | `pkg:oci/library/nginx`, the repository name of the pull. A named upstream keeps its prefix, also when containerd reaches it through `ns`: `ghcr.io/owner/app` pulled that way is `pkg:oci/upstream/ghcr/owner/app`. Homebrew bottles use Homebrew's image name, with `@` written as `/` and `+` as `x` (`openssl@3` is `pkg:oci/homebrew/core/openssl/3`). Helm charts pulled over OCI are stored like images. Only blobs are evicted; manifests stay in the metadata cache. |
 | `pub` | no | - |
-| `pypi` | no | - |
+| `pypi` | yes | `pkg:pypi/requests`; case and single `_`/`-` don't matter. Dots and repeated separators are kept as written, so a project like `zope.interface` can be stored as `zope.interface` and `zope-interface`; add a rule for each. |
 | `rpm` | no | - |
 | `swift` | no | - |
 
