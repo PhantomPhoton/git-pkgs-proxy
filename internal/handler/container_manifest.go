@@ -191,12 +191,13 @@ func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, r
 		h.proxy.Logger.Warn("failed to read cached container manifest", "error", err)
 		return nil
 	}
-	if cached != nil {
-		if containerManifestCacheCompatible(accept, cached) {
-			return cached
-		}
-		return nil
+	if cached != nil && containerManifestCacheCompatible(accept, cached) {
+		return cached
 	}
+	// The shared entry may hold a representation this client does not accept,
+	// for example an OCI index for a client that only accepts Docker manifest
+	// lists. Its own per-Accept entry is still written, so look there.
+	sharedEntryExists := cached != nil
 
 	for _, legacyCacheKey := range h.containerManifestLegacyCacheKeys(registryURL, name, reference, accept, cacheAccept, cacheKey) {
 		cached, err = h.loadContainerManifest(ctx, legacyCacheKey)
@@ -204,14 +205,13 @@ func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, r
 			h.proxy.Logger.Warn("failed to read legacy cached container manifest", "error", err)
 			return nil
 		}
-		if cached == nil {
+		if cached == nil || !containerManifestCacheCompatible(accept, cached) {
 			continue
 		}
-		if !containerManifestCacheCompatible(accept, cached) {
-			return nil
-		}
-		if err := h.storeContainerManifest(ctx, cacheKey, cached); err != nil {
-			h.proxy.Logger.Warn("failed to migrate cached container manifest", "error", err)
+		if !sharedEntryExists {
+			if err := h.storeContainerManifest(ctx, cacheKey, cached); err != nil {
+				h.proxy.Logger.Warn("failed to migrate cached container manifest", "error", err)
+			}
 		}
 		return cached
 	}

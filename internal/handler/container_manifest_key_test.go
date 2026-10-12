@@ -163,3 +163,32 @@ func TestContainerHandler_IndexlessClientKeepsOwnTagEntry(t *testing.T) {
 		t.Errorf("offline index-less body = %q, want the converted manifest", response.Body.String())
 	}
 }
+
+func TestContainerHandler_IncompatibleSharedEntryFallsBackToAcceptEntry(t *testing.T) {
+	list := `{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}`
+	index := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`
+	registry := newFakeManifestRegistry(t)
+	registry.set("/v2/library/app/manifests/latest", dockerManifestListMediaType, list)
+	h := newManifestKeyTestHandler(t, registry)
+
+	const dockerOnly = "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+	if response := getManifest(t, h, "/library/app/manifests/latest", dockerOnly); response.Body.String() != list {
+		t.Fatalf("Docker-only pull body = %q, want the manifest list", response.Body.String())
+	}
+	registry.set("/v2/library/app/manifests/latest", ociImageIndexMediaType, index)
+	if response := getManifest(t, h, "/library/app/manifests/latest", ociImageIndexMediaType); response.Body.String() != index {
+		t.Fatalf("OCI pull body = %q, want the index", response.Body.String())
+	}
+	registry.offline.Store(true)
+
+	response := getManifest(t, h, "/library/app/manifests/latest", dockerOnly)
+	if response.Code != http.StatusOK {
+		t.Fatalf("offline Docker-only pull status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	if response.Body.String() != list {
+		t.Errorf("offline Docker-only body = %q, want the manifest list", response.Body.String())
+	}
+	if response := getManifest(t, h, "/library/app/manifests/latest", ociImageIndexMediaType); response.Body.String() != index {
+		t.Errorf("offline OCI body = %q, want the index still in the shared entry", response.Body.String())
+	}
+}
