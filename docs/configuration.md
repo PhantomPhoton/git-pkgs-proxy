@@ -95,7 +95,7 @@ A package rule wins over an ecosystem rule, which wins over `default`. Package r
 | `conda` | no | - |
 | `cran` | no | - |
 | `deb` | no | - |
-| `gem` | yes | `pkg:gem/rails`, the gem name as published, case included. Package rules don't reach gem files whose platform ends in a number (`universal-darwin-22`, `universal-java-17`) yet, which the proxy files under a wrong package name; the gem rule and `default` still cover them. |
+| `gem` | yes | `pkg:gem/rails`, the gem name as published, case included. |
 | `golang` | yes | `pkg:golang/github.com/stretchr/testify`, the module path as in `go.mod`; case doesn't matter. A major version like `/v2` (or `.v3` on gopkg.in) is a module of its own and needs its own rule. The `!`-escaped form from proxy URLs and the module cache (`github.com/!azure/...`) is refused. |
 | `helm` | no | - |
 | `hex` | no | - |

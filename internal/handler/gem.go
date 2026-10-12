@@ -17,10 +17,8 @@ const (
 
 // Gems are stored under pkg:gem/{name} with the name from the gem filename,
 // and purl keeps gem names as they are, so package rules use the default
-// key mapping. parseGemFilename splits at the last hyphen before a digit,
-// so a platform like universal-darwin-22 lands under a wrong package name
-// that package rules don't reach. The spec also claims the "rubygems"
-// spelling git-pkgs writes into packages.ecosystem.
+// key mapping. The spec also claims the "rubygems" spelling git-pkgs writes
+// into packages.ecosystem.
 func init() {
 	retention.Default.Register(retention.Spec{Key: "gem", CanonicalPackage: retention.DefaultCanonical("gem")})
 }
@@ -89,14 +87,16 @@ func (h *GemHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 // parseGemFilename extracts name and version from a gem filename.
 // e.g., "rails-7.1.0.gem" -> ("rails", "7.1.0")
 // e.g., "aws-sdk-s3-1.142.0.gem" -> ("aws-sdk-s3", "1.142.0")
+// e.g., "sorbet-static-0.5.11002-universal-darwin-22.gem" -> ("sorbet-static", "0.5.11002-universal-darwin-22")
+//
+// The version starts at the first hyphen followed by a digit. Platforms can
+// end in a number (universal-java-17, arm64-darwin-23), so splitting at the
+// last one would cut the platform; only gem names with a "-<digit>" segment
+// are misread this way, and those are rare.
 func (h *GemHandler) parseGemFilename(filename string) (name, version string) {
-	// Remove .gem extension
 	base := strings.TrimSuffix(filename, ".gem")
-
-	// Find the last hyphen followed by a version number
-	// Version starts with a digit
-	for i := len(base) - 1; i >= 0; i-- {
-		if base[i] == '-' && i+1 < len(base) && base[i+1] >= '0' && base[i+1] <= '9' {
+	for i := 0; i+1 < len(base); i++ {
+		if base[i] == '-' && base[i+1] >= '0' && base[i+1] <= '9' {
 			return base[:i], base[i+1:]
 		}
 	}
