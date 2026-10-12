@@ -233,11 +233,11 @@ Each upstream used by a built-in package route can be set in YAML or JSON under 
 | `upstream.allow_loopback` | `PROXY_UPSTREAM_ALLOW_LOOPBACK` | `false` |
 | `upstream.npm` | `PROXY_UPSTREAM_NPM` | `https://registry.npmjs.org` |
 | `upstream.npm_full_metadata` | `PROXY_UPSTREAM_NPM_FULL_METADATA` | `false` |
-| `upstream.go_sumdbs_offline` | `PROXY_UPSTREAM_GO_SUMDBS_OFFLINE` | `false` |
 | `upstream.cargo` | `PROXY_UPSTREAM_CARGO` | `https://index.crates.io` |
 | `upstream.cargo_download` | `PROXY_UPSTREAM_CARGO_DOWNLOAD` | `https://static.crates.io/crates` |
 | `upstream.gem` | `PROXY_UPSTREAM_GEM` | `https://rubygems.org` |
 | `upstream.go` | `PROXY_UPSTREAM_GO` | `https://proxy.golang.org` |
+| `upstream.go_sumdbs_offline` | `PROXY_UPSTREAM_GO_SUMDBS_OFFLINE` | `false` |
 | `upstream.hex` | `PROXY_UPSTREAM_HEX` | `https://repo.hex.pm` |
 | `upstream.hex_api` | `PROXY_UPSTREAM_HEX_API` | `https://hex.pm` |
 | `upstream.pub` | `PROXY_UPSTREAM_PUB` | `https://pub.dev` |
