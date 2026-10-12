@@ -27,10 +27,11 @@ func init() {
 
 // condaRetentionKey maps a package rule to the stored package PURL. It
 // takes the channel from the namespace, or from the name in the stored
-// form, and refuses a key without a channel or with an empty segment,
-// since no stored package looks like that. A label channel such as
-// conda-forge/label/rc keeps all its segments. The package name is
-// lowercased the way conda treats it; the channel stays as the URL had it.
+// form. Downloads are routed as /{channel}/{arch}/{filename}, so the channel
+// is always one path segment; a key without a channel, with more segments
+// or with an empty one is refused, since no stored package looks like that.
+// The package name is lowercased the way conda treats it; the channel stays
+// as the URL had it.
 func condaRetentionKey(p *purl.PURL) (string, bool) {
 	if p == nil {
 		return "", false
@@ -40,11 +41,10 @@ func condaRetentionKey(p *purl.PURL) (string, bool) {
 		full = p.Namespace + "/" + p.Name
 	}
 	segments := strings.Split(full, "/")
-	if len(segments) < 2 || slices.Contains(segments, "") {
+	if len(segments) != 2 || slices.Contains(segments, "") {
 		return "", false
 	}
-	channel := strings.Join(segments[:len(segments)-1], "/")
-	name := strings.ToLower(segments[len(segments)-1])
+	channel, name := segments[0], strings.ToLower(segments[1])
 	return retention.DefaultCanonical("conda")(purl.New(p.Type, "", channel+"/"+name, "", nil))
 }
 
