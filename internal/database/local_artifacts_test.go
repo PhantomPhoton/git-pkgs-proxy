@@ -205,3 +205,71 @@ func TestDeleteLocalArtifacts(t *testing.T) {
 		}
 	})
 }
+
+func TestLocalArtifactManifestAndIntegrity(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		if err := db.UpsertPackage(&Package{PURL: "pkg:npm/request", Ecosystem: "npm", Name: "request"}); err != nil {
+			t.Fatalf("UpsertPackage: %v", err)
+		}
+		if err := db.UpsertVersion(&Version{
+			PURL:        "pkg:npm/request@2.88.3",
+			PackagePURL: "pkg:npm/request",
+			Integrity:   sql.NullString{String: "sha512-abc", Valid: true},
+		}); err != nil {
+			t.Fatalf("UpsertVersion: %v", err)
+		}
+		const manifest = `{"name":"request","version":"2.88.3"}`
+		if err := db.UpsertArtifact(&Artifact{
+			VersionPURL: "pkg:npm/request@2.88.3",
+			Filename:    "request-2.88.3.tgz",
+			StoragePath: sql.NullString{String: "npm/request/2.88.3/x/request-2.88.3.tgz", Valid: true},
+			ContentHash: sql.NullString{String: "00", Valid: true},
+			FetchedAt:   sql.NullTime{Time: time.Now(), Valid: true},
+			Source:      SourceLocal,
+			Manifest:    sql.NullString{String: manifest, Valid: true},
+		}); err != nil {
+			t.Fatalf("UpsertArtifact: %v", err)
+		}
+
+		local, err := db.GetLocalArtifacts("pkg:npm/request")
+		if err != nil || len(local) != 1 {
+			t.Fatalf("GetLocalArtifacts = %+v, %v", local, err)
+		}
+		if local[0].Manifest.String != manifest || local[0].Integrity.String != "sha512-abc" {
+			t.Errorf("manifest/integrity = %q/%q", local[0].Manifest.String, local[0].Integrity.String)
+		}
+	})
+}
+
+func TestMigrationAddsArtifactManifest(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "existing.db")
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := sqlDB.Exec(schemaSQLite); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	if _, err := sqlDB.Exec(`ALTER TABLE artifacts DROP COLUMN manifest`); err != nil {
+		t.Fatalf("drop manifest column: %v", err)
+	}
+	if _, err := sqlDB.Exec(`DELETE FROM migrations WHERE name = '013_add_artifact_manifest'`); err != nil {
+		t.Fatalf("forget migration: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+	has, err := db.HasColumn("artifacts", "manifest")
+	if err != nil || !has {
+		t.Errorf("artifacts.manifest after migration = %v, %v", has, err)
+	}
+}

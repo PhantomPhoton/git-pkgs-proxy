@@ -23,8 +23,7 @@ import (
 
 const (
 	testHostedToken     = "push-token"
-	testHostedMaxUpload = 64
-	pushedBody          = "patched tarball"
+	testHostedMaxUpload = 4096
 )
 
 type hostedTestServer struct {
@@ -101,7 +100,7 @@ func (s hostedTestServer) do(t *testing.T, method, target, token, body string) *
 func TestHostedPushIsServedByTheEcosystemHandler(t *testing.T) {
 	s := newHostedTestServer(t)
 
-	rec := s.do(t, http.MethodPut, "/api/hosted/npm/request/2.88.3", testHostedToken, pushedBody)
+	rec := s.do(t, http.MethodPut, "/api/hosted/npm/request/2.88.3", testHostedToken, requestTarball)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body)
 	}
@@ -110,12 +109,12 @@ func TestHostedPushIsServedByTheEcosystemHandler(t *testing.T) {
 		t.Fatalf("decoding PUT response: %v", err)
 	}
 	if pushed.Ecosystem != "npm" || pushed.Name != "request" || pushed.Version != "2.88.3" ||
-		pushed.Filename != "request-2.88.3.tgz" || pushed.Size != int64(len(pushedBody)) {
+		pushed.Filename != "request-2.88.3.tgz" || pushed.Size != int64(len(requestTarball)) {
 		t.Errorf("PUT response = %+v", pushed)
 	}
 
 	rec = s.do(t, http.MethodGet, "/npm/request/-/request-2.88.3.tgz", "", "")
-	if rec.Code != http.StatusOK || rec.Body.String() != pushedBody {
+	if rec.Code != http.StatusOK || rec.Body.String() != requestTarball {
 		t.Fatalf("download status = %d, body %q, want 200 and the pushed tarball", rec.Code, rec.Body)
 	}
 	if *s.fetches != 0 {
@@ -126,13 +125,13 @@ func TestHostedPushIsServedByTheEcosystemHandler(t *testing.T) {
 func TestHostedPushIsServedByTheComposerHandler(t *testing.T) {
 	s := newHostedTestServer(t)
 
-	rec := s.do(t, http.MethodPut, "/api/hosted/composer/monolog/monolog/3.5.0", testHostedToken, pushedBody)
+	rec := s.do(t, http.MethodPut, "/api/hosted/composer/monolog/monolog/3.5.0", testHostedToken, monologZip)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body)
 	}
 
 	rec = s.do(t, http.MethodGet, "/composer/files/monolog/monolog/3.5.0/monolog-3.5.0.zip", "", "")
-	if rec.Code != http.StatusOK || rec.Body.String() != pushedBody {
+	if rec.Code != http.StatusOK || rec.Body.String() != monologZip {
 		t.Fatalf("download status = %d, body %q, want 200 and the pushed archive", rec.Code, rec.Body)
 	}
 	if *s.upstreamRequests != 0 || *s.fetches != 0 {
@@ -142,7 +141,7 @@ func TestHostedPushIsServedByTheComposerHandler(t *testing.T) {
 
 func TestComposerDownloadOfUnpushedFileStillNeedsUpstreamMetadata(t *testing.T) {
 	s := newHostedTestServer(t)
-	if rec := s.do(t, http.MethodPut, "/api/hosted/composer/monolog/monolog/3.5.0", testHostedToken, pushedBody); rec.Code != http.StatusCreated {
+	if rec := s.do(t, http.MethodPut, "/api/hosted/composer/monolog/monolog/3.5.0", testHostedToken, monologZip); rec.Code != http.StatusCreated {
 		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body)
 	}
 
@@ -158,19 +157,19 @@ func TestComposerDownloadOfUnpushedFileStillNeedsUpstreamMetadata(t *testing.T) 
 func TestHostedPushScopedNpmPackage(t *testing.T) {
 	s := newHostedTestServer(t)
 
-	rec := s.do(t, http.MethodPut, "/api/hosted/npm/@types/node/20.1.0", testHostedToken, pushedBody)
+	rec := s.do(t, http.MethodPut, "/api/hosted/npm/@types/node/20.1.0", testHostedToken, nodeTarball)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body)
 	}
 	rec = s.do(t, http.MethodGet, "/npm/@types/node/-/node-20.1.0.tgz", "", "")
-	if rec.Code != http.StatusOK || rec.Body.String() != pushedBody {
+	if rec.Code != http.StatusOK || rec.Body.String() != nodeTarball {
 		t.Fatalf("download status = %d, body %q, want 200 and the pushed tarball", rec.Code, rec.Body)
 	}
 }
 
 func TestHostedListAndDelete(t *testing.T) {
 	s := newHostedTestServer(t)
-	if rec := s.do(t, http.MethodPut, "/api/hosted/npm/request/2.88.3", testHostedToken, pushedBody); rec.Code != http.StatusCreated {
+	if rec := s.do(t, http.MethodPut, "/api/hosted/npm/request/2.88.3", testHostedToken, requestTarball); rec.Code != http.StatusCreated {
 		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body)
 	}
 
@@ -205,11 +204,13 @@ func TestHostedPushRejections(t *testing.T) {
 		body       string
 		wantStatus int
 	}{
-		{name: "no token", target: "/api/hosted/npm/request/2.88.3", body: pushedBody, wantStatus: http.StatusUnauthorized},
-		{name: "wrong token", target: "/api/hosted/npm/request/2.88.3", token: "guess", body: pushedBody, wantStatus: http.StatusUnauthorized},
-		{name: "unsupported ecosystem", target: "/api/hosted/cargo/serde/1.0.200", token: testHostedToken, body: pushedBody, wantStatus: http.StatusBadRequest},
-		{name: "composer name without vendor", target: "/api/hosted/composer/monolog/3.5.0", token: testHostedToken, body: pushedBody, wantStatus: http.StatusBadRequest},
-		{name: "missing version", target: "/api/hosted/npm/request", token: testHostedToken, body: pushedBody, wantStatus: http.StatusBadRequest},
+		{name: "no token", target: "/api/hosted/npm/request/2.88.3", body: requestTarball, wantStatus: http.StatusUnauthorized},
+		{name: "wrong token", target: "/api/hosted/npm/request/2.88.3", token: "guess", body: requestTarball, wantStatus: http.StatusUnauthorized},
+		{name: "unsupported ecosystem", target: "/api/hosted/cargo/serde/1.0.200", token: testHostedToken, body: requestTarball, wantStatus: http.StatusBadRequest},
+		{name: "composer name without vendor", target: "/api/hosted/composer/monolog/3.5.0", token: testHostedToken, body: requestTarball, wantStatus: http.StatusBadRequest},
+		{name: "missing version", target: "/api/hosted/npm/request", token: testHostedToken, body: requestTarball, wantStatus: http.StatusBadRequest},
+		{name: "not an archive", target: "/api/hosted/npm/request/2.88.3", token: testHostedToken, body: "plain text", wantStatus: http.StatusBadRequest},
+		{name: "manifest of another version", target: "/api/hosted/npm/request/2.88.4", token: testHostedToken, body: requestTarball, wantStatus: http.StatusBadRequest},
 		{name: "empty body", target: "/api/hosted/npm/request/2.88.3", token: testHostedToken, wantStatus: http.StatusBadRequest},
 		{name: "too large", target: "/api/hosted/npm/request/2.88.3", token: testHostedToken, body: strings.Repeat("x", testHostedMaxUpload+1), wantStatus: http.StatusRequestEntityTooLarge},
 	}
@@ -271,7 +272,7 @@ func startHostedServer(t *testing.T, hosted config.HostedConfig) string {
 
 func putArchive(t *testing.T, url, token string) int {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPut, url, strings.NewReader(pushedBody))
+	req, err := http.NewRequest(http.MethodPut, url, strings.NewReader(requestTarball))
 	if err != nil {
 		t.Fatalf("building request: %v", err)
 	}

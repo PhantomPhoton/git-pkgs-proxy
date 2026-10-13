@@ -162,6 +162,7 @@ type Proxy struct {
 	MetadataTTL         time.Duration
 	MetadataMaxSize     int64
 	GradleReadOnly      bool
+	HostedEnabled       bool
 	GradleMaxUploadSize int64
 	// NPMFullMetadata requests full npm packuments from upstream even when
 	// cooldown is disabled, so served metadata carries publish times.

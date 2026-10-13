@@ -102,6 +102,8 @@ func (h *HostedAPIHandler) pushError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &tooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, ErrCodeBadRequest, "archive exceeds hosted.max_upload_size")
+	case errors.Is(err, handler.ErrHostedInvalidArchive), errors.Is(err, handler.ErrHostedManifestMismatch):
+		badRequest(w, err.Error())
 	case errors.Is(err, handler.ErrVersionDenied), errors.Is(err, handler.ErrArtifactBlocked):
 		writeError(w, http.StatusForbidden, ErrCodeBadRequest, err.Error())
 	default:

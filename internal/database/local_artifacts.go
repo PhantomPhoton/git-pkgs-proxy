@@ -1,18 +1,25 @@
 package database
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
 )
 
+// LocalArtifact is a pushed artifact with the integrity of its version.
+type LocalArtifact struct {
+	Artifact
+	Integrity sql.NullString `db:"integrity"`
+}
+
 // GetLocalArtifacts returns the artifacts pushed to the proxy for a package,
 // ordered by version and filename.
-func (db *DB) GetLocalArtifacts(packagePURL string) ([]Artifact, error) {
-	var artifacts []Artifact
+func (db *DB) GetLocalArtifacts(packagePURL string) ([]LocalArtifact, error) {
+	var artifacts []LocalArtifact
 	query := db.Rebind(`
 		SELECT a.id, a.version_purl, a.filename, a.upstream_url, a.storage_path, a.content_hash,
 		       a.size, a.content_type, a.fetched_at, a.hit_count, a.last_accessed_at,
-		       a.created_at, a.updated_at, a.source
+		       a.created_at, a.updated_at, a.source, a.manifest, v.integrity
 		FROM artifacts a
 		JOIN versions v ON v.purl = a.version_purl
 		WHERE v.package_purl = ? AND a.source = 'local'

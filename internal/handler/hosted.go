@@ -2,9 +2,10 @@ package handler
 
 import (
 	"context"
+	"crypto/sha512"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -106,6 +107,8 @@ func validHostedSegment(s string) bool {
 // PushLocalArtifact stores body as the artifact for target and records it as
 // local, replacing any cached upstream copy. Download handlers serve it from
 // the cache without contacting the upstream, and eviction never removes it.
+// The archive's manifest must name target; it is kept so the ecosystem's
+// metadata can list the version with its dependencies.
 func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target HostedTarget, body io.Reader, contentType string) (HostedArtifact, error) {
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, target.Name, target.Version)
 	if err != nil {
@@ -115,36 +118,68 @@ func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target 
 		return HostedArtifact{}, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
 	}
 
-	storagePath := storage.FetchPath(ecosystem, target.Name, target.Version, storage.NewFetchID(), target.Filename)
+	push := storedPush{
+		storagePath: storage.FetchPath(ecosystem, target.Name, target.Version, storage.NewFetchID(), target.Filename),
+		contentType: contentType,
+	}
+	sha512Hash := sha512.New()
 	storeStart := time.Now()
-	size, hash, err := p.Storage.Store(ctx, storagePath, body)
+	push.size, push.sha256, err = p.Storage.Store(ctx, push.storagePath, io.TeeReader(body, sha512Hash))
 	metrics.RecordStorageOperation("write", time.Since(storeStart))
 	if err != nil {
 		metrics.RecordStorageError("write", metrics.FailureDetail{
-			PURL: versionPURL, Filename: target.Filename, Path: storagePath, Err: err})
+			PURL: versionPURL, Filename: target.Filename, Path: push.storagePath, Err: err})
 		return HostedArtifact{}, fmt.Errorf("storing artifact: %w", err)
 	}
+	push.integrity = "sha512-" + base64.StdEncoding.EncodeToString(sha512Hash.Sum(nil))
 
-	if p.Scanners != nil && p.Scanners.Enabled() {
-		if err := p.runScan(ctx, ecosystem, target.Name, target.Version, target.Filename, versionPURL, storagePath, size, contentType); err != nil {
-			p.discardStored(ctx, storagePath)
-			return HostedArtifact{}, err
-		}
+	if err := p.checkPush(ctx, ecosystem, target, versionPURL, &push); err != nil {
+		p.discardStored(ctx, push.storagePath)
+		return HostedArtifact{}, err
 	}
 
-	pushedAt := time.Now()
-	if err := p.recordLocalArtifact(ecosystem, target, pkgPURL, versionPURL, storagePath, hash, size, contentType, pushedAt); err != nil {
-		p.discardStored(ctx, storagePath)
+	push.pushedAt = time.Now()
+	if err := p.recordLocalArtifact(ecosystem, target, pkgPURL, versionPURL, push); err != nil {
+		p.discardStored(ctx, push.storagePath)
 		return HostedArtifact{}, err
 	}
 
 	return HostedArtifact{
 		Version:  target.Version,
 		Filename: target.Filename,
-		SHA256:   hash,
-		Size:     size,
-		PushedAt: pushedAt.UTC(),
+		SHA256:   push.sha256,
+		Size:     push.size,
+		PushedAt: push.pushedAt.UTC(),
 	}, nil
+}
+
+// storedPush is a pushed archive once it is in storage.
+type storedPush struct {
+	storagePath string
+	sha256      string
+	integrity   string
+	size        int64
+	contentType string
+	manifest    json.RawMessage
+	pushedAt    time.Time
+}
+
+// checkPush reads the manifest of a stored push and runs the scanners on it.
+func (p *Proxy) checkPush(ctx context.Context, ecosystem string, target HostedTarget, versionPURL string, push *storedPush) error {
+	stored, err := p.Storage.Open(ctx, push.storagePath)
+	if err != nil {
+		return fmt.Errorf("reading pushed archive: %w", err)
+	}
+	push.manifest, err = readHostedManifest(ecosystem, stored, target)
+	_ = stored.Close()
+	if err != nil {
+		return err
+	}
+
+	if p.Scanners != nil && p.Scanners.Enabled() {
+		return p.runScan(ctx, ecosystem, target.Name, target.Version, target.Filename, versionPURL, push.storagePath, push.size, push.contentType)
+	}
+	return nil
 }
 
 func (p *Proxy) discardStored(ctx context.Context, storagePath string) {
@@ -157,7 +192,7 @@ func (p *Proxy) discardStored(ctx context.Context, storagePath string) {
 // version's integrity is set to the pushed bytes, so the cache's integrity
 // check verifies them rather than an upstream archive's digest. An existing
 // package record is kept as it is, since it may describe the upstream package.
-func (p *Proxy) recordLocalArtifact(ecosystem string, target HostedTarget, pkgPURL, versionPURL, storagePath, hash string, size int64, contentType string, pushedAt time.Time) error {
+func (p *Proxy) recordLocalArtifact(ecosystem string, target HostedTarget, pkgPURL, versionPURL string, push storedPush) error {
 	existing, err := p.DB.GetPackageByPURL(pkgPURL)
 	if err != nil {
 		return fmt.Errorf("reading package: %w", err)
@@ -168,14 +203,10 @@ func (p *Proxy) recordLocalArtifact(ecosystem string, target HostedTarget, pkgPU
 		}
 	}
 
-	sri, err := hexDigestSRI(hash)
-	if err != nil {
-		return err
-	}
 	if err := p.DB.UpsertVersion(&database.Version{
 		PURL:        versionPURL,
 		PackagePURL: pkgPURL,
-		Integrity:   sql.NullString{String: sri, Valid: true},
+		Integrity:   sql.NullString{String: push.integrity, Valid: true},
 	}); err != nil {
 		return fmt.Errorf("upserting version: %w", err)
 	}
@@ -183,24 +214,17 @@ func (p *Proxy) recordLocalArtifact(ecosystem string, target HostedTarget, pkgPU
 	if err := p.DB.UpsertArtifact(&database.Artifact{
 		VersionPURL: versionPURL,
 		Filename:    target.Filename,
-		StoragePath: sql.NullString{String: storagePath, Valid: true},
-		ContentHash: sql.NullString{String: hash, Valid: true},
-		Size:        sql.NullInt64{Int64: size, Valid: true},
-		ContentType: sql.NullString{String: contentType, Valid: contentType != ""},
-		FetchedAt:   sql.NullTime{Time: pushedAt, Valid: true},
+		StoragePath: sql.NullString{String: push.storagePath, Valid: true},
+		ContentHash: sql.NullString{String: push.sha256, Valid: true},
+		Size:        sql.NullInt64{Int64: push.size, Valid: true},
+		ContentType: sql.NullString{String: push.contentType, Valid: push.contentType != ""},
+		FetchedAt:   sql.NullTime{Time: push.pushedAt, Valid: true},
 		Source:      database.SourceLocal,
+		Manifest:    sql.NullString{String: string(push.manifest), Valid: true},
 	}); err != nil {
 		return fmt.Errorf("upserting artifact: %w", err)
 	}
 	return nil
-}
-
-func hexDigestSRI(hexDigest string) (string, error) {
-	raw, err := hex.DecodeString(hexDigest)
-	if err != nil {
-		return "", fmt.Errorf("decoding stored digest: %w", err)
-	}
-	return "sha256-" + base64.StdEncoding.EncodeToString(raw), nil
 }
 
 // LocalArtifacts lists the archives pushed for a package.
@@ -224,6 +248,47 @@ func (p *Proxy) LocalArtifacts(ecosystem, name string) ([]HostedArtifact, error)
 		})
 	}
 	return listed, nil
+}
+
+// localVersion is a pushed version as ecosystem metadata lists it.
+type localVersion struct {
+	Version   string
+	Filename  string
+	SHA256    string
+	Integrity string
+	Manifest  json.RawMessage
+	PushedAt  time.Time
+}
+
+// localVersions returns the versions pushed for a package, or nil when hosted
+// packages are disabled, so metadata requests cost no extra lookup then.
+func (p *Proxy) localVersions(ecosystem, name string) ([]localVersion, error) {
+	if !p.HostedEnabled {
+		return nil, nil
+	}
+	pkgPURL := packageurl.MakeString(ecosystem, name, "")
+	if pkgPURL == "" {
+		return nil, nil
+	}
+	rows, err := p.DB.GetLocalArtifacts(pkgPURL)
+	if err != nil {
+		return nil, fmt.Errorf("listing local versions: %w", err)
+	}
+	versions := make([]localVersion, 0, len(rows))
+	for _, row := range rows {
+		if !row.Manifest.Valid {
+			continue
+		}
+		versions = append(versions, localVersion{
+			Version:   database.VersionFromPURL(row.VersionPURL),
+			Filename:  row.Filename,
+			SHA256:    row.ContentHash.String,
+			Integrity: row.Integrity.String,
+			Manifest:  json.RawMessage(row.Manifest.String),
+			PushedAt:  row.FetchedAt.Time.UTC(),
+		})
+	}
+	return versions, nil
 }
 
 // DeleteLocalVersion removes the archives pushed for name@version. If the

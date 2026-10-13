@@ -369,8 +369,8 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 		query = `
 			INSERT INTO artifacts (version_purl, filename, upstream_url, storage_path, content_hash,
 			                       size, content_type, fetched_at, hit_count, last_accessed_at,
-			                       created_at, updated_at, source)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			                       created_at, updated_at, source, manifest)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT(version_purl, filename) DO UPDATE SET
 				upstream_url = EXCLUDED.upstream_url,
 				storage_path = EXCLUDED.storage_path,
@@ -379,15 +379,16 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 				content_type = EXCLUDED.content_type,
 				fetched_at = EXCLUDED.fetched_at,
 				updated_at = EXCLUDED.updated_at,
-				source = EXCLUDED.source
-			WHERE artifacts.storage_path IS NOT DISTINCT FROM $14
+				source = EXCLUDED.source,
+				manifest = EXCLUDED.manifest
+			WHERE artifacts.storage_path IS NOT DISTINCT FROM $15
 		`
 	} else {
 		query = `
 			INSERT INTO artifacts (version_purl, filename, upstream_url, storage_path, content_hash,
 			                       size, content_type, fetched_at, hit_count, last_accessed_at,
-			                       created_at, updated_at, source)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			                       created_at, updated_at, source, manifest)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(version_purl, filename) DO UPDATE SET
 				upstream_url = excluded.upstream_url,
 				storage_path = excluded.storage_path,
@@ -396,7 +397,8 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 				content_type = excluded.content_type,
 				fetched_at = excluded.fetched_at,
 				updated_at = excluded.updated_at,
-				source = excluded.source
+				source = excluded.source,
+				manifest = excluded.manifest
 			WHERE artifacts.storage_path IS ?
 		`
 	}
@@ -404,7 +406,7 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 	res, err := db.Exec(query,
 		a.VersionPURL, a.Filename, a.UpstreamURL, a.StoragePath, a.ContentHash,
 		a.Size, a.ContentType, inUTC(a.FetchedAt), a.HitCount, inUTC(a.LastAccessedAt), now, now,
-		a.sourceOrUpstream(), previous,
+		a.sourceOrUpstream(), a.Manifest, previous,
 	)
 	if err != nil {
 		return false, fmt.Errorf("upserting artifact: %w", err)

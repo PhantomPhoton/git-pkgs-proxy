@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	last_accessed_at DATETIME,
 	created_at DATETIME,
 	updated_at DATETIME,
-	source TEXT NOT NULL DEFAULT 'upstream'
+	source TEXT NOT NULL DEFAULT 'upstream',
+	manifest TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -192,7 +193,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	last_accessed_at TIMESTAMP,
 	created_at TIMESTAMP,
 	updated_at TIMESTAMP,
-	source TEXT NOT NULL DEFAULT 'upstream'
+	source TEXT NOT NULL DEFAULT 'upstream',
+	manifest TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -270,7 +272,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	last_accessed_at DATETIME,
 	created_at DATETIME,
 	updated_at DATETIME,
-	source TEXT NOT NULL DEFAULT 'upstream'
+	source TEXT NOT NULL DEFAULT 'upstream',
+	manifest TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -292,7 +295,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	last_accessed_at TIMESTAMP,
 	created_at TIMESTAMP,
 	updated_at TIMESTAMP,
-	source TEXT NOT NULL DEFAULT 'upstream'
+	source TEXT NOT NULL DEFAULT 'upstream',
+	manifest TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -406,6 +410,7 @@ var migrations = []migration{
 	{"010_add_pending_deletes_queued_at_index", migrateAddPendingDeletesQueuedAtIndex},
 	{"011_add_metadata_dates", migrateAddMetadataDates},
 	{"012_add_artifact_source", migrateAddArtifactSource},
+	{"013_add_artifact_manifest", migrateAddArtifactManifest},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -796,6 +801,22 @@ func migrateAddArtifactSource(db *DB) error {
 	}
 	if _, err := db.Exec(`ALTER TABLE artifacts ADD COLUMN source TEXT NOT NULL DEFAULT 'upstream'`); err != nil {
 		return fmt.Errorf("adding column source to artifacts: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactManifest stores the manifest read from a pushed archive,
+// which the metadata of its ecosystem lists the version with.
+func migrateAddArtifactManifest(db *DB) error {
+	hasCol, err := db.HasColumn("artifacts", "manifest")
+	if err != nil {
+		return fmt.Errorf("checking column manifest: %w", err)
+	}
+	if hasCol {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE artifacts ADD COLUMN manifest TEXT`); err != nil {
+		return fmt.Errorf("adding column manifest to artifacts: %w", err)
 	}
 	return nil
 }

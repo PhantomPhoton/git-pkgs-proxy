@@ -1,6 +1,10 @@
 package handler
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"io"
@@ -62,7 +66,51 @@ func TestHostedTargetFor(t *testing.T) {
 	}
 }
 
-const pushedTarball = "patched request tarball"
+// npmTarball builds an npm package tarball holding manifest as
+// package/package.json. Building an archive in memory cannot fail, so errors
+// panic.
+func npmTarball(manifest string) []byte {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, f := range [][2]string{{"package/package.json", manifest}, {"package/index.js", "module.exports = 1\n"}} {
+		must(tw.WriteHeader(&tar.Header{Name: f[0], Mode: 0o644, Size: int64(len(f[1]))}))
+		_, err := io.WriteString(tw, f[1])
+		must(err)
+	}
+	must(tw.Close())
+	must(gz.Close())
+	return buf.Bytes()
+}
+
+// composerZip builds a Composer dist archive holding manifest as composer.json
+// under dir, or at the root when dir is empty.
+func composerZip(dir, manifest string) []byte {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+	for _, f := range [][2]string{{prefix + "composer.json", manifest}, {prefix + "src/Logger.php", "<?php\n"}} {
+		w, err := zw.Create(f[0])
+		must(err)
+		_, err = io.WriteString(w, f[1])
+		must(err)
+	}
+	must(zw.Close())
+	return buf.Bytes()
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+const requestManifest = `{"name":"request","version":"2.88.3","dependencies":{"qs":"~6.5.2"}}`
+
+var pushedTarball = string(npmTarball(requestManifest))
 
 func pushRequest(t *testing.T, proxy *Proxy) HostedArtifact {
 	t.Helper()
@@ -177,5 +225,91 @@ func TestGetLocalArtifactIgnoresUpstreamCopies(t *testing.T) {
 	}
 	if got := readResult(local); got != pushedTarball {
 		t.Errorf("served body = %q, want the pushed tarball", got)
+	}
+}
+
+func TestPushLocalArtifactRecordsManifest(t *testing.T) {
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	pushed := pushRequest(t, proxy)
+
+	versions, err := proxy.localVersions("npm", "request")
+	if err != nil || len(versions) != 1 {
+		t.Fatalf("localVersions = %+v, %v", versions, err)
+	}
+	got := versions[0]
+	if got.Version != "2.88.3" || got.Filename != "request-2.88.3.tgz" || got.SHA256 != pushed.SHA256 {
+		t.Errorf("local version = %+v", got)
+	}
+	if !strings.Contains(string(got.Manifest), `"qs":"~6.5.2"`) {
+		t.Errorf("manifest = %s, want the dependencies from package.json", got.Manifest)
+	}
+	if !strings.HasPrefix(got.Integrity, "sha512-") {
+		t.Errorf("integrity = %q, want sha512", got.Integrity)
+	}
+}
+
+func TestLocalVersionsNeedHostedEnabled(t *testing.T) {
+	proxy, _, _, _ := setupTestProxy(t)
+	pushRequest(t, proxy)
+	if versions, err := proxy.localVersions("npm", "request"); err != nil || versions != nil {
+		t.Errorf("localVersions with hosted disabled = %+v, %v, want nil", versions, err)
+	}
+}
+
+func TestPushLocalArtifactChecksManifest(t *testing.T) {
+	tests := []struct {
+		name      string
+		ecosystem string
+		pkg       string
+		version   string
+		archive   []byte
+		wantErr   error
+	}{
+		{name: "npm other version", ecosystem: "npm", pkg: "request", version: "2.88.3",
+			archive: npmTarball(`{"name":"request","version":"2.88.2"}`), wantErr: ErrHostedManifestMismatch},
+		{name: "npm other name", ecosystem: "npm", pkg: "request", version: "2.88.3",
+			archive: npmTarball(`{"name":"requests","version":"2.88.3"}`), wantErr: ErrHostedManifestMismatch},
+		{name: "npm manifest not an object", ecosystem: "npm", pkg: "request", version: "2.88.3",
+			archive: npmTarball(`["request"]`), wantErr: ErrHostedInvalidArchive},
+		{name: "not an archive", ecosystem: "npm", pkg: "request", version: "2.88.3",
+			archive: []byte("plain text"), wantErr: ErrHostedInvalidArchive},
+		{name: "npm tarball without package.json", ecosystem: "npm", pkg: "request", version: "2.88.3",
+			archive: composerZip("", `{}`), wantErr: ErrHostedInvalidArchive},
+		{name: "composer other name", ecosystem: "composer", pkg: "monolog/monolog", version: "3.5.0",
+			archive: composerZip("", `{"name":"monolog/other"}`), wantErr: ErrHostedManifestMismatch},
+		{name: "composer other version", ecosystem: "composer", pkg: "monolog/monolog", version: "3.5.0",
+			archive: composerZip("", `{"name":"monolog/monolog","version":"3.4.0"}`), wantErr: ErrHostedManifestMismatch},
+		{name: "composer zip without composer.json", ecosystem: "composer", pkg: "monolog/monolog", version: "3.5.0",
+			archive: npmTarball(`{}`), wantErr: ErrHostedInvalidArchive},
+		{name: "composer manifest at the root", ecosystem: "composer", pkg: "monolog/monolog", version: "3.5.0",
+			archive: composerZip("", `{"name":"monolog/monolog","require":{"php":">=8.1"}}`)},
+		{name: "composer manifest in a top directory", ecosystem: "composer", pkg: "monolog/monolog", version: "3.5.0",
+			archive: composerZip("Seldaek-monolog-abc123", `{"name":"Monolog/Monolog","version":"3.5.0"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, _, store, _ := setupTestProxy(t)
+			target, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version)
+			if err != nil {
+				t.Fatalf("HostedTargetFor: %v", err)
+			}
+			_, err = proxy.PushLocalArtifact(context.Background(), tt.ecosystem, target, bytes.NewReader(tt.archive), "")
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("PushLocalArtifact: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("PushLocalArtifact error = %v, want %v", err, tt.wantErr)
+			}
+			if listed, _ := proxy.LocalArtifacts(tt.ecosystem, tt.pkg); len(listed) != 0 {
+				t.Errorf("rejected archive was recorded: %+v", listed)
+			}
+			if len(store.files) != 0 {
+				t.Errorf("rejected archive left %d objects in storage", len(store.files))
+			}
+		})
 	}
 }

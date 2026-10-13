@@ -150,6 +150,7 @@ type Artifact struct {
 	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
 	Source         string         `db:"source" json:"source"`
+	Manifest       sql.NullString `db:"manifest" json:"manifest,omitempty"`
 }
 
 func (a *Artifact) sourceOrUpstream() string {
