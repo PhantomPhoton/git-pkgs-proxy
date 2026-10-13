@@ -251,6 +251,10 @@ func startHostedServer(t *testing.T, hosted config.HostedConfig) string {
 	cfg.Database.Path = filepath.Join(tempDir, "proxy.db")
 	cfg.Storage.URL = "file://" + filepath.Join(tempDir, "artifacts")
 	cfg.Hosted = hosted
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(upstream.Close)
+	cfg.Upstream.NPM = upstream.URL
+	cfg.Upstream.AllowLoopback = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validating config: %v", err)
 	}
@@ -272,7 +276,12 @@ func startHostedServer(t *testing.T, hosted config.HostedConfig) string {
 
 func putArchive(t *testing.T, url, token string) int {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPut, url, strings.NewReader(requestTarball))
+	return putBody(t, url, token, requestTarball)
+}
+
+func putBody(t *testing.T, url, token, body string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, url, strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("building request: %v", err)
 	}
@@ -299,5 +308,23 @@ func TestHostedRoutesFollowConfig(t *testing.T) {
 	}
 	if status := putArchive(t, enabled+"/api/hosted/npm/request/2.88.3", testHostedToken); status != http.StatusCreated {
 		t.Errorf("push with token status = %d, want 201", status)
+	}
+}
+
+func TestHostedNpmPackageIsListedByTheRunningServer(t *testing.T) {
+	base := startHostedServer(t, config.HostedConfig{Enabled: true, Token: testHostedToken})
+	private := npmTarball(`{"name":"@acme/private","version":"1.0.0"}`)
+	if status := putBody(t, base+"/api/hosted/npm/@acme/private/1.0.0", testHostedToken, private); status != http.StatusCreated {
+		t.Fatalf("push status = %d, want 201", status)
+	}
+
+	resp, err := http.Get(base + "/npm/@acme%2fprivate")
+	if err != nil {
+		t.Fatalf("GET packument: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"1.0.0"`) {
+		t.Errorf("packument status = %d, body %s", resp.StatusCode, body)
 	}
 }

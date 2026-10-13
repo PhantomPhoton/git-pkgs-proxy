@@ -215,12 +215,29 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		accept = contentTypeJSON
 	}
 
+	specifier, versionLookup := npmVersionSpecifier(packagePath, packageName)
+	local, err := h.npmLocalEntries(packageName)
+	if err != nil {
+		h.proxy.Logger.Error("failed to read pushed npm versions", "package", packageName, "error", err)
+		JSONError(w, http.StatusInternalServerError, "failed to read pushed versions")
+		return
+	}
+	if e, ok := findNPMLocalEntry(local, specifier); versionLookup && ok {
+		w.Header().Set(headerContentType, contentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(e.entry)
+		return
+	}
+	if len(local) > 0 && !versionLookup {
+		h.serveMetadataWithLocal(w, r, packageName, upstreamURL, accept, metadataCacheKey, local)
+		return
+	}
+
 	if stored, ok := h.proxy.storedRewrite("npm", metadataCacheKey, h.proxyURL, metadataCacheKey); ok {
 		serveRewrittenMetadata(w, r, stored)
 		return
 	}
 
-	specifier, versionLookup := npmVersionSpecifier(packagePath, packageName)
 	if versionLookup && h.npmVersionMetadataUsesFilteredPackument(packageName) {
 		h.handleFilteredNPMVersionMetadata(w, r, packageName, specifier, accept, registryURL, cacheKey, metadataCacheKey)
 		return
@@ -396,6 +413,14 @@ func (h *NPMHandler) rewriteMetadata(packageName string, body []byte) ([]byte, e
 // rewriteMetadataKeeping is rewriteMetadata that also reports the versions it
 // kept.
 func (h *NPMHandler) rewriteMetadataKeeping(packageName string, body []byte) ([]byte, []string, error) {
+	return h.rewriteMetadataWithLocal(packageName, body, nil)
+}
+
+// rewriteMetadataWithLocal is rewriteMetadataKeeping that also lists the
+// pushed versions in local, in place of any upstream entry with the same
+// version. Cooldown and the denylist only filter upstream versions, and
+// dist-tags stay as upstream has them.
+func (h *NPMHandler) rewriteMetadataWithLocal(packageName string, body []byte, local []npmLocalEntry) ([]byte, []string, error) {
 	doc, err := indexNPMPackument(body)
 	if err != nil {
 		return nil, nil, err
@@ -439,18 +464,26 @@ func (h *NPMHandler) rewriteMetadataKeeping(packageName string, body []byte) ([]
 
 	h.applyCooldownFiltering(metadata, versions, packageName)
 	h.applyDenylistFiltering(metadata, versions, packageName)
+	for _, e := range local {
+		delete(versions, e.version)
+	}
 
 	// Untouched members are copied as they are; the three the filters
 	// handled are written from their filtered state, and only when it changed.
 	out, err := doc.write(func(out *bytes.Buffer, i int) error {
 		switch {
 		case i == doc.versionsAt:
-			return h.writeNPMVersions(out, packageName, versionsRaw, versions)
-		case i == doc.timeAt && timeMap != nil && len(timeMap) != timeEntries:
-			return writeFilteredJSONObject(out, doc.value(i), func(key string) bool {
+			return h.writeNPMVersions(out, packageName, versionsRaw, versions, local)
+		case i == doc.timeAt && timeMap != nil && (len(timeMap) != timeEntries || len(local) > 0):
+			pushedAt := make([][2]string, 0, len(local))
+			for _, e := range local {
+				pushedAt = append(pushedAt, [2]string{e.version, e.time})
+			}
+			return writeFilteredJSONObjectWith(out, doc.value(i), func(key string) bool {
 				_, ok := timeMap[key]
-				return ok
-			})
+				_, pushed := findNPMLocalEntry(local, key)
+				return ok && !pushed
+			}, pushedAt)
 		case i == doc.tagsAt && distTags != nil && !reflect.DeepEqual(distTags, originalTags):
 			encoded, err := json.Marshal(distTags)
 			out.Write(encoded)
@@ -460,7 +493,11 @@ func (h *NPMHandler) rewriteMetadataKeeping(packageName string, body []byte) ([]
 			return nil
 		}
 	})
-	return out, slices.Collect(maps.Keys(versions)), err
+	kept := slices.Collect(maps.Keys(versions))
+	for _, e := range local {
+		kept = append(kept, e.version)
+	}
+	return out, kept, err
 }
 
 // npmPackument is a packument's top-level members as offsets into its bytes,
@@ -547,8 +584,9 @@ func (d *npmPackument) write(writeValue func(out *bytes.Buffer, i int) error) ([
 }
 
 // writeNPMVersions writes the versions object, keeping the versions still in
-// keep and pointing each kept version's tarball at this proxy.
-func (h *NPMHandler) writeNPMVersions(out *bytes.Buffer, packageName string, versionsRaw []byte, keep map[string]any) error {
+// keep and pointing each kept version's tarball at this proxy, followed by the
+// pushed versions in local.
+func (h *NPMHandler) writeNPMVersions(out *bytes.Buffer, packageName string, versionsRaw []byte, keep map[string]any, local []npmLocalEntry) error {
 	out.WriteByte('{')
 	first := true
 	err := forEachJSONMember(versionsRaw, func(m jsonMember) error {
@@ -568,6 +606,16 @@ func (h *NPMHandler) writeNPMVersions(out *bytes.Buffer, packageName string, ver
 		h.writeNPMVersion(out, packageName, version, m.value(versionsRaw))
 		return nil
 	})
+	for _, e := range local {
+		if !first {
+			out.WriteByte(',')
+		}
+		first = false
+		key, _ := json.Marshal(e.version)
+		out.Write(key)
+		out.WriteByte(':')
+		out.Write(e.entry)
+	}
 	out.WriteByte('}')
 	return err
 }
@@ -610,6 +658,12 @@ func (h *NPMHandler) writeNPMVersion(out *bytes.Buffer, packageName, version str
 // writeFilteredJSONObject writes the object obj holds, keeping the members
 // whose decoded key keep accepts.
 func writeFilteredJSONObject(out *bytes.Buffer, obj []byte, keep func(string) bool) error {
+	return writeFilteredJSONObjectWith(out, obj, keep, nil)
+}
+
+// writeFilteredJSONObjectWith is writeFilteredJSONObject followed by extra
+// string members.
+func writeFilteredJSONObjectWith(out *bytes.Buffer, obj []byte, keep func(string) bool, extra [][2]string) error {
 	out.WriteByte('{')
 	first := true
 	err := forEachJSONMember(obj, func(m jsonMember) error {
@@ -627,6 +681,17 @@ func writeFilteredJSONObject(out *bytes.Buffer, obj []byte, keep func(string) bo
 		out.Write(obj[m.keyStart:m.valEnd])
 		return nil
 	})
+	for _, member := range extra {
+		if !first {
+			out.WriteByte(',')
+		}
+		first = false
+		key, _ := json.Marshal(member[0])
+		value, _ := json.Marshal(member[1])
+		out.Write(key)
+		out.WriteByte(':')
+		out.Write(value)
+	}
 	out.WriteByte('}')
 	return err
 }

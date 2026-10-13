@@ -1,0 +1,221 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+const requestPackument = `{
+	"name": "request",
+	"dist-tags": {"latest": "2.88.2"},
+	"versions": {
+		"2.88.2": {"name": "request", "version": "2.88.2", "dependencies": {"qs": "~6.5.1"},
+			"dist": {"tarball": "https://registry.npmjs.org/request/-/request-2.88.2.tgz", "integrity": "sha512-upstream2"}},
+		"2.88.3": {"name": "request", "version": "2.88.3", "dependencies": {"old": "1.0.0"},
+			"dist": {"tarball": "https://registry.npmjs.org/request/-/request-2.88.3.tgz", "integrity": "sha512-upstream3"}}
+	},
+	"time": {"modified": "2020-02-11T00:00:00Z", "2.88.2": "2020-02-11T00:00:00Z", "2.88.3": "2020-02-12T00:00:00Z"}
+}`
+
+type npmHostedFixture struct {
+	proxy   *Proxy
+	handler http.Handler
+}
+
+// newNPMHostedFixture serves packuments from upstream, keyed by request path,
+// and answers 404 for anything else.
+func newNPMHostedFixture(t *testing.T, upstream map[string]string) npmHostedFixture {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := upstream[r.URL.EscapedPath()]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	proxy.HTTPClient = srv.Client()
+	return npmHostedFixture{proxy: proxy, handler: NewNPMHandler(proxy, "http://proxy.local", srv.URL).Routes()}
+}
+
+func (f npmHostedFixture) push(t *testing.T, name, version, manifest string) HostedArtifact {
+	t.Helper()
+	target, err := HostedTargetFor("npm", name, version)
+	if err != nil {
+		t.Fatalf("HostedTargetFor: %v", err)
+	}
+	pushed, err := f.proxy.PushLocalArtifact(context.Background(), "npm", target, bytes.NewReader(npmTarball(manifest)), "")
+	if err != nil {
+		t.Fatalf("PushLocalArtifact: %v", err)
+	}
+	return pushed
+}
+
+func (f npmHostedFixture) get(t *testing.T, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	return rec
+}
+
+type npmTestPackument struct {
+	Name     string                     `json:"name"`
+	DistTags map[string]string          `json:"dist-tags"`
+	Versions map[string]npmTestVersion  `json:"versions"`
+	Time     map[string]string          `json:"time"`
+	Extra    map[string]json.RawMessage `json:"-"`
+}
+
+type npmTestVersion struct {
+	Name         string            `json:"name"`
+	Version      string            `json:"version"`
+	ID           string            `json:"_id"`
+	Dependencies map[string]string `json:"dependencies"`
+	Dist         struct {
+		Tarball   string `json:"tarball"`
+		Integrity string `json:"integrity"`
+	} `json:"dist"`
+}
+
+func decodePackument(t *testing.T, rec *httptest.ResponseRecorder) npmTestPackument {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	var doc npmTestPackument
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decoding packument: %v\n%s", err, rec.Body)
+	}
+	return doc
+}
+
+func TestNPMMetadataListsPushedVersion(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	pushed := f.push(t, "request", "2.88.4", `{"name":"request","version":"2.88.4","dependencies":{"qs":"~6.5.2"}}`)
+
+	doc := decodePackument(t, f.get(t, "/request"))
+
+	local, ok := doc.Versions["2.88.4"]
+	if !ok {
+		t.Fatalf("pushed version missing from versions: %v", doc.Versions)
+	}
+	if local.Name != "request" || local.Version != "2.88.4" || local.ID != "request@2.88.4" || local.Dependencies["qs"] != "~6.5.2" {
+		t.Errorf("pushed version entry = %+v", local)
+	}
+	if local.Dist.Tarball != "http://proxy.local/npm/request/-/request-2.88.4.tgz" {
+		t.Errorf("tarball = %q", local.Dist.Tarball)
+	}
+	if !strings.HasPrefix(local.Dist.Integrity, "sha512-") {
+		t.Errorf("integrity = %q, want the pushed archive's sha512", local.Dist.Integrity)
+	}
+	if doc.Time["2.88.4"] != pushed.PushedAt.Format(time.RFC3339) {
+		t.Errorf("time[2.88.4] = %q, want %q", doc.Time["2.88.4"], pushed.PushedAt.Format(time.RFC3339))
+	}
+	if doc.Versions["2.88.2"].Dist.Tarball != "http://proxy.local/npm/request/-/request-2.88.2.tgz" {
+		t.Errorf("upstream version not rewritten: %+v", doc.Versions["2.88.2"])
+	}
+	if doc.DistTags["latest"] != "2.88.2" {
+		t.Errorf("dist-tags.latest = %q, want upstream's 2.88.2", doc.DistTags["latest"])
+	}
+}
+
+func TestNPMMetadataPushedVersionReplacesUpstream(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	f.push(t, "request", "2.88.3", `{"name":"request","version":"2.88.3","dependencies":{"qs":"~6.5.2"}}`)
+
+	rec := f.get(t, "/request")
+	if body := rec.Body.String(); strings.Contains(body, "sha512-upstream3") || strings.Count(body, `"2.88.3":{`) != 1 {
+		t.Fatalf("upstream entry for the pushed version still listed:\n%s", body)
+	}
+	local := decodePackument(t, rec).Versions["2.88.3"]
+	if local.Dependencies["qs"] != "~6.5.2" || local.Dependencies["old"] != "" {
+		t.Errorf("dependencies = %v, want the pushed package.json's", local.Dependencies)
+	}
+}
+
+func TestNPMMetadataForPackageOnlyPushed(t *testing.T) {
+	f := newNPMHostedFixture(t, nil)
+	f.push(t, "@acme/private", "1.10.0", `{"name":"@acme/private","version":"1.10.0"}`)
+	f.push(t, "@acme/private", "1.9.0", `{"name":"@acme/private","version":"1.9.0"}`)
+
+	doc := decodePackument(t, f.get(t, "/@acme/private"))
+	if doc.Name != "@acme/private" || len(doc.Versions) != 2 {
+		t.Errorf("packument = %+v", doc)
+	}
+	if doc.DistTags["latest"] != "1.10.0" {
+		t.Errorf("dist-tags.latest = %q, want the highest pushed version 1.10.0", doc.DistTags["latest"])
+	}
+	if doc.Versions["1.9.0"].Dist.Tarball != "http://proxy.local/npm/@acme%2Fprivate/-/private-1.9.0.tgz" {
+		t.Errorf("tarball = %q", doc.Versions["1.9.0"].Dist.Tarball)
+	}
+
+	if rec := f.get(t, "/@acme/other"); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown package status = %d, want 404", rec.Code)
+	}
+}
+
+func TestNPMVersionMetadataForPushedVersion(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	f.push(t, "request", "2.88.4", `{"name":"request","version":"2.88.4","dependencies":{"qs":"~6.5.2"}}`)
+
+	rec := f.get(t, "/request/2.88.4")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	var version npmTestVersion
+	if err := json.Unmarshal(rec.Body.Bytes(), &version); err != nil {
+		t.Fatalf("decoding version: %v", err)
+	}
+	if version.Version != "2.88.4" || version.Dist.Tarball != "http://proxy.local/npm/request/-/request-2.88.4.tgz" {
+		t.Errorf("version document = %+v", version)
+	}
+}
+
+func TestNPMMetadataFollowsPushAndDelete(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	f.proxy.CacheMetadata = true
+	f.proxy.MetadataTTL = time.Hour
+	f.proxy.SetMetadataRewriteCacheSize(1 << 20)
+
+	before := f.get(t, "/request")
+	if before.Code != http.StatusOK {
+		t.Fatalf("status = %d", before.Code)
+	}
+
+	f.push(t, "request", "2.88.4", `{"name":"request","version":"2.88.4"}`)
+	pushed := f.get(t, "/request")
+	if _, ok := decodePackument(t, pushed).Versions["2.88.4"]; !ok {
+		t.Fatal("pushed version not listed while the upstream document is cached")
+	}
+	if pushed.Header().Get("ETag") == before.Header().Get("ETag") {
+		t.Error("ETag unchanged after a push")
+	}
+
+	if err := f.proxy.DeleteLocalVersion("npm", "request", "2.88.4"); err != nil {
+		t.Fatalf("DeleteLocalVersion: %v", err)
+	}
+	if _, ok := decodePackument(t, f.get(t, "/request")).Versions["2.88.4"]; ok {
+		t.Error("deleted version still listed")
+	}
+}
+
+func TestNPMMetadataIgnoresPushesWhenHostedDisabled(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	f.push(t, "request", "2.88.4", `{"name":"request","version":"2.88.4"}`)
+	f.proxy.HostedEnabled = false
+
+	if _, ok := decodePackument(t, f.get(t, "/request")).Versions["2.88.4"]; ok {
+		t.Error("pushed version listed with hosted packages disabled")
+	}
+}
