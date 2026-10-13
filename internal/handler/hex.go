@@ -10,12 +10,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/git-pkgs/proxy/internal/retention"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
 const (
 	hexUpstream = "https://repo.hex.pm"
 )
+
+// Tarballs are stored under pkg:hex/{name} with the name from the tarball
+// filename, and purl keeps hex names as they are, so package rules use the
+// default key mapping.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "hex", CanonicalPackage: retention.DefaultCanonical("hex")})
+}
 
 // HexHandler handles Hex.pm registry protocol requests.
 type HexHandler struct {
@@ -76,16 +84,16 @@ func (h *HexHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 // parseTarballFilename extracts name and version from a hex tarball filename.
 // e.g., "phoenix-1.7.10.tar" -> ("phoenix", "1.7.10")
+// e.g., "amqp_client-4.1.5-1.tar" -> ("amqp_client", "4.1.5-1")
+//
+// Hex package names can't contain a hyphen, so the first one separates the
+// name from a version that may carry hyphens of its own.
 func (h *HexHandler) parseTarballFilename(filename string) (name, version string) {
-	base := strings.TrimSuffix(filename, ".tar")
-
-	// Find the last hyphen followed by a version number
-	for i := len(base) - 1; i >= 0; i-- {
-		if base[i] == '-' && i+1 < len(base) && base[i+1] >= '0' && base[i+1] <= '9' {
-			return base[:i], base[i+1:]
-		}
+	name, version, ok := strings.Cut(strings.TrimSuffix(filename, ".tar"), "-")
+	if !ok || name == "" || version == "" {
+		return "", ""
 	}
-	return "", ""
+	return name, version
 }
 
 // hexAPIURL is the Hex HTTP API base URL for fetching package metadata with timestamps.
