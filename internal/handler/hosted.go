@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -248,6 +249,30 @@ func (p *Proxy) LocalArtifacts(ecosystem, name string) ([]HostedArtifact, error)
 		})
 	}
 	return listed, nil
+}
+
+// hostedOnly reports whether a package is in an npm scope or Composer vendor
+// that is served from pushed packages alone. The upstream is never asked
+// about such a package, so nobody can mix in versions by publishing the same
+// name there.
+func (p *Proxy) hostedOnly(ecosystem, name string) bool {
+	if !p.HostedEnabled {
+		return false
+	}
+	namespace, _, namespaced := strings.Cut(name, "/")
+	if !namespaced {
+		return false
+	}
+	switch ecosystem {
+	case "npm":
+		return slices.Contains(p.HostedNPMScopes, namespace)
+	case "composer":
+		return slices.ContainsFunc(p.HostedComposerVendors, func(vendor string) bool {
+			return strings.EqualFold(vendor, namespace)
+		})
+	default:
+		return false
+	}
 }
 
 // localVersion is a pushed version as ecosystem metadata lists it.

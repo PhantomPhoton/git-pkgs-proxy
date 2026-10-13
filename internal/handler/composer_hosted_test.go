@@ -24,13 +24,16 @@ const monologDevMetadata = `{"minified":"composer/2.0","packages":{"monolog/mono
 ]}}`
 
 type composerHostedFixture struct {
-	proxy   *Proxy
-	handler http.Handler
+	proxy            *Proxy
+	handler          http.Handler
+	upstreamRequests *int
 }
 
 func newComposerHostedFixture(t *testing.T, upstream map[string]string) composerHostedFixture {
 	t.Helper()
+	upstreamRequests := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
 		body, ok := upstream[r.URL.Path]
 		if !ok {
 			http.NotFound(w, r)
@@ -45,7 +48,7 @@ func newComposerHostedFixture(t *testing.T, upstream map[string]string) composer
 	proxy.HostedEnabled = true
 	proxy.HTTPClient = srv.Client()
 	h := NewComposerHandlerWithUpstreams(proxy, "http://proxy.local", srv.URL, srv.URL)
-	return composerHostedFixture{proxy: proxy, handler: h.Routes()}
+	return composerHostedFixture{proxy: proxy, handler: h.Routes(), upstreamRequests: &upstreamRequests}
 }
 
 func (f composerHostedFixture) push(t *testing.T, name, version, manifest string) HostedArtifact {
@@ -163,5 +166,36 @@ func TestComposerMetadataForPackageOnlyPushed(t *testing.T) {
 	f.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/p2/acme/private~dev.json", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("dev file of a package with no pushed dev versions status = %d, want 404", rec.Code)
+	}
+}
+
+func TestComposerHostedOnlyVendorNeverAsksUpstream(t *testing.T) {
+	squatter := `{"packages":{"acme/private":[{"name":"acme/private","version":"1.0.1",
+		"dist":{"type":"zip","url":"https://api.github.com/repos/evil/private/zipball/ddd","reference":"ddd"}}]}}`
+	f := newComposerHostedFixture(t, map[string]string{
+		"/p2/acme/private.json":    squatter,
+		"/p2/monolog/monolog.json": monologMetadata,
+	})
+	f.proxy.HostedComposerVendors = []string{"acme"}
+	f.push(t, "acme/private", "1.0.0", `{"name":"acme/private"}`)
+
+	versions := f.versions(t, "/p2/acme/private.json", "acme/private")
+	if _, ok := versions["1.0.0"]; !ok || len(versions) != 1 {
+		t.Errorf("versions = %v, want only the pushed 1.0.0", versions)
+	}
+	for _, path := range []string{"/p2/acme/private~dev.json", "/p2/acme/other.json", "/files/acme/private/1.0.1/ddd.zip"} {
+		rec := httptest.NewRecorder()
+		f.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404", path, rec.Code)
+		}
+	}
+	if *f.upstreamRequests != 0 {
+		t.Errorf("hosted-only vendor sent %d requests upstream", *f.upstreamRequests)
+	}
+
+	f.versions(t, "/p2/monolog/monolog.json", "monolog/monolog")
+	if *f.upstreamRequests == 0 {
+		t.Error("package outside the vendor was not fetched upstream")
 	}
 }

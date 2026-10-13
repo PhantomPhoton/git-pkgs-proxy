@@ -371,6 +371,10 @@ gradle:
 #   enabled: true
 #   token: "${PROXY_HOSTED_TOKEN}"
 #   max_upload_size: "100MB"
+#   # Namespaces served from pushed packages only; the upstream is never asked
+#   # about them, so nobody can mix in versions by publishing the same name.
+#   npm_scopes: ["@acme"]
+#   composer_vendors: ["acme"]
 
 # Health endpoint configuration.
 health:

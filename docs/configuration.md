@@ -993,6 +993,8 @@ hosted:
   enabled: true
   token: "${PROXY_HOSTED_TOKEN}"
   max_upload_size: "100MB"
+  npm_scopes: ["@acme"]
+  composer_vendors: ["acme"]
 ```
 
 | Config | Environment | Description |
@@ -1000,6 +1002,8 @@ hosted:
 | `hosted.enabled` | `PROXY_HOSTED_ENABLED` | Register the `/api/hosted` endpoints (default `false`) |
 | `hosted.token` | `PROXY_HOSTED_TOKEN` | Bearer token required to push and delete; required when enabled, supports `${VAR}` |
 | `hosted.max_upload_size` | `PROXY_HOSTED_MAX_UPLOAD_SIZE` | Maximum size of one pushed archive (default `100MB`) |
+| `hosted.npm_scopes` | `PROXY_HOSTED_NPM_SCOPES` | npm scopes served from pushed packages only (comma-separated in the environment) |
+| `hosted.composer_vendors` | `PROXY_HOSTED_COMPOSER_VENDORS` | Composer vendors served from pushed packages only |
 
 `hosted.enabled` cannot be combined with `storage.cache_artifacts: false`.
 
@@ -1049,6 +1053,17 @@ Pushed versions are listed in the package metadata clients resolve against, with
 - npm entries carry the archive's sha512 as `dist.integrity`. Composer entries carry its sha256 as `dist.reference` and leave `shasum` empty.
 
 Metadata of packages with pushed versions is rewritten on every request instead of being cached, so a push or delete shows up on the next request.
+
+### Hosted-only namespaces
+
+A package the upstream doesn't know is served from its pushed versions, but the proxy still asks the upstream about it on every request. If someone later publishes the same name there, their versions are listed next to yours, and a range such as `^1.0.0` can resolve to one of them (dependency confusion).
+
+For private packages:
+
+1. Prefer a namespace you own on the public registry: an npm scope registered on npmjs.com, or a Composer vendor with packages on Packagist. Nobody else can publish under it.
+2. List the namespace in `hosted.npm_scopes` or `hosted.composer_vendors`. Its packages are served from pushed versions alone: the upstream is never asked about them, and anything not pushed answers 404.
+
+Other packages, including ones in other scopes and vendors, are proxied as usual.
 
 ### Storage and eviction
 

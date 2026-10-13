@@ -155,6 +155,10 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		http.Error(w, "failed to read pushed versions", http.StatusInternalServerError)
 		return
 	}
+	if h.proxy.hostedOnly("composer", basePackage) {
+		h.serveHostedOnlyMetadata(w, r, basePackage, cacheKey, local)
+		return
+	}
 	if len(local) > 0 {
 		h.serveMetadataWithLocal(w, r, basePackage, upstreamURL, cacheKey, local)
 		return
@@ -625,6 +629,10 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	}
 	if local != nil {
 		ServeArtifactRequest(w, r, local)
+		return
+	}
+	if h.proxy.hostedOnly("composer", packageName) {
+		http.Error(w, "version not found", http.StatusNotFound)
 		return
 	}
 

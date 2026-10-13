@@ -216,20 +216,7 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 	}
 
 	specifier, versionLookup := npmVersionSpecifier(packagePath, packageName)
-	local, err := h.npmLocalEntries(packageName)
-	if err != nil {
-		h.proxy.Logger.Error("failed to read pushed npm versions", "package", packageName, "error", err)
-		JSONError(w, http.StatusInternalServerError, "failed to read pushed versions")
-		return
-	}
-	if e, ok := findNPMLocalEntry(local, specifier); versionLookup && ok {
-		w.Header().Set(headerContentType, contentTypeJSON)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(e.entry)
-		return
-	}
-	if len(local) > 0 && !versionLookup {
-		h.serveMetadataWithLocal(w, r, packageName, upstreamURL, accept, metadataCacheKey, local)
+	if h.serveLocalMetadata(w, r, npmMetadataRequest{packageName, specifier, versionLookup, upstreamURL, accept, metadataCacheKey}) {
 		return
 	}
 
@@ -836,6 +823,10 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if local != nil {
 		ServeArtifactRequest(w, r, local)
+		return
+	}
+	if h.proxy.hostedOnly("npm", packageName) {
+		JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
 		return
 	}
 	registryURL, cacheKey := h.sourceFor(packageName)

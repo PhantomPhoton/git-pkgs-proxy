@@ -99,6 +99,22 @@ func (h *ComposerHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.
 	serveRewrittenMetadata(w, r, h.proxy.uncachedRewrite("composer", h.proxyURL, cacheKey, out))
 }
 
+// serveHostedOnlyMetadata answers a metadata request for a package of a
+// hosted-only vendor from its pushed versions alone.
+func (h *ComposerHandler) serveHostedOnlyMetadata(w http.ResponseWriter, r *http.Request, packageName, cacheKey string, local []composerLocalEntry) {
+	if len(local) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	out, err := localComposerDocument(packageName, local)
+	if err != nil {
+		h.proxy.Logger.Error("failed to build composer metadata from pushed versions", "package", packageName, "error", err)
+		http.Error(w, "failed to build package metadata", http.StatusInternalServerError)
+		return
+	}
+	serveRewrittenMetadata(w, r, h.proxy.uncachedRewrite("composer", h.proxyURL, cacheKey, out))
+}
+
 func localComposerDocument(packageName string, local []composerLocalEntry) ([]byte, error) {
 	entries := make([]json.RawMessage, 0, len(local))
 	for _, e := range local {

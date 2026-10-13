@@ -1215,6 +1215,8 @@ func (c *Config) LoadFromEnv() {
 	setEnvBool(&c.Hosted.Enabled, "PROXY_HOSTED_ENABLED")
 	setEnvString(&c.Hosted.Token, "PROXY_HOSTED_TOKEN")
 	setEnvString(&c.Hosted.MaxUploadSize, "PROXY_HOSTED_MAX_UPLOAD_SIZE")
+	setEnvStringSlice(&c.Hosted.NPMScopes, "PROXY_HOSTED_NPM_SCOPES")
+	setEnvStringSlice(&c.Hosted.ComposerVendors, "PROXY_HOSTED_COMPOSER_VENDORS")
 	setEnvString(&c.MetadataTTL, "PROXY_METADATA_TTL")
 	setEnvString(&c.MetadataMaxSize, "PROXY_METADATA_MAX_SIZE")
 	setEnvString(&c.ArtifactMaxSize, "PROXY_ARTIFACT_MAX_SIZE")

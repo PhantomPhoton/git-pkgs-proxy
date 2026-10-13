@@ -93,6 +93,8 @@
 //	PROXY_HOSTED_ENABLED                     - Enable pushing packages to /api/hosted
 //	PROXY_HOSTED_TOKEN                       - Bearer token for pushing and deleting
 //	PROXY_HOSTED_MAX_UPLOAD_SIZE             - Max size of one pushed archive (default "100MB")
+//	PROXY_HOSTED_NPM_SCOPES                  - npm scopes served from pushed packages only
+//	PROXY_HOSTED_COMPOSER_VENDORS            - Composer vendors served from pushed packages only
 //	PROXY_URL                                - Proxy URL for push, list and delete
 //
 // Example:

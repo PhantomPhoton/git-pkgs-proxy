@@ -56,6 +56,42 @@ func findNPMLocalEntry(local []npmLocalEntry, version string) (npmLocalEntry, bo
 	return npmLocalEntry{}, false
 }
 
+// npmMetadataRequest is a packument or version metadata request.
+type npmMetadataRequest struct {
+	packageName      string
+	specifier        string
+	versionLookup    bool
+	upstreamURL      string
+	accept           string
+	metadataCacheKey string
+}
+
+// serveLocalMetadata answers the metadata requests that pushed versions
+// decide, and reports whether it did: a request for a pushed version, any
+// request for a package in a hosted-only scope, and a packument of a package
+// with pushed versions. Everything else takes the usual upstream path.
+func (h *NPMHandler) serveLocalMetadata(w http.ResponseWriter, r *http.Request, req npmMetadataRequest) bool {
+	local, err := h.npmLocalEntries(req.packageName)
+	if err != nil {
+		h.proxy.Logger.Error("failed to read pushed npm versions", "package", req.packageName, "error", err)
+		JSONError(w, http.StatusInternalServerError, "failed to read pushed versions")
+		return true
+	}
+	switch e, pushed := findNPMLocalEntry(local, req.specifier); {
+	case req.versionLookup && pushed:
+		w.Header().Set(headerContentType, contentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(e.entry)
+	case h.proxy.hostedOnly("npm", req.packageName):
+		h.serveHostedOnlyMetadata(w, r, req.packageName, req.specifier, req.versionLookup, req.metadataCacheKey, local)
+	case len(local) > 0 && !req.versionLookup:
+		h.serveMetadataWithLocal(w, r, req.packageName, req.upstreamURL, req.accept, req.metadataCacheKey, local)
+	default:
+		return false
+	}
+	return true
+}
+
 // serveMetadataWithLocal serves a packument with the pushed versions of the
 // package added. It bypasses the rewrite cache, whose entries are keyed by the
 // upstream document alone, so a push or delete shows up on the next request.
@@ -87,17 +123,59 @@ func (h *NPMHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.Reque
 	serveRewrittenMetadata(w, r, h.proxy.uncachedRewrite("npm", h.proxyURL, metadataCacheKey, out))
 }
 
-// localNPMPackument builds a packument from pushed versions alone. latest is
-// the highest of them, or the last pushed when a version is not semver.
+// serveHostedOnlyMetadata answers a metadata request for a package in a
+// hosted-only scope from its pushed versions alone.
+func (h *NPMHandler) serveHostedOnlyMetadata(w http.ResponseWriter, r *http.Request, packageName, specifier string, versionLookup bool, metadataCacheKey string, local []npmLocalEntry) {
+	if len(local) == 0 {
+		JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
+		return
+	}
+	if versionLookup {
+		if specifier == "latest" {
+			specifier = latestNPMVersion(local)
+		}
+		e, ok := findNPMLocalEntry(local, specifier)
+		if !ok {
+			JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
+			return
+		}
+		w.Header().Set(headerContentType, contentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(e.entry)
+		return
+	}
+	out, err := localNPMPackument(packageName, local)
+	if err != nil {
+		h.proxy.Logger.Error("failed to build npm metadata from pushed versions", "package", packageName, "error", err)
+		JSONError(w, http.StatusInternalServerError, "failed to build package metadata")
+		return
+	}
+	serveRewrittenMetadata(w, r, h.proxy.uncachedRewrite("npm", h.proxyURL, metadataCacheKey, out))
+}
+
+// localNPMPackument builds a packument from pushed versions alone.
 func localNPMPackument(packageName string, local []npmLocalEntry) ([]byte, error) {
 	versions := make(map[string]json.RawMessage, len(local))
 	times := make(map[string]string, len(local))
+	for _, e := range local {
+		versions[e.version] = e.entry
+		times[e.version] = e.time
+	}
+	return json.Marshal(map[string]any{
+		"name":      packageName,
+		"dist-tags": map[string]string{"latest": latestNPMVersion(local)},
+		"versions":  versions,
+		"time":      times,
+	})
+}
+
+// latestNPMVersion returns the highest pushed version, or the last pushed
+// when a version is not semver.
+func latestNPMVersion(local []npmLocalEntry) string {
 	latest, latestTime := "", ""
 	var latestSemver *semver.Version
 	semverOnly := true
 	for _, e := range local {
-		versions[e.version] = e.entry
-		times[e.version] = e.time
 		if e.time > latestTime {
 			latest, latestTime = e.version, e.time
 		}
@@ -111,12 +189,7 @@ func localNPMPackument(packageName string, local []npmLocalEntry) ([]byte, error
 		}
 	}
 	if semverOnly && latestSemver != nil {
-		latest = latestSemver.Original()
+		return latestSemver.Original()
 	}
-	return json.Marshal(map[string]any{
-		"name":      packageName,
-		"dist-tags": map[string]string{"latest": latest},
-		"versions":  versions,
-		"time":      times,
-	})
+	return latest
 }

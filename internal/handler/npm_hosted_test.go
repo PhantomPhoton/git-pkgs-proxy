@@ -26,15 +26,18 @@ const requestPackument = `{
 }`
 
 type npmHostedFixture struct {
-	proxy   *Proxy
-	handler http.Handler
+	proxy            *Proxy
+	handler          http.Handler
+	upstreamRequests *int
 }
 
 // newNPMHostedFixture serves packuments from upstream, keyed by request path,
 // and answers 404 for anything else.
 func newNPMHostedFixture(t *testing.T, upstream map[string]string) npmHostedFixture {
 	t.Helper()
+	upstreamRequests := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
 		body, ok := upstream[r.URL.EscapedPath()]
 		if !ok {
 			http.NotFound(w, r)
@@ -48,7 +51,7 @@ func newNPMHostedFixture(t *testing.T, upstream map[string]string) npmHostedFixt
 	proxy, _, _, _ := setupTestProxy(t)
 	proxy.HostedEnabled = true
 	proxy.HTTPClient = srv.Client()
-	return npmHostedFixture{proxy: proxy, handler: NewNPMHandler(proxy, "http://proxy.local", srv.URL).Routes()}
+	return npmHostedFixture{proxy: proxy, handler: NewNPMHandler(proxy, "http://proxy.local", srv.URL).Routes(), upstreamRequests: &upstreamRequests}
 }
 
 func (f npmHostedFixture) push(t *testing.T, name, version, manifest string) HostedArtifact {
@@ -253,5 +256,40 @@ func TestNPMDownloadOfPushedOverrideOfVersionInCooldown(t *testing.T) {
 	rec := f.get(t, "/request/-/request-2.88.3.tgz")
 	if rec.Code != http.StatusOK || rec.Body.String() != string(npmTarball(`{"name":"request","version":"2.88.3"}`)) {
 		t.Errorf("download status = %d, want 200 and the pushed tarball: the packument lists it, so the download must not be withheld", rec.Code)
+	}
+}
+
+func TestNPMHostedOnlyScopeNeverAsksUpstream(t *testing.T) {
+	squatter := `{"name":"@acme/private","dist-tags":{"latest":"1.0.1"},"versions":{"1.0.1":{"name":"@acme/private","version":"1.0.1",
+		"dist":{"tarball":"https://registry.npmjs.org/@acme/private/-/private-1.0.1.tgz"}}}}`
+	f := newNPMHostedFixture(t, map[string]string{"/@acme%2fprivate": squatter, "/@acme%2Fprivate": squatter, "/request": requestPackument})
+	f.proxy.HostedNPMScopes = []string{"@acme"}
+	f.push(t, "@acme/private", "1.0.0", `{"name":"@acme/private","version":"1.0.0"}`)
+
+	doc := decodePackument(t, f.get(t, "/@acme/private"))
+	if len(doc.Versions) != 1 || doc.DistTags["latest"] != "1.0.0" {
+		t.Errorf("packument = %+v, want only the pushed 1.0.0", doc)
+	}
+	if rec := f.get(t, "/@acme/private/latest"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"version":"1.0.0"`) {
+		t.Errorf("latest status = %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := f.get(t, "/@acme/private/1.0.1"); rec.Code != http.StatusNotFound {
+		t.Errorf("unpushed version status = %d, want 404", rec.Code)
+	}
+	if rec := f.get(t, "/@acme/private/-/private-1.0.1.tgz"); rec.Code != http.StatusNotFound {
+		t.Errorf("unpushed tarball status = %d, want 404", rec.Code)
+	}
+	if rec := f.get(t, "/@acme/other"); rec.Code != http.StatusNotFound {
+		t.Errorf("unpushed package status = %d, want 404", rec.Code)
+	}
+	if rec := f.get(t, "/@acme/private/-/private-1.0.0.tgz"); rec.Code != http.StatusOK {
+		t.Errorf("pushed tarball status = %d, want 200", rec.Code)
+	}
+	if *f.upstreamRequests != 0 {
+		t.Errorf("hosted-only scope sent %d requests upstream", *f.upstreamRequests)
+	}
+
+	if rec := f.get(t, "/request"); rec.Code != http.StatusOK || *f.upstreamRequests == 0 {
+		t.Errorf("package outside the scope status = %d after %d upstream requests, want it fetched upstream", rec.Code, *f.upstreamRequests)
 	}
 }

@@ -175,6 +175,11 @@ type Proxy struct {
 	DirectServeBaseURL string
 	HTTPClient         *http.Client
 
+	// HostedNPMScopes and HostedComposerVendors name namespaces served from
+	// pushed packages alone, without asking the upstream.
+	HostedNPMScopes       []string
+	HostedComposerVendors []string
+
 	// StreamArtifacts streams artifacts from upstream without storing them.
 	// Each request fetches its own copy: there is no cache to check and
 	// nothing for concurrent misses to share.
