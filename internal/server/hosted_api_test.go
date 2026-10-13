@@ -66,6 +66,7 @@ func newHostedTestServer(t *testing.T) hostedTestServer {
 	calls := 0
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	proxy := handler.NewProxy(db, store, countingFetcher{calls: &calls}, fetch.NewResolver(), logger)
+	proxy.HostedEnabled = true
 
 	upstreamRequests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -326,5 +327,36 @@ func TestHostedNpmPackageIsListedByTheRunningServer(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"1.0.0"`) {
 		t.Errorf("packument status = %d, body %s", resp.StatusCode, body)
+	}
+}
+
+func TestHostedComposerVersionIsInstallableFromMetadata(t *testing.T) {
+	s := newHostedTestServer(t)
+	if rec := s.do(t, http.MethodPut, "/api/hosted/composer/acme/private/1.0.0", testHostedToken,
+		composerZip(`{"name":"acme/private","require":{"php":">=8.1"}}`)); rec.Code != http.StatusCreated {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+
+	rec := s.do(t, http.MethodGet, "/composer/p2/acme/private.json", "", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body %s", rec.Code, rec.Body)
+	}
+	var doc struct {
+		Packages map[string][]struct {
+			Dist struct {
+				URL string `json:"url"`
+			} `json:"dist"`
+		} `json:"packages"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decoding metadata: %v", err)
+	}
+	versions := doc.Packages["acme/private"]
+	if len(versions) != 1 {
+		t.Fatalf("metadata = %s", rec.Body)
+	}
+	distPath := strings.TrimPrefix(versions[0].Dist.URL, "http://proxy.test")
+	if rec := s.do(t, http.MethodGet, distPath, "", ""); rec.Code != http.StatusOK {
+		t.Errorf("download of %s status = %d", distPath, rec.Code)
 	}
 }

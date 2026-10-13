@@ -148,6 +148,18 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 	repoURL, cacheKey := h.sourceFor(packageName)
 	upstreamURL := fmt.Sprintf("%s/p2/%s/%s.json", repoURL, vendor, pkg)
 
+	basePackage := strings.TrimSuffix(packageName, composerDevFile)
+	local, err := h.composerLocalEntries(basePackage, basePackage != packageName)
+	if err != nil {
+		h.proxy.Logger.Error("failed to read pushed composer versions", "package", basePackage, "error", err)
+		http.Error(w, "failed to read pushed versions", http.StatusInternalServerError)
+		return
+	}
+	if len(local) > 0 {
+		h.serveMetadataWithLocal(w, r, basePackage, upstreamURL, cacheKey, local)
+		return
+	}
+
 	if stored, ok := h.proxy.storedRewrite("composer", cacheKey, h.proxyURL, cacheKey); ok {
 		serveRewrittenMetadata(w, r, stored)
 		return
@@ -195,6 +207,15 @@ func (h *ComposerHandler) rewriteMetadata(body []byte) ([]byte, error) {
 // rewriteMetadataKeeping is rewriteMetadata that also reports the versions
 // it kept, each as its package name and version.
 func (h *ComposerHandler) rewriteMetadataKeeping(body []byte) ([]byte, []string, error) {
+	return h.rewriteMetadataWithLocal(body, "", nil)
+}
+
+// rewriteMetadataWithLocal is rewriteMetadataKeeping that also lists the
+// pushed versions in local under localPackage, in place of any upstream entry
+// with the same version. Cooldown only filters upstream versions. A document
+// that does not list localPackage at all is replaced by one holding only the
+// pushed versions.
+func (h *ComposerHandler) rewriteMetadataWithLocal(body []byte, localPackage string, local []composerLocalEntry) ([]byte, []string, error) {
 	if !json.Valid(body) {
 		return nil, nil, errors.New("composer metadata is not valid JSON")
 	}
@@ -206,6 +227,7 @@ func (h *ComposerHandler) rewriteMetadataKeeping(body []byte) ([]byte, []string,
 
 	var out bytes.Buffer
 	var kept []string
+	listed := false
 	out.Grow(len(body) + len(body)/8)
 	err = rewriteJSONMembers(&out, body, func(out *bytes.Buffer, m jsonMember) (bool, error) {
 		packages := m.value(body)
@@ -221,11 +243,19 @@ func (h *ComposerHandler) rewriteMetadataKeeping(body []byte) ([]byte, []string,
 			if err != nil {
 				return false, err
 			}
-			return true, h.writeVersions(out, packageName, versions, minified, &kept)
+			var pushed []composerLocalEntry
+			if packageName == localPackage {
+				pushed, listed = local, true
+			}
+			return true, h.writeVersions(out, packageName, versions, minified, &kept, pushed)
 		})
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(local) > 0 && !listed {
+		document, err := localComposerDocument(localPackage, local)
+		return document, nil, err
 	}
 	return out.Bytes(), kept, nil
 }
@@ -239,7 +269,10 @@ func (h *ComposerHandler) rewriteMetadataKeeping(body []byte) ([]byte, []string,
 // entry itself unless filtered versions were dropped before it; then it also
 // carries the changes those versions made. Every version gets its own dist,
 // since the proxied URL names the version.
-func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, versions []byte, minified bool, kept *[]string) error {
+//
+// The pushed versions in local follow the upstream ones and take the place of
+// upstream entries with the same version.
+func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, versions []byte, minified bool, kept *[]string, local []composerLocalEntry) error {
 	packagePURL := canonicalPackagePURL("composer", packageName)
 	upstream, written := newComposerFields(), newComposerFields()
 	devReset, first := false, true
@@ -265,7 +298,7 @@ func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, v
 		}
 
 		version := upstream.string("version")
-		if h.shouldFilterVersion(packagePURL, packageName, version, upstream.get("time")) {
+		if pushedComposerVersion(local, version) || h.shouldFilterVersion(packagePURL, packageName, version, upstream.get("time")) {
 			return nil
 		}
 
@@ -284,8 +317,30 @@ func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, v
 		*kept = append(*kept, packageName+"\x00"+version)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, e := range local {
+		pushed := newComposerFields()
+		if err := pushed.apply(e.entry, false); err != nil {
+			return err
+		}
+		if !minified {
+			written.reset()
+		}
+		if !first {
+			out.WriteByte(',')
+		}
+		first = false
+		if devReset {
+			out.WriteString(`"` + composerDevReset + `",`)
+			devReset = false
+		}
+		h.writeVersion(out, packageName, e.version, pushed, written)
+		*kept = append(*kept, packageName+"\x00"+e.version)
+	}
 	out.WriteByte(']')
-	return err
+	return nil
 }
 
 // writeVersion writes the fields of upstream that differ from written, with
