@@ -140,3 +140,28 @@ func TestRunDelete(t *testing.T) {
 		t.Errorf("delete of a missing version error = %v", err)
 	}
 }
+
+func TestRunHostedDispatchesSubcommands(t *testing.T) {
+	srv, recorded := hostedTestServer(t, http.StatusOK, `{"ecosystem":"npm","name":"request","artifacts":[]}`)
+
+	if err := runHosted([]string{"list", "-url", srv.URL, "npm", "request"}, hostedEnv(nil), io.Discard, srv.Client()); err != nil {
+		t.Fatalf("runHosted list: %v", err)
+	}
+	if recorded.method != http.MethodGet || recorded.path != "/api/hosted/npm/request" {
+		t.Errorf("request = %s %s", recorded.method, recorded.path)
+	}
+
+	for _, args := range [][]string{nil, {"bogus"}} {
+		err := runHosted(args, hostedEnv(nil), io.Discard, srv.Client())
+		if err == nil || !strings.Contains(err.Error(), "usage: proxy hosted <push|list|delete>") {
+			t.Errorf("runHosted(%q) error = %v, want the hosted usage", args, err)
+		}
+	}
+}
+
+func TestHostedSubcommandUsageNamesTheHostedCommand(t *testing.T) {
+	err := runPush([]string{"npm"}, hostedEnv(map[string]string{"PROXY_HOSTED_TOKEN": "tok"}), io.Discard, http.DefaultClient)
+	if err == nil || !strings.Contains(err.Error(), "usage: proxy hosted push") {
+		t.Errorf("push usage error = %v, want it to name proxy hosted push", err)
+	}
+}

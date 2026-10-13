@@ -103,7 +103,7 @@ func hostedToken(getenv func(string) string) (string, error) {
 }
 
 func runPush(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
-	cmd := newHostedCommand("push", "proxy push [-url URL] <ecosystem> <name> <version> <file>",
+	cmd := newHostedCommand("push", "proxy hosted push [-url URL] <ecosystem> <name> <version> <file>",
 		"Push a package archive to the proxy", getenv)
 	positional, err := cmd.parse(args, pushArgCount)
 	if err != nil {
@@ -138,7 +138,7 @@ func runPush(args []string, getenv func(string) string, stdout io.Writer, client
 }
 
 func runList(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
-	cmd := newHostedCommand("list", "proxy list [-url URL] <ecosystem> <name>", "List pushed package archives", getenv)
+	cmd := newHostedCommand("list", "proxy hosted list [-url URL] <ecosystem> <name>", "List pushed package archives", getenv)
 	positional, err := cmd.parse(args, listArgCount)
 	if err != nil {
 		return err
@@ -161,7 +161,7 @@ func runList(args []string, getenv func(string) string, stdout io.Writer, client
 }
 
 func runDelete(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
-	cmd := newHostedCommand("delete", "proxy delete [-url URL] <ecosystem> <name> <version>", "Delete a pushed version", getenv)
+	cmd := newHostedCommand("delete", "proxy hosted delete [-url URL] <ecosystem> <name> <version>", "Delete a pushed version", getenv)
 	positional, err := cmd.parse(args, deleteArgCount)
 	if err != nil {
 		return err
@@ -207,11 +207,36 @@ func doHosted(client *http.Client, req *http.Request, wantStatus int, out any) e
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// runHostedCommand runs one of the push, list and delete commands against the
-// proxy's /api/hosted endpoints and exits non-zero on failure.
-func runHostedCommand(run func([]string, func(string) string, io.Writer, *http.Client) error) {
+const hostedUsage = "usage: proxy hosted <push|list|delete> [flags] ...\n\n" +
+	"  push     Push a package archive to the proxy\n" +
+	"  list     List pushed package archives\n" +
+	"  delete   Delete a pushed version"
+
+type hostedSubcommand func([]string, func(string) string, io.Writer, *http.Client) error
+
+var hostedSubcommands = map[string]hostedSubcommand{
+	"push":   runPush,
+	"list":   runList,
+	"delete": runDelete,
+}
+
+// runHosted runs the hosted subcommand named by args[0].
+func runHosted(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
+	if len(args) == 0 {
+		return errors.New(hostedUsage)
+	}
+	run, ok := hostedSubcommands[args[0]]
+	if !ok {
+		return fmt.Errorf("unknown hosted command %q\n%s", args[0], hostedUsage)
+	}
+	return run(args[1:], getenv, stdout, client)
+}
+
+// runHostedCommand runs proxy hosted against the proxy's /api/hosted
+// endpoints and exits non-zero on failure.
+func runHostedCommand() {
 	client := &http.Client{Timeout: hostedClientTimeout}
-	if err := run(os.Args[1:], os.Getenv, os.Stdout, client); err != nil {
+	if err := runHosted(os.Args[1:], os.Getenv, os.Stdout, client); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

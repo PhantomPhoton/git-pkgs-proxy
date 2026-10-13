@@ -1014,7 +1014,7 @@ hosted:
 
    ```bash
    export PROXY_HOSTED_TOKEN=...
-   proxy push -url https://proxy.example.com npm request 2.88.3 ./request-2.88.3.tgz
+   proxy hosted push -url https://proxy.example.com npm request 2.88.3 ./request-2.88.3.tgz
    ```
 
    or with curl:
@@ -1026,8 +1026,8 @@ hosted:
    ```
 
 3. Install it as usual, e.g. `npm install request@2.88.3`. The version is listed in the package metadata, so ranges like `^2.88.0` resolve to it too.
-4. Check what is pushed: `proxy list npm request` or `GET /api/hosted/npm/request`.
-5. Remove it again: `proxy delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
+4. Check what is pushed: `proxy hosted list npm request` or `GET /api/hosted/npm/request`.
+5. Remove it again: `proxy hosted delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
 
 ### Supported ecosystems
 

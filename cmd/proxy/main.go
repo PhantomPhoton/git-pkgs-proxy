@@ -22,9 +22,7 @@
 //	serve    Start the proxy server (default if no command given)
 //	stats    Show cache statistics
 //	mirror   Pre-populate cache from PURLs, SBOMs, or registries
-//	push     Push a package archive to a running proxy (needs hosted.enabled)
-//	list     List package archives pushed to a running proxy
-//	delete   Delete a pushed version from a running proxy
+//	hosted   Push, list or delete packages on a running proxy (needs hosted.enabled)
 //
 // Serve Flags:
 //
@@ -95,7 +93,7 @@
 //	PROXY_HOSTED_MAX_UPLOAD_SIZE             - Max size of one pushed archive (default "100MB")
 //	PROXY_HOSTED_NPM_SCOPES                  - npm scopes served from pushed packages only
 //	PROXY_HOSTED_COMPOSER_VENDORS            - Composer vendors served from pushed packages only
-//	PROXY_URL                                - Proxy URL for push, list and delete
+//	PROXY_URL                                - Proxy URL for proxy hosted
 //
 // Example:
 //
@@ -168,17 +166,9 @@ func main() {
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 			runMirror()
 			return
-		case "push":
+		case "hosted":
 			os.Args = append(os.Args[:1], os.Args[2:]...)
-			runHostedCommand(runPush)
-			return
-		case "list":
-			os.Args = append(os.Args[:1], os.Args[2:]...)
-			runHostedCommand(runList)
-			return
-		case "delete":
-			os.Args = append(os.Args[:1], os.Args[2:]...)
-			runHostedCommand(runDelete)
+			runHostedCommand()
 			return
 		case "-version", "--version":
 			fmt.Printf("proxy %s (%s)\n", Version, Commit)
@@ -202,9 +192,7 @@ Commands:
   serve    Start the proxy server (default)
   stats    Show cache statistics
   mirror   Pre-populate cache from PURLs, SBOMs, or registries
-  push     Push a package archive to a running proxy
-  list     List package archives pushed to a running proxy
-  delete   Delete a pushed version from a running proxy
+  hosted   Push, list or delete packages on a running proxy
 
 Run 'proxy <command> -help' for more information on a command.
 

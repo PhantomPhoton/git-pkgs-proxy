@@ -1026,16 +1026,16 @@ curl http://localhost:8080/api/mirror/mirror-1
 curl -X DELETE http://localhost:8080/api/mirror/mirror-1
 ```
 
-### push, list, delete
+### hosted
 
 Push package archives to a running proxy with `hosted.enabled`, list them and delete them. See [Hosted Packages](docs/configuration.md#hosted-packages).
 
 ```bash
 export PROXY_URL=https://proxy.example.com PROXY_HOSTED_TOKEN=...
-proxy push npm request 2.88.3 ./request-2.88.3.tgz
-proxy push composer monolog/monolog 3.5.0 ./monolog-3.5.0.zip
-proxy list npm request
-proxy delete npm request 2.88.3
+proxy hosted push npm request 2.88.3 ./request-2.88.3.tgz
+proxy hosted push composer monolog/monolog 3.5.0 ./monolog-3.5.0.zip
+proxy hosted list npm request
+proxy hosted delete npm request 2.88.3
 ```
 
 ### stats
