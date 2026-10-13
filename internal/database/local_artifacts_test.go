@@ -152,3 +152,56 @@ func TestMigrationAddsArtifactSource(t *testing.T) {
 		t.Errorf("existing artifact source = %q, want %q", art.Source, SourceUpstream)
 	}
 }
+
+func TestGetLocalArtifacts(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		seedSourcedArtifact(t, db, "request", SourceLocal, 100, time.Now())
+		seedSourcedArtifact(t, db, "lodash", SourceLocal, 100, time.Now())
+		seedSourcedArtifact(t, db, "express", SourceUpstream, 100, time.Now())
+
+		local, err := db.GetLocalArtifacts("pkg:npm/request")
+		if err != nil {
+			t.Fatalf("GetLocalArtifacts: %v", err)
+		}
+		if len(local) != 1 || local[0].Filename != "request-1.0.0.tgz" {
+			t.Fatalf("local artifacts of request = %+v, want only request-1.0.0.tgz", local)
+		}
+
+		upstreamOnly, err := db.GetLocalArtifacts("pkg:npm/express")
+		if err != nil {
+			t.Fatalf("GetLocalArtifacts(express): %v", err)
+		}
+		if len(upstreamOnly) != 0 {
+			t.Errorf("local artifacts of express = %+v, want none", upstreamOnly)
+		}
+	})
+}
+
+func TestDeleteLocalArtifacts(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		seedSourcedArtifact(t, db, "request", SourceLocal, 100, time.Now())
+		seedSourcedArtifact(t, db, "express", SourceUpstream, 100, time.Now())
+		const pushedPath = "npm/request/1.0.0/request-1.0.0.tgz"
+
+		deleted, err := db.DeleteLocalArtifacts("pkg:npm/request@1.0.0")
+		if err != nil || deleted != 1 {
+			t.Fatalf("DeleteLocalArtifacts(request) = %d, %v, want 1, nil", deleted, err)
+		}
+		art, err := db.GetArtifact("pkg:npm/request@1.0.0", "request-1.0.0.tgz")
+		if err != nil || art != nil {
+			t.Errorf("GetArtifact after delete = %+v, %v, want nil, nil", art, err)
+		}
+		var queued int
+		if err := db.Get(&queued, db.Rebind(`SELECT COUNT(*) FROM pending_deletes WHERE path = ?`), pushedPath); err != nil || queued != 1 {
+			t.Errorf("queued deletes for %s = %d, %v, want 1", pushedPath, queued, err)
+		}
+
+		deleted, err = db.DeleteLocalArtifacts("pkg:npm/express@1.0.0")
+		if err != nil || deleted != 0 {
+			t.Errorf("DeleteLocalArtifacts(upstream) = %d, %v, want 0, nil", deleted, err)
+		}
+		if art, err := db.GetArtifact("pkg:npm/express@1.0.0", "express-1.0.0.tgz"); err != nil || art == nil {
+			t.Errorf("upstream artifact removed by DeleteLocalArtifacts: %+v, %v", art, err)
+		}
+	})
+}

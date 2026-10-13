@@ -563,6 +563,16 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	h.proxy.Logger.Info("composer download request",
 		"package", packageName, "version", version, "filename", filename)
 
+	local, err := h.proxy.GetLocalArtifact(r.Context(), "composer", packageName, version, filename)
+	if err != nil {
+		h.proxy.serveArtifactError(w, err, "failed to read pushed package")
+		return
+	}
+	if local != nil {
+		ServeArtifactRequest(w, r, local)
+		return
+	}
+
 	// We need to fetch the metadata to get the actual download URL since
 	// Packagist URLs include a hash. Packagist serves dev versions (e.g.
 	// "3.x-dev", "dev-master") from a separate "~dev" metadata file, while

@@ -5,6 +5,11 @@
 // @description HTTP API for package enrichment, vulnerability lookup, cache stats, and source browsing.
 // @BasePath /
 //
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
+// @description "Bearer " followed by hosted.token
+//
 // The proxy caches package artifacts from upstream registries (npm, cargo, etc.)
 // providing faster, more reliable access for development teams.
 //

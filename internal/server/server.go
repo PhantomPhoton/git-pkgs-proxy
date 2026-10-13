@@ -365,6 +365,12 @@ func (s *Server) serve(listener net.Listener) error {
 		go jobStore.StartCleanup(bgCtx)
 	}
 
+	// Hosted package endpoints (opt-in via hosted.enabled or PROXY_HOSTED_ENABLED)
+	if s.cfg.Hosted.Enabled {
+		hostedAPI := NewHostedAPIHandler(proxy, s.cfg.Hosted.MaxUploadBytes(), s.logger)
+		registerHostedRoutes(r, hostedAPI, s.cfg.Hosted.TokenExpanded())
+	}
+
 	s.http = &http.Server{
 		Addr:         s.cfg.Listen,
 		Handler:      r,
