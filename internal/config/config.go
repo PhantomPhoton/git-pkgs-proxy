@@ -190,6 +190,9 @@ type Config struct {
 	// Disabled by default to prevent unauthenticated users from triggering downloads.
 	MirrorAPI bool `json:"mirror_api" yaml:"mirror_api"`
 
+	// Hosted configures pushing packages to the proxy (/api/packages).
+	Hosted HostedConfig `json:"hosted" yaml:"hosted"`
+
 	// Gradle configures Gradle HttpBuildCache behavior.
 	Gradle GradleConfig `json:"gradle" yaml:"gradle"`
 
@@ -1209,6 +1212,9 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.Scanning.FetchBaseURL, "PROXY_SCANNING_FETCH_BASE_URL")
 	setEnvBool(&c.CacheMetadata, "PROXY_CACHE_METADATA")
 	setEnvBool(&c.MirrorAPI, "PROXY_MIRROR_API")
+	setEnvBool(&c.Hosted.Enabled, "PROXY_HOSTED_ENABLED")
+	setEnvString(&c.Hosted.Token, "PROXY_HOSTED_TOKEN")
+	setEnvString(&c.Hosted.MaxUploadSize, "PROXY_HOSTED_MAX_UPLOAD_SIZE")
 	setEnvString(&c.MetadataTTL, "PROXY_METADATA_TTL")
 	setEnvString(&c.MetadataMaxSize, "PROXY_METADATA_MAX_SIZE")
 	setEnvString(&c.ArtifactMaxSize, "PROXY_ARTIFACT_MAX_SIZE")
@@ -1335,6 +1341,8 @@ func (c *Config) validateCacheArtifacts() error {
 		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with storage.direct_serve: no artifacts are stored to redirect to")
 	case c.MirrorAPI:
 		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with mirror_api: mirrored artifacts would never be served")
+	case c.Hosted.Enabled:
+		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with hosted.enabled: pushed packages would never be served")
 	}
 	return nil
 }
@@ -1361,6 +1369,10 @@ func (c *Config) validateComponents() error {
 	}
 
 	if err := c.Scanning.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Hosted.Validate(); err != nil {
 		return err
 	}
 
