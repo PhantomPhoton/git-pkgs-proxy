@@ -537,10 +537,12 @@ Lookups for modules that were never cached fail as well. Builds whose
 `go.sum` already lists every module do not ask the database at all and are
 not affected. This requires `cache_metadata`.
 
-With `cache_metadata` enabled, lookups, partial tiles and the latest signed
-tree follow `metadata_ttl` and are served from cache when the database is
-unreachable. Complete tiles never change and are not revalidated once cached;
-a tile of the wrong size is refused and not stored.
+With `cache_metadata` enabled, lookups, partial hash tiles and the latest
+signed tree follow `metadata_ttl` and are served from cache when the database
+is unreachable. Complete hash tiles never change and are not revalidated once
+cached; a tile of the wrong size is refused and not stored. Data tiles are
+always forwarded and never stored: the `go` command does not fetch them, only
+mirrors and auditors do.
 Without `cache_metadata` the requests are forwarded and nothing is stored.
 
 A 404 from the database keeps its text, which the `go` command prints to

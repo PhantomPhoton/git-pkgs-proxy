@@ -135,6 +135,12 @@ func (h *GoHandler) handleSumDB(w http.ResponseWriter, r *http.Request, rest str
 		http.NotFound(w, r)
 		return
 	}
+	// Only mirrors and auditors fetch data tiles, never the go command, and
+	// together they hold the whole log, so they are not stored.
+	if tile, err := tlog.ParseTilePath(path); err == nil && tile.L < 0 {
+		h.proxy.proxyMetadataStream(w, r, sumDBURL+"/"+path, "identity", "*/*")
+		return
+	}
 
 	cacheKey := goSumDBCacheKey(name, sumDBURL, path)
 	check := goSumDBResponseCheck(path)
@@ -275,8 +281,8 @@ const goSumDBTreePrefix = "go.sum database tree\n"
 // followed by a signed tree, which is how the go command reads it; a block
 // page cached in its place would also replace the copy kept for an outage.
 // A hash tile holds exactly W hashes, and complete tiles are never
-// revalidated, so a bad one would otherwise stay for good. A data tile holds
-// exactly W records.
+// revalidated, so a bad one would otherwise stay for good. Data tiles are
+// never cached and not checked.
 func goSumDBResponseCheck(path string) func([]byte) error {
 	if path == "latest" {
 		return func(body []byte) error {
@@ -300,28 +306,11 @@ func goSumDBResponseCheck(path string) func([]byte) error {
 		return nil
 	}
 	return func(body []byte) error {
-		if tile.L >= 0 && len(body) != tile.W*tlog.HashSize {
+		if len(body) != tile.W*tlog.HashSize {
 			return fmt.Errorf("checksum database tile %s has %d bytes, want %d", path, len(body), tile.W*tlog.HashSize)
-		}
-		if tile.L < 0 {
-			if n := goSumDBDataTileRecords(body); n != tile.W {
-				return fmt.Errorf("checksum database tile %s has %d records, want %d", path, n, tile.W)
-			}
 		}
 		return nil
 	}
-}
-
-// goSumDBDataTileRecords counts the records in a data tile. Each record ends
-// with a newline and a blank line separates it from the next; whether one
-// follows the last record differs between servers. Anything that does not end
-// with a newline counts as no records.
-func goSumDBDataTileRecords(body []byte) int {
-	text, ok := strings.CutSuffix(string(body), "\n")
-	if !ok || text == "" {
-		return 0
-	}
-	return strings.Count(text, "\n\n") + 1
 }
 
 // validGoSumDBLookup checks an escaped module@version the way the checksum

@@ -492,25 +492,6 @@ func TestGoSumDB_ShortcutNeedsOfflineMode(t *testing.T) {
 	}
 }
 
-func TestGoSumDBDataTileRecords(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want int
-	}{
-		{"sum.golang.org layout", dataTile(3), 3},
-		{"blank line after the last record", dataTile(3) + "\n", 3},
-		{"one record", dataTile(1), 1},
-		{"empty", "", 0},
-		{"no final newline", "<html>please log in</html>", 0},
-	}
-	for _, tt := range tests {
-		if got := goSumDBDataTileRecords([]byte(tt.body)); got != tt.want {
-			t.Errorf("%s: records = %d, want %d", tt.name, got, tt.want)
-		}
-	}
-}
-
 // TestGoSumDB_FreshTreeIsNotAnAnswer: a supported check answered from a
 // fresh cached tree did not reach the database, so it must not cancel a
 // failure that a lookup started earlier reports afterwards.
@@ -653,18 +634,14 @@ func TestGoSumDB_LookupCachedWithinTTL(t *testing.T) {
 
 func TestGoSumDB_CompleteTilesSkipRevalidation(t *testing.T) {
 	files := map[string]string{
-		"/tile/8/0/000":        hashTile(256, "a"),
-		"/tile/8/data/000":     dataTile(256),
-		"/tile/8/0/001.p/5":    hashTile(5, "b"),
-		"/tile/8/data/001.p/5": dataTile(5),
-		"/latest":              testSumDBTree,
+		"/tile/8/0/000":     hashTile(256, "a"),
+		"/tile/8/0/001.p/5": hashTile(5, "b"),
+		"/latest":           testSumDBTree,
 	}
 	wantRequests := map[string]int{
-		"/tile/8/0/000":        1,
-		"/tile/8/data/000":     1,
-		"/tile/8/0/001.p/5":    2,
-		"/tile/8/data/001.p/5": 2,
-		"/latest":              2,
+		"/tile/8/0/000":     1,
+		"/tile/8/0/001.p/5": 2,
+		"/latest":           2,
 	}
 	db := newFakeSumDB(t, files)
 	// Every cached entry is past its TTL by the second request.
@@ -685,25 +662,46 @@ func TestGoSumDB_CompleteTilesSkipRevalidation(t *testing.T) {
 	}
 }
 
+// TestGoSumDB_DataTilesAreNotStored: the go command never fetches data
+// tiles, and stored they would add up to the whole log.
+func TestGoSumDB_DataTilesAreNotStored(t *testing.T) {
+	files := map[string]string{
+		"/tile/8/data/000":     dataTile(256),
+		"/tile/8/data/001.p/5": dataTile(5),
+	}
+	db := newFakeSumDB(t, files)
+	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
+
+	for range 2 {
+		for path, want := range files {
+			w := serveGoRequest(h, "/sumdb/sum.example"+path)
+			if w.Code != http.StatusOK || w.Body.String() != want {
+				t.Fatalf("%s: status = %d, body length %d, want the %d-byte tile", path, w.Code, w.Body.Len(), len(want))
+			}
+		}
+	}
+	for path := range files {
+		if n := db.requests(path); n != 2 {
+			t.Errorf("%s: database requests = %d, want 2", path, n)
+		}
+		key := goSumDBCacheKey(testSumDBName, db.server.URL, strings.TrimPrefix(path, "/"))
+		if entry, _ := h.proxy.DB.GetMetadataCache(goEcosystem, key); entry != nil {
+			t.Errorf("%s: stored in the metadata cache", path)
+		}
+	}
+}
+
 // TestGoSumDB_BadTilesAreNotCached guards complete tiles, which are never
 // revalidated once cached: a response of the wrong size must not be stored.
 func TestGoSumDB_BadTilesAreNotCached(t *testing.T) {
 	const tile = "/tile/8/0/000"
 	db := newFakeSumDB(t, map[string]string{
-		tile:                   "<html>please log in</html>",
-		"/tile/8/data/000.p/3": "",
-		"/tile/8/data/000":     "<html>please log in</html>\n",
+		tile: "<html>please log in</html>",
 	})
 	h := newSumDBTestHandler(t, db.server.URL, true, time.Hour)
 
 	if w := serveGoRequest(h, "/sumdb/sum.example"+tile); w.Code != http.StatusBadGateway {
 		t.Fatalf("wrong-size tile: status = %d, want 502", w.Code)
-	}
-	if w := serveGoRequest(h, "/sumdb/sum.example/tile/8/data/000.p/3"); w.Code != http.StatusBadGateway {
-		t.Errorf("empty data tile: status = %d, want 502", w.Code)
-	}
-	if w := serveGoRequest(h, "/sumdb/sum.example/tile/8/data/000"); w.Code != http.StatusBadGateway {
-		t.Errorf("block page as a data tile: status = %d, want 502", w.Code)
 	}
 
 	want := hashTile(256, "a")
