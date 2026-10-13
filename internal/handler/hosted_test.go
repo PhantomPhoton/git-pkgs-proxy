@@ -368,3 +368,50 @@ func TestPushedArtifactIsNeverReplacedFromUpstream(t *testing.T) {
 		})
 	}
 }
+
+// zipWith builds a zip holding files in the given order.
+func zipWith(files ...[2]string) []byte {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, f := range files {
+		w, err := zw.Create(f[0])
+		must(err)
+		_, err = io.WriteString(w, f[1])
+		must(err)
+	}
+	must(zw.Close())
+	return buf.Bytes()
+}
+
+func TestComposerManifestLookup(t *testing.T) {
+	const monolog = `{"name":"monolog/monolog"}`
+	const fixture = `{"name":"acme/test-fixture"}`
+	tests := []struct {
+		name    string
+		archive []byte
+		wantErr error
+	}{
+		{name: "root manifest after a nested one",
+			archive: zipWith([2]string{"tests/composer.json", fixture}, [2]string{"composer.json", monolog})},
+		{name: "top directory manifest next to a deeper one",
+			archive: zipWith([2]string{"monolog-abc/tests/composer.json", fixture}, [2]string{"monolog-abc/composer.json", monolog})},
+		{name: "two top directories with manifests",
+			archive: zipWith([2]string{"tests/composer.json", fixture}, [2]string{"monolog-abc/composer.json", monolog}),
+			wantErr: ErrHostedInvalidArchive},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, err := HostedTargetFor("composer", "monolog/monolog", "3.5.0")
+			if err != nil {
+				t.Fatalf("HostedTargetFor: %v", err)
+			}
+			_, err = readHostedManifest("composer", bytes.NewReader(tt.archive), target)
+			if tt.wantErr == nil && err != nil {
+				t.Errorf("readHostedManifest error = %v, want the root or single top directory manifest", err)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("readHostedManifest error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}

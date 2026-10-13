@@ -89,25 +89,50 @@ func readComposerManifest(archive io.Reader, target HostedTarget) (json.RawMessa
 		return nil, fmt.Errorf("%w: %w", ErrHostedInvalidArchive, err)
 	}
 
-	for _, entry := range zr.File {
-		if entry.FileInfo().IsDir() || (entry.Name != "composer.json" && !isTopLevelManifest(entry.Name, "composer.json")) {
+	entry, err := composerManifestEntry(zr.File)
+	if err != nil {
+		return nil, err
+	}
+	rc, err := entry.Open()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrHostedInvalidArchive, err)
+	}
+	manifest, fields, err := decodeManifest(rc)
+	_ = rc.Close()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(fields.Name, target.Name) || (fields.Version != "" && fields.Version != target.Version) {
+		return nil, fmt.Errorf("%w: composer.json is %s %s", ErrHostedManifestMismatch, fields.Name, fields.Version)
+	}
+	return manifest, nil
+}
+
+// composerManifestEntry picks the package's composer.json: the one at the
+// root, or else the only one directly inside a top directory. Archives keep
+// other composer.json files for tests and examples, in any order, so the
+// first one found isn't necessarily the package's.
+func composerManifestEntry(files []*zip.File) (*zip.File, error) {
+	var topLevel []*zip.File
+	for _, entry := range files {
+		if entry.FileInfo().IsDir() {
 			continue
 		}
-		rc, err := entry.Open()
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrHostedInvalidArchive, err)
+		if entry.Name == "composer.json" {
+			return entry, nil
 		}
-		manifest, fields, err := decodeManifest(rc)
-		_ = rc.Close()
-		if err != nil {
-			return nil, err
+		if isTopLevelManifest(entry.Name, "composer.json") {
+			topLevel = append(topLevel, entry)
 		}
-		if !strings.EqualFold(fields.Name, target.Name) || (fields.Version != "" && fields.Version != target.Version) {
-			return nil, fmt.Errorf("%w: composer.json is %s %s", ErrHostedManifestMismatch, fields.Name, fields.Version)
-		}
-		return manifest, nil
 	}
-	return nil, fmt.Errorf("%w: no composer.json in zip", ErrHostedInvalidArchive)
+	switch len(topLevel) {
+	case 0:
+		return nil, fmt.Errorf("%w: no composer.json in zip", ErrHostedInvalidArchive)
+	case 1:
+		return topLevel[0], nil
+	default:
+		return nil, fmt.Errorf("%w: no composer.json at the root and %d in top directories", ErrHostedInvalidArchive, len(topLevel))
+	}
 }
 
 // isTopLevelManifest reports whether name is filename inside one top
