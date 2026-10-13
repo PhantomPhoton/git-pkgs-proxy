@@ -28,6 +28,23 @@ const (
 // and served without revalidation once fetched.
 var githubReleaseAssetPattern = regexp.MustCompile(`^([^/]+)/([^/]+)/releases/download/([^/]+)/([^/]+)$`)
 
+// builtinGenericArtifacts maps well-known download hosts to patterns for
+// their version-pinned paths. They apply to any generic upstream configured
+// with that base URL, after the upstream's own generic_artifacts.
+var builtinGenericArtifacts = map[string][]string{
+	// dist/{project dirs}/{version}/[binaries/]{file}, e.g. maven/maven-3 or maven/mvnd.
+	"https://archive.apache.org": {
+		`dist/(?P<name>.+?)/(?P<version>[0-9][^/]*)/(?:binaries/)?(?P<file>[^/]+)`,
+	},
+	"https://nodejs.org": {
+		`dist/(?P<version>v[0-9][^/]*)/(?P<file>[^/]+)`,
+	},
+	// The version is only in the filename: go1.23.2.linux-amd64.tar.gz.
+	"https://dl.google.com/go": {
+		`(?P<file>go(?P<version>[0-9][^/]*?)\.[a-z0-9]+-[a-z0-9]+\.(?:tar\.gz|zip)(?:\.sha256)?)`,
+	},
+}
+
 // GenericHandler proxies plain HTTP downloads from configured upstream base
 // URLs. Each configured upstream is mounted at /generic/{name}/ and the
 // remaining request path (and query string) is appended to the upstream URL.
@@ -38,7 +55,7 @@ var githubReleaseAssetPattern = regexp.MustCompile(`^([^/]+)/([^/]+)/releases/do
 // assets, and is pointed at by URL-rewriting settings on the client.
 //
 // Release-asset paths ({owner}/{repo}/releases/download/{tag}/{asset}), and
-// paths matching the upstream's configured artifact patterns, are
+// paths matching the upstream's built-in or configured artifact patterns, are
 // version-pinned and cached in the shared artifact cache, so they keep being
 // served when the upstream is unreachable. Every other path is served through
 // the metadata cache: fresh within the metadata TTL, revalidated with the
@@ -63,20 +80,28 @@ func NewGenericHandler(proxy *Proxy, repositories map[string]string, artifactPat
 	for name, upstreamURL := range repositories {
 		h.repositories[name] = strings.TrimSuffix(upstreamURL, "/")
 	}
+	// The first matching pattern wins, so configured patterns go first.
 	if len(artifactPatterns) > 0 {
 		for name, patterns := range artifactPatterns[0] {
-			for _, pattern := range patterns {
-				re, err := config.CompileGenericArtifactPattern(pattern)
-				if err != nil {
-					proxy.Logger.Warn("skipping generic artifact pattern",
-						"repository", name, "pattern", pattern, "error", err)
-					continue
-				}
-				h.artifactPatterns[name] = append(h.artifactPatterns[name], re)
-			}
+			h.addArtifactPatterns(name, patterns)
 		}
 	}
+	for name, upstreamURL := range h.repositories {
+		h.addArtifactPatterns(name, builtinGenericArtifacts[upstreamURL])
+	}
 	return h
+}
+
+func (h *GenericHandler) addArtifactPatterns(name string, patterns []string) {
+	for _, pattern := range patterns {
+		re, err := config.CompileGenericArtifactPattern(pattern)
+		if err != nil {
+			h.proxy.Logger.Warn("skipping generic artifact pattern",
+				"repository", name, "pattern", pattern, "error", err)
+			continue
+		}
+		h.artifactPatterns[name] = append(h.artifactPatterns[name], re)
+	}
 }
 
 // Routes returns the HTTP handler for generic download requests.

@@ -105,6 +105,58 @@ func TestMatchArtifactPattern(t *testing.T) {
 	}
 }
 
+func TestGenericHandler_BuiltinArtifactPatterns(t *testing.T) {
+	h := NewGenericHandler(testProxy(), map[string]string{
+		"apache": "https://archive.apache.org/",
+		"node":   "https://nodejs.org",
+		"golang": "https://dl.google.com/go",
+		"mirror": "https://mirror.example.com",
+	}, map[string][]string{
+		"apache": {`extra/(?P<version>[^/]+)/(?P<file>[^/]+)`, testMavenPattern},
+	})
+
+	tests := []struct {
+		repository string
+		path       string
+		want       genericArtifact
+		ok         bool
+	}{
+		// The configured testMavenPattern overlaps the built-in and takes precedence.
+		{"apache", "dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz",
+			genericArtifact{name: "maven", version: "3.9.9", filename: "apache-maven-3.9.9-bin.tar.gz"}, true},
+		{"apache", "dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz.sha512",
+			genericArtifact{name: "maven", version: "3.9.9", filename: "apache-maven-3.9.9-bin.tar.gz.sha512"}, true},
+		{"apache", "dist/maven/maven-4/4.0.0/binaries/apache-maven-4.0.0-bin.tar.gz",
+			genericArtifact{name: "maven/maven-4", version: "4.0.0", filename: "apache-maven-4.0.0-bin.tar.gz"}, true},
+		{"apache", "dist/maven/mvnd/1.0.6/maven-mvnd-1.0.6-linux-amd64.tar.gz",
+			genericArtifact{name: "maven/mvnd", version: "1.0.6", filename: "maven-mvnd-1.0.6-linux-amd64.tar.gz"}, true},
+		{"apache", "dist/maven/maven-3/", genericArtifact{}, false},
+		{"apache", "dist/maven/maven-3/3.9.9/source/apache-maven-3.9.9-src.tar.gz", genericArtifact{}, false},
+		{"apache", "extra/1.0/file.txt", genericArtifact{name: "apache", version: "1.0", filename: "file.txt"}, true},
+		{"node", "dist/v22.11.0/node-v22.11.0-linux-x64.tar.gz",
+			genericArtifact{name: "node", version: "v22.11.0", filename: "node-v22.11.0-linux-x64.tar.gz"}, true},
+		{"node", "dist/v22.11.0/SHASUMS256.txt",
+			genericArtifact{name: "node", version: "v22.11.0", filename: "SHASUMS256.txt"}, true},
+		{"node", "dist/index.json", genericArtifact{}, false},
+		{"golang", "go1.23.2.linux-amd64.tar.gz",
+			genericArtifact{name: "golang", version: "1.23.2", filename: "go1.23.2.linux-amd64.tar.gz"}, true},
+		{"golang", "go1.23.2.darwin-arm64.tar.gz.sha256",
+			genericArtifact{name: "golang", version: "1.23.2", filename: "go1.23.2.darwin-arm64.tar.gz.sha256"}, true},
+		{"golang", "go1.24rc1.windows-amd64.zip",
+			genericArtifact{name: "golang", version: "1.24rc1", filename: "go1.24rc1.windows-amd64.zip"}, true},
+		{"mirror", "dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz", genericArtifact{}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.repository+"/"+tt.path, func(t *testing.T) {
+			got, ok := h.parseArtifact(tt.repository, tt.path)
+			if ok != tt.ok || got != tt.want {
+				t.Errorf("parseArtifact(%q, %q) = (%+v, %v), want (%+v, %v)", tt.repository, tt.path, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
 func TestGenericHandler_ArtifactPatternIsCachedAndOtherPathsAreNot(t *testing.T) {
 	const (
 		artifactPath = "/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz"

@@ -361,8 +361,18 @@ version-pinned GitHub release assets: they are stored in the artifact cache
 and served from it without revalidation, including while the upstream is
 down.
 
+Upstreams pointed at these hosts get version-pinned paths built in, whatever
+the upstream is named:
+
+| Upstream URL | Cached as artifacts | Package name |
+|---|---|---|
+| `https://archive.apache.org` | `dist/{project dirs}/{version}/[binaries/]{file}`, where `{version}` starts with a digit | the project dirs, e.g. `maven/maven-3`, `maven/mvnd` |
+| `https://nodejs.org` | `dist/v{version}/{file}` | the upstream name |
+| `https://dl.google.com/go` | `go{version}.{os}-{arch}.tar.gz`, `.zip` and their `.sha256` | the upstream name |
+
 Other upstreams can declare their own version-pinned paths in
-`generic_artifacts`. Each pattern is a regular expression that must match the
+`generic_artifacts`. These are tried before any built-in ones, so a configured
+pattern that overlaps a built-in decides the package name. Each pattern is a regular expression that must match the
 whole path after `/generic/{name}/`, with `version` and `file` named groups
 (single path segments) and an optional `name` group for the package name,
 which otherwise is the upstream name. Matching downloads are cached like
@@ -371,10 +381,10 @@ release assets and listed under the `generic` ecosystem:
 ```yaml
 upstream:
   generic:
-    apache: "https://archive.apache.org"
+    eclipse: "https://download.eclipse.org"
   generic_artifacts:
-    apache:
-      - 'dist/(?P<name>maven)/maven-3/(?P<version>[^/]+)/binaries/(?P<file>[^/]+)'
+    eclipse:
+      - 'jdtls/milestones/(?P<version>[^/]+)/(?P<file>[^/]+)'
 ```
 
 Only list paths whose content never changes for a given version: a match is
