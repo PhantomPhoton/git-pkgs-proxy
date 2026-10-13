@@ -184,7 +184,8 @@ func (g *Group) evaluate(scanCtx context.Context, req Request, e entry) (finding
 			// timed out or failed on its own.
 			errType = "cancelled"
 		}
-		metrics.RecordScanError(req.Ecosystem, e.scanner.Name(), errType)
+		metrics.RecordScanError(req.Ecosystem, e.scanner.Name(), errType, metrics.FailureDetail{
+			PURL: req.PURL, Filename: req.Filename, Err: err})
 
 		if errType == "cancelled" {
 			// Another scanner already decided the verdict and cancelled

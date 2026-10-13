@@ -169,9 +169,9 @@ func (c *healthCache) Check() error {
 	if err != nil {
 		var pe *probeError
 		if errors.As(err, &pe) {
-			metrics.RecordHealthProbeFailure(pe.step)
+			metrics.RecordHealthProbeFailure(pe.step, metrics.FailureDetail{Err: pe.err})
 		} else {
-			metrics.RecordHealthProbeFailure("unknown")
+			metrics.RecordHealthProbeFailure("unknown", metrics.FailureDetail{Err: err})
 		}
 	}
 

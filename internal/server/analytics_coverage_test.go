@@ -54,6 +54,7 @@ var metricSurface = map[string]string{
 // on the analytics page. The page is meant to be a complete view of what
 // /metrics exposes, so a silently unsurfaced metric is a gap, not a detail.
 func TestEveryMetricIsSurfaced(t *testing.T) {
+	isolateRecentFailures(t)
 	// Touch every metric family so it is present in the registry output, since
 	// a vector with no observed label values gathers as nothing at all.
 	metrics.RecordRequest("npm", 200, 0)
@@ -61,15 +62,15 @@ func TestEveryMetricIsSurfaced(t *testing.T) {
 	metrics.RecordCacheHit("npm")
 	metrics.RecordCacheMiss("npm")
 	metrics.RecordUpstreamFetch("npm", 0)
-	metrics.RecordUpstreamError("npm", "fetch_failed")
+	metrics.RecordUpstreamError("npm", "fetch_failed", metrics.FailureDetail{})
 	metrics.RecordStorageOperation("get", 0)
-	metrics.RecordStorageError("get")
-	metrics.RecordIntegrityFailure("npm")
-	metrics.RecordHealthProbeFailure("write")
+	metrics.RecordStorageError("get", metrics.FailureDetail{})
+	metrics.RecordIntegrityFailure("npm", metrics.FailureDetail{})
+	metrics.RecordHealthProbeFailure("write", metrics.FailureDetail{})
 	metrics.UpdateCircuitBreakerState("example.test", 0)
 	metrics.RecordCircuitBreakerTrip("example.test")
 	metrics.RecordScanResult("npm", "clamav", false, 0)
-	metrics.RecordScanError("npm", "clamav", "timeout")
+	metrics.RecordScanError("npm", "clamav", "timeout", metrics.FailureDetail{})
 	metrics.UpdateCacheStats(1, 1)
 	metrics.RecordArtifactEvicted("retention", "npm")
 	metrics.UpdateEcosystemStats([]metrics.EcosystemStats{{Ecosystem: "npm", DownloadedBytes: 1}})

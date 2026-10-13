@@ -1336,6 +1336,14 @@ Set `ui_request_sources: true` and both appear on `/ui/analytics` under **Runtim
 
 **Why addresses are not Prometheus labels.** Client tool names are exported as `proxy_client_requests_total{client}` because they come from a closed set. Addresses are not exported at all: the caller set is unbounded and outside the proxy's control, and every new address would create a time series that lives forever in your TSDB. The same goes for anything job-scoped -- a pipeline ID must never become a label. Per-address and per-request detail belongs in the access log, which records `remote_ip`, `user_agent`, `client`, `ecosystem` and `bytes` on every line as JSONL, ready for `jq`, Loki or whatever you ship logs to.
 
+### Failure details
+
+The failure counts under **Runtime** on `/ui/analytics` -- upstream errors, storage errors, integrity failures, health probe failures and scan errors -- say how often something failed, not what. Set `ui_failure_details: true` and each count gets a **Latest** list underneath it, newest first: the package URL and filename, the upstream URL or storage path, the error, and how long ago it happened.
+
+The list keeps the last 20 failures per row, in memory only, so it starts empty when the proxy starts, like the counts above it. Credentials, query strings and fragments are stripped from every URL before it is kept, including URLs inside error messages, since that is where registry tokens and signed-URL signatures live.
+
+The flag defaults to off for the same reason as `ui_request_sources`: package names and upstream hosts say what your users depend on, and `/ui` is not authenticated. Package names and URLs are never Prometheus labels; the same detail is in the proxy's log.
+
 ### Grafana dashboard
 
 A ready-made dashboard lives at [`deploy/grafana/git-pkgs-proxy.json`](deploy/grafana/git-pkgs-proxy.json). Import it via **Dashboards -> New -> Import** and pick your Prometheus data source when prompted; it has no hardcoded data source UID.
