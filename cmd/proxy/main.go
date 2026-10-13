@@ -22,6 +22,9 @@
 //	serve    Start the proxy server (default if no command given)
 //	stats    Show cache statistics
 //	mirror   Pre-populate cache from PURLs, SBOMs, or registries
+//	push     Push a package archive to a running proxy (needs hosted.enabled)
+//	list     List package archives pushed to a running proxy
+//	delete   Delete a pushed version from a running proxy
 //
 // Serve Flags:
 //
@@ -87,6 +90,10 @@
 //	PROXY_GRADLE_BUILD_CACHE_MAX_SIZE        - Gradle cache max total size
 //	PROXY_GRADLE_BUILD_CACHE_SWEEP_INTERVAL  - Gradle cache eviction sweep interval
 //	PROXY_HEALTH_STORAGE_PROBE_INTERVAL      - Storage health probe cache interval (default "30s")
+//	PROXY_HOSTED_ENABLED                     - Enable pushing packages to /api/hosted
+//	PROXY_HOSTED_TOKEN                       - Bearer token for pushing and deleting
+//	PROXY_HOSTED_MAX_UPLOAD_SIZE             - Max size of one pushed archive (default "100MB")
+//	PROXY_URL                                - Proxy URL for push, list and delete
 //
 // Example:
 //
@@ -159,6 +166,18 @@ func main() {
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 			runMirror()
 			return
+		case "push":
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+			runHostedCommand(runPush)
+			return
+		case "list":
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+			runHostedCommand(runList)
+			return
+		case "delete":
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+			runHostedCommand(runDelete)
+			return
 		case "-version", "--version":
 			fmt.Printf("proxy %s (%s)\n", Version, Commit)
 			os.Exit(0)
@@ -181,6 +200,9 @@ Commands:
   serve    Start the proxy server (default)
   stats    Show cache statistics
   mirror   Pre-populate cache from PURLs, SBOMs, or registries
+  push     Push a package archive to a running proxy
+  list     List package archives pushed to a running proxy
+  delete   Delete a pushed version from a running proxy
 
 Run 'proxy <command> -help' for more information on a command.
 
