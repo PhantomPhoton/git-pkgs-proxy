@@ -313,3 +313,58 @@ func TestPushLocalArtifactChecksManifest(t *testing.T) {
 		})
 	}
 }
+
+// removeStored deletes the stored object of an artifact behind the cache's back.
+func removeStored(t *testing.T, proxy *Proxy, versionPURL, filename string) {
+	t.Helper()
+	record, err := proxy.DB.GetArtifact(versionPURL, filename)
+	if err != nil || record == nil {
+		t.Fatalf("GetArtifact: %+v, %v", record, err)
+	}
+	if err := proxy.Storage.Delete(context.Background(), record.StoragePath.String); err != nil {
+		t.Fatalf("deleting stored object: %v", err)
+	}
+}
+
+func TestPushedArtifactIsNeverReplacedFromUpstream(t *testing.T) {
+	const versionPURL, filename = "pkg:npm/request@2.88.3", "request-2.88.3.tgz"
+	tests := []struct {
+		name    string
+		damage  func(t *testing.T, proxy *Proxy)
+		wantErr error
+	}{
+		{name: "stored object missing", wantErr: ErrHostedArtifactUnavailable,
+			damage: func(t *testing.T, proxy *Proxy) { removeStored(t, proxy, versionPURL, filename) }},
+		{name: "record cleared after an integrity failure", wantErr: ErrHostedArtifactMissing,
+			damage: func(t *testing.T, proxy *Proxy) {
+				record, err := proxy.DB.GetArtifact(versionPURL, filename)
+				if err != nil || record == nil {
+					t.Fatalf("GetArtifact: %+v, %v", record, err)
+				}
+				if err := proxy.DB.DiscardArtifact(versionPURL, filename, record.StoragePath.String); err != nil {
+					t.Fatalf("DiscardArtifact: %v", err)
+				}
+			}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, db, _, fetcher := setupTestProxy(t)
+			fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader("upstream tarball")), ContentType: "application/gzip"}
+			pushRequest(t, proxy)
+			tt.damage(t, proxy)
+
+			_, err := proxy.GetOrFetchArtifactFromURL(context.Background(), "npm", "request", "2.88.3", filename,
+				"https://registry.npmjs.org/request/-/request-2.88.3.tgz")
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("GetOrFetchArtifactFromURL error = %v, want %v", err, tt.wantErr)
+			}
+			if fetcher.fetchCalled {
+				t.Error("a miss on a pushed artifact fetched the upstream copy")
+			}
+			local, err := db.GetLocalArtifacts("pkg:npm/request")
+			if err != nil || len(local) != 1 || !local[0].Manifest.Valid {
+				t.Errorf("pushed records after the miss = %+v, %v, want the pushed one with its manifest", local, err)
+			}
+		})
+	}
+}

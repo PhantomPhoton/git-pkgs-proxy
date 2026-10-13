@@ -817,8 +817,7 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// it too, even when the upstream published the same version recently.
 	local, err := h.proxy.GetLocalArtifact(r.Context(), "npm", packageName, version, filename)
 	if err != nil {
-		h.proxy.Logger.Error("failed to read pushed npm tarball", "error", err)
-		JSONError(w, http.StatusInternalServerError, "failed to read pushed package")
+		h.proxy.serveArtifactError(w, err, "failed to read pushed package")
 		return
 	}
 	if local != nil {

@@ -347,7 +347,36 @@ func (p *Proxy) ClearCachedArtifact(ecosystem, name, version, filename string) e
 // checkCache looks up an artifact in the cache. Returns nil if not cached.
 // With StreamArtifacts set it always reports a miss, so entries stored before the
 // mode was enabled are never served.
+//
+// A miss on a pushed artifact is an error rather than a miss: the caller would
+// otherwise fetch the upstream copy and replace the pushed one with it.
 func (p *Proxy) checkCache(ctx context.Context, pkgPURL, versionPURL, filename string) (*CacheResult, error) {
+	result, err := p.lookupCache(ctx, pkgPURL, versionPURL, filename)
+	if err != nil || result != nil || p.StreamArtifacts {
+		return result, err
+	}
+	return nil, p.localArtifactMiss(versionPURL, filename)
+}
+
+// localArtifactMiss returns ErrHostedArtifactUnavailable when the artifact
+// was pushed and is stored but couldn't be served, ErrHostedArtifactMissing
+// when it was pushed and its stored object is gone, and nil otherwise.
+func (p *Proxy) localArtifactMiss(versionPURL, filename string) error {
+	record, err := p.DB.GetArtifact(versionPURL, filename)
+	if err != nil {
+		return fmt.Errorf("checking artifact source: %w", err)
+	}
+	if record == nil || record.Source != database.SourceLocal {
+		return nil
+	}
+	if record.StoragePath.Valid {
+		return fmt.Errorf("%w: %s %s", ErrHostedArtifactUnavailable, versionPURL, filename)
+	}
+	return fmt.Errorf("%w: %s %s", ErrHostedArtifactMissing, versionPURL, filename)
+}
+
+// lookupCache looks up an artifact in the cache. Returns nil if not cached.
+func (p *Proxy) lookupCache(ctx context.Context, pkgPURL, versionPURL, filename string) (*CacheResult, error) {
 	if p.Denylist.Denied(versionPURL) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
 	}
@@ -1142,6 +1171,15 @@ func (p *Proxy) serveArtifactError(w http.ResponseWriter, err error, clientMsg s
 	}
 	if errors.Is(err, ErrArtifactBlocked) || errors.Is(err, ErrVersionDenied) {
 		JSONError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if errors.Is(err, ErrHostedArtifactMissing) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, ErrHostedArtifactUnavailable) {
+		p.Logger.Error("failed to read pushed artifact", "error", err)
+		http.Error(w, "pushed package is temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	p.Logger.Error("failed to get artifact", "error", err)

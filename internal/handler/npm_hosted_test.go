@@ -293,3 +293,13 @@ func TestNPMHostedOnlyScopeNeverAsksUpstream(t *testing.T) {
 		t.Errorf("package outside the scope status = %d after %d upstream requests, want it fetched upstream", rec.Code, *f.upstreamRequests)
 	}
 }
+
+func TestNPMDownloadOfUnreadablePushedTarball(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	f.push(t, "request", "2.88.3", `{"name":"request","version":"2.88.3"}`)
+	removeStored(t, f.proxy, "pkg:npm/request@2.88.3", "request-2.88.3.tgz")
+
+	if rec := f.get(t, "/request/-/request-2.88.3.tgz"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("download status = %d, body %s, want 503 rather than the upstream tarball", rec.Code, rec.Body)
+	}
+}

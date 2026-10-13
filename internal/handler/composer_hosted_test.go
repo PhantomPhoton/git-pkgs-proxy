@@ -199,3 +199,15 @@ func TestComposerHostedOnlyVendorNeverAsksUpstream(t *testing.T) {
 		t.Error("package outside the vendor was not fetched upstream")
 	}
 }
+
+func TestComposerDownloadOfUnreadablePushedArchive(t *testing.T) {
+	f := newComposerHostedFixture(t, map[string]string{"/p2/monolog/monolog.json": monologMetadata})
+	f.push(t, "monolog/monolog", "3.5.0", `{"name":"monolog/monolog"}`)
+	removeStored(t, f.proxy, "pkg:composer/monolog/monolog@3.5.0", "monolog-3.5.0.zip")
+
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/monolog/monolog/3.5.0/monolog-3.5.0.zip", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("download status = %d, body %s, want 503 rather than the upstream archive", rec.Code, rec.Body)
+	}
+}

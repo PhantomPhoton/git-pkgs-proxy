@@ -23,6 +23,12 @@ var (
 	ErrHostedUnsupported     = errors.New("pushing packages is not supported for this ecosystem")
 	ErrHostedInvalidName     = errors.New("invalid package name or version")
 	ErrHostedVersionNotFound = errors.New("no pushed artifacts for this version")
+
+	// ErrHostedArtifactUnavailable and ErrHostedArtifactMissing report a
+	// pushed artifact the cache can't serve. They stop the caller from
+	// fetching the upstream copy, which would replace the pushed one.
+	ErrHostedArtifactUnavailable = errors.New("pushed artifact is stored but can't be read")
+	ErrHostedArtifactMissing     = errors.New("pushed artifact is no longer stored")
 )
 
 // HostedTarget is where a pushed archive is stored: the package name and
