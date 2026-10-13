@@ -5,10 +5,10 @@ import "fmt"
 const defaultHostedMaxUploadSize = "100MB"
 
 // HostedConfig configures packages pushed to the proxy through the
-// /api/packages endpoints. Pushed versions are served in place of upstream
+// /api/hosted endpoints. Pushed versions are served in place of upstream
 // versions with the same number, so writes always require a token.
 type HostedConfig struct {
-	// Enabled registers the /api/packages endpoints. Off by default.
+	// Enabled registers the /api/hosted endpoints. Off by default.
 	Enabled bool `json:"enabled" yaml:"enabled"`
 
 	// Token is the bearer token required to push and delete packages.

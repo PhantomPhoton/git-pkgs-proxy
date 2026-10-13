@@ -190,7 +190,7 @@ type Config struct {
 	// Disabled by default to prevent unauthenticated users from triggering downloads.
 	MirrorAPI bool `json:"mirror_api" yaml:"mirror_api"`
 
-	// Hosted configures pushing packages to the proxy (/api/packages).
+	// Hosted configures pushing packages to the proxy (/api/hosted).
 	Hosted HostedConfig `json:"hosted" yaml:"hosted"`
 
 	// Gradle configures Gradle HttpBuildCache behavior.

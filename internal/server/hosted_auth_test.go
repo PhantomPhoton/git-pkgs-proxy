@@ -29,7 +29,7 @@ func TestRequireBearerToken(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPut, "/api/packages/npm/request/2.88.3", nil)
+			req := httptest.NewRequest(http.MethodPut, "/api/hosted/npm/request/2.88.3", nil)
 			if tt.authorization != "" {
 				req.Header.Set("Authorization", tt.authorization)
 			}
