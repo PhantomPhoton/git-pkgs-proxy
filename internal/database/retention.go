@@ -36,6 +36,7 @@ func (c RetentionCandidate) ExpiredBefore(cutoff time.Time) bool {
 // accessed since. It takes the cutoff twice.
 const expiredCondition = `
 	storage_path IS NOT NULL
+	AND source <> 'local'
 	AND fetched_at < ?
 	AND (last_accessed_at IS NULL OR last_accessed_at < ?)`
 

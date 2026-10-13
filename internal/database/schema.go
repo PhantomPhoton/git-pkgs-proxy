@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	hit_count INTEGER DEFAULT 0,
 	last_accessed_at DATETIME,
 	created_at DATETIME,
-	updated_at DATETIME
+	updated_at DATETIME,
+	source TEXT NOT NULL DEFAULT 'upstream'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -190,7 +191,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	hit_count BIGINT DEFAULT 0,
 	last_accessed_at TIMESTAMP,
 	created_at TIMESTAMP,
-	updated_at TIMESTAMP
+	updated_at TIMESTAMP,
+	source TEXT NOT NULL DEFAULT 'upstream'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -267,7 +269,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	hit_count INTEGER DEFAULT 0,
 	last_accessed_at DATETIME,
 	created_at DATETIME,
-	updated_at DATETIME
+	updated_at DATETIME,
+	source TEXT NOT NULL DEFAULT 'upstream'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -288,7 +291,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	hit_count BIGINT DEFAULT 0,
 	last_accessed_at TIMESTAMP,
 	created_at TIMESTAMP,
-	updated_at TIMESTAMP
+	updated_at TIMESTAMP,
+	source TEXT NOT NULL DEFAULT 'upstream'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
@@ -401,6 +405,7 @@ var migrations = []migration{
 	{"009_add_pending_deletes", migrateAddPendingDeletes},
 	{"010_add_pending_deletes_queued_at_index", migrateAddPendingDeletesQueuedAtIndex},
 	{"011_add_metadata_dates", migrateAddMetadataDates},
+	{"012_add_artifact_source", migrateAddArtifactSource},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -775,6 +780,22 @@ func (db *DB) EnsureMetadataCacheTable() error {
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("creating metadata_cache table: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactSource records whether an artifact is a cached copy of an
+// upstream registry or was pushed to the proxy. Existing rows are all upstream.
+func migrateAddArtifactSource(db *DB) error {
+	hasCol, err := db.HasColumn("artifacts", "source")
+	if err != nil {
+		return fmt.Errorf("checking column source: %w", err)
+	}
+	if hasCol {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE artifacts ADD COLUMN source TEXT NOT NULL DEFAULT 'upstream'`); err != nil {
+		return fmt.Errorf("adding column source to artifacts: %w", err)
 	}
 	return nil
 }
