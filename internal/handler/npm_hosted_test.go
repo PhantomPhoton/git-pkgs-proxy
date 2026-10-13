@@ -303,3 +303,18 @@ func TestNPMDownloadOfUnreadablePushedTarball(t *testing.T) {
 		t.Errorf("download status = %d, body %s, want 503 rather than the upstream tarball", rec.Code, rec.Body)
 	}
 }
+
+func TestNPMMetadataLeavesOutDeniedPushedVersions(t *testing.T) {
+	f := newNPMHostedFixture(t, nil)
+	f.push(t, "@acme/private", "1.0.0", `{"name":"@acme/private","version":"1.0.0"}`)
+	f.push(t, "@acme/private", "1.1.0", `{"name":"@acme/private","version":"1.1.0"}`)
+	setTestDenylist(t, f.proxy, "pkg:npm/@acme/private@1.1.0")
+
+	doc := decodePackument(t, f.get(t, "/@acme/private"))
+	if _, ok := doc.Versions["1.1.0"]; ok || len(doc.Versions) != 1 {
+		t.Errorf("versions = %v, want the denied 1.1.0 left out", doc.Versions)
+	}
+	if doc.DistTags["latest"] != "1.0.0" {
+		t.Errorf("dist-tags.latest = %q, want 1.0.0", doc.DistTags["latest"])
+	}
+}

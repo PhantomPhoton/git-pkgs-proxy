@@ -211,3 +211,13 @@ func TestComposerDownloadOfUnreadablePushedArchive(t *testing.T) {
 		t.Errorf("download status = %d, body %s, want 503 rather than the upstream archive", rec.Code, rec.Body)
 	}
 }
+
+func TestComposerMetadataLeavesOutDeniedPushedVersions(t *testing.T) {
+	f := newComposerHostedFixture(t, map[string]string{"/p2/monolog/monolog.json": monologMetadata})
+	f.push(t, "monolog/monolog", "3.6.0", `{"name":"monolog/monolog"}`)
+	setTestDenylist(t, f.proxy, "pkg:composer/monolog/monolog@3.6.0")
+
+	if _, ok := f.versions(t, "/p2/monolog/monolog.json", "monolog/monolog")["3.6.0"]; ok {
+		t.Error("denied pushed version listed")
+	}
+}

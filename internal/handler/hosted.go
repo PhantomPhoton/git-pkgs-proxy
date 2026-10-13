@@ -293,6 +293,8 @@ type localVersion struct {
 
 // localVersions returns the versions pushed for a package, or nil when hosted
 // packages are disabled, so metadata requests cost no extra lookup then.
+// Denied versions are left out, so metadata never lists a version whose
+// download is refused.
 func (p *Proxy) localVersions(ecosystem, name string) ([]localVersion, error) {
 	if !p.HostedEnabled {
 		return nil, nil
@@ -307,11 +309,12 @@ func (p *Proxy) localVersions(ecosystem, name string) ([]localVersion, error) {
 	}
 	versions := make([]localVersion, 0, len(rows))
 	for _, row := range rows {
-		if !row.Manifest.Valid {
+		version := database.VersionFromPURL(row.VersionPURL)
+		if !row.Manifest.Valid || p.versionDenied(ecosystem, name, version) {
 			continue
 		}
 		versions = append(versions, localVersion{
-			Version:   database.VersionFromPURL(row.VersionPURL),
+			Version:   version,
 			Filename:  row.Filename,
 			SHA256:    row.ContentHash.String,
 			Integrity: row.Integrity.String,
