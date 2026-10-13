@@ -1005,7 +1005,7 @@ hosted:
 
 ### Pushing a patched package
 
-1. Build the archive with the original package name inside it, e.g. `request-2.88.3.tgz`.
+1. Build the archive with the original package name and the version you push in its manifest (`package.json` or `composer.json`), e.g. `request-2.88.3.tgz`.
 2. Push it:
 
    ```bash
@@ -1021,8 +1021,9 @@ hosted:
      https://proxy.example.com/api/hosted/npm/request/2.88.3
    ```
 
-3. Check what is pushed: `proxy list npm request` or `GET /api/hosted/npm/request`.
-4. Remove it again: `proxy delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
+3. Install it as usual, e.g. `npm install request@2.88.3`. The version is listed in the package metadata, so ranges like `^2.88.0` resolve to it too.
+4. Check what is pushed: `proxy list npm request` or `GET /api/hosted/npm/request`.
+5. Remove it again: `proxy delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
 
 ### Supported ecosystems
 
@@ -1034,6 +1035,20 @@ Download handlers look archives up by the filename clients request, so a push is
 | `composer` | `{vendor}/{package}` | `{package}-{version}.zip` |
 
 Other ecosystems are not supported yet.
+
+The archive must contain the package manifest: `package.json` in the top directory of an npm tarball, or `composer.json` at the root or in the single top directory of a Composer zip. Its name, and its version when it has one, must match the push. Otherwise the push is refused with 400.
+
+### Package metadata
+
+Pushed versions are listed in the package metadata clients resolve against, with the dependencies from their manifest:
+
+- A pushed version takes the place of an upstream version with the same number.
+- Pushed versions are added next to the upstream ones and are never held back by cooldown. npm `dist-tags` stay as the upstream has them.
+- A package the upstream doesn't know is served from its pushed versions alone. Its npm `latest` tag is the highest pushed version.
+- Pushed Composer dev versions (`dev-*`, `*-dev`) are listed in the `~dev` metadata file.
+- npm entries carry the archive's sha512 as `dist.integrity`. Composer entries carry its sha256 as `dist.reference` and leave `shasum` empty.
+
+Metadata of packages with pushed versions is rewritten on every request instead of being cached, so a push or delete shows up on the next request.
 
 ### Storage and eviction
 
