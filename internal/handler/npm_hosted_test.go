@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/git-pkgs/cooldown"
 )
 
 const requestPackument = `{
@@ -217,5 +219,39 @@ func TestNPMMetadataIgnoresPushesWhenHostedDisabled(t *testing.T) {
 
 	if _, ok := decodePackument(t, f.get(t, "/request")).Versions["2.88.4"]; ok {
 		t.Error("pushed version listed with hosted packages disabled")
+	}
+}
+
+func TestNPMDownloadOfPushedPackageWithCooldown(t *testing.T) {
+	f := newNPMHostedFixture(t, nil)
+	f.proxy.Cooldown = &cooldown.Config{Default: "7d"}
+	f.push(t, "@acme/private", "1.0.0", `{"name":"@acme/private","version":"1.0.0"}`)
+
+	rec := f.get(t, "/@acme/private/-/private-1.0.0.tgz")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("download status = %d, body %s, want the pushed tarball", rec.Code, rec.Body)
+	}
+	if _, ok := decodePackument(t, f.get(t, "/@acme/private")).Versions["1.0.0"]; !ok {
+		t.Error("pushed version missing from the packument with cooldown enabled")
+	}
+}
+
+func TestNPMDownloadOfPushedOverrideOfVersionInCooldown(t *testing.T) {
+	recent := time.Now().Add(-time.Hour).Format(time.RFC3339)
+	packument := `{"name":"request","dist-tags":{"latest":"2.88.2"},
+		"versions":{
+			"2.88.2":{"name":"request","version":"2.88.2","dist":{"tarball":"https://registry.npmjs.org/request/-/request-2.88.2.tgz"}},
+			"2.88.3":{"name":"request","version":"2.88.3","dist":{"tarball":"https://registry.npmjs.org/request/-/request-2.88.3.tgz"}}},
+		"time":{"2.88.2":"2020-02-11T00:00:00Z","2.88.3":"` + recent + `"}}`
+	f := newNPMHostedFixture(t, map[string]string{"/request": packument})
+	f.proxy.Cooldown = &cooldown.Config{Default: "7d"}
+	f.push(t, "request", "2.88.3", `{"name":"request","version":"2.88.3"}`)
+
+	if _, ok := decodePackument(t, f.get(t, "/request")).Versions["2.88.3"]; !ok {
+		t.Fatal("pushed version missing from the packument")
+	}
+	rec := f.get(t, "/request/-/request-2.88.3.tgz")
+	if rec.Code != http.StatusOK || rec.Body.String() != string(npmTarball(`{"name":"request","version":"2.88.3"}`)) {
+		t.Errorf("download status = %d, want 200 and the pushed tarball: the packument lists it, so the download must not be withheld", rec.Code)
 	}
 }

@@ -826,6 +826,18 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		JSONError(w, http.StatusForbidden, ErrVersionDenied.Error()+": "+canonicalVersionPURL("npm", packageName, version))
 		return
 	}
+	// Pushed versions are listed without cooldown, so they are served without
+	// it too, even when the upstream published the same version recently.
+	local, err := h.proxy.GetLocalArtifact(r.Context(), "npm", packageName, version, filename)
+	if err != nil {
+		h.proxy.Logger.Error("failed to read pushed npm tarball", "error", err)
+		JSONError(w, http.StatusInternalServerError, "failed to read pushed package")
+		return
+	}
+	if local != nil {
+		ServeArtifactRequest(w, r, local)
+		return
+	}
 	registryURL, cacheKey := h.sourceFor(packageName)
 	metadata := sync.OnceValues(func() ([]byte, error) {
 		upstreamURL := registryURL + "/" + url.PathEscape(packageName)
