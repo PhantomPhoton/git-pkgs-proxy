@@ -273,3 +273,25 @@ func TestMigrationAddsArtifactManifest(t *testing.T) {
 		t.Errorf("artifacts.manifest after migration = %v, %v", has, err)
 	}
 }
+
+func TestUpsertPackageKeepsSource(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		pkg := &Package{PURL: "pkg:npm/request", Ecosystem: "npm", Name: "request"}
+		if err := db.UpsertPackage(pkg); err != nil {
+			t.Fatalf("UpsertPackage: %v", err)
+		}
+		if _, err := db.Exec(db.Rebind(`UPDATE packages SET source = ? WHERE purl = ?`), "deps.dev", pkg.PURL); err != nil {
+			t.Fatalf("setting source: %v", err)
+		}
+		if err := db.UpsertPackage(pkg); err != nil {
+			t.Fatalf("second UpsertPackage: %v", err)
+		}
+		got, err := db.GetPackageByPURL(pkg.PURL)
+		if err != nil || got == nil {
+			t.Fatalf("GetPackageByPURL: %+v, %v", got, err)
+		}
+		if got.Source.String != "deps.dev" {
+			t.Errorf("source after upsert = %q, want deps.dev", got.Source.String)
+		}
+	})
+}

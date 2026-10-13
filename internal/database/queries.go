@@ -70,8 +70,7 @@ func (db *DB) UpsertPackage(pkg *Package) error {
 				repository_url = EXCLUDED.repository_url,
 				registry_url = EXCLUDED.registry_url,
 				enriched_at = EXCLUDED.enriched_at,
-				updated_at = EXCLUDED.updated_at,
-				source = EXCLUDED.source
+				updated_at = EXCLUDED.updated_at
 		`
 	} else {
 		query = `
@@ -87,8 +86,7 @@ func (db *DB) UpsertPackage(pkg *Package) error {
 				repository_url = excluded.repository_url,
 				registry_url = excluded.registry_url,
 				enriched_at = excluded.enriched_at,
-				updated_at = excluded.updated_at,
-				source = excluded.source
+				updated_at = excluded.updated_at
 		`
 	}
 
