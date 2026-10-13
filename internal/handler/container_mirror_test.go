@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,12 @@ type fakeImageRegistry struct {
 	manifests map[string]fakeManifest
 	blobs     map[string]string
 	blobGets  atomic.Int32
+	// tagGets counts GET requests for manifests by tag.
+	tagGets atomic.Int32
+	// truncateManifests makes manifest GETs end after a few bytes.
+	truncateManifests atomic.Bool
+	// onBlob, if set, runs before a blob is served.
+	onBlob func(path string)
 }
 
 type fakeImage struct {
@@ -112,10 +119,21 @@ func newFakeImageRegistry(t *testing.T) (*fakeImageRegistry, fakeImage) {
 		if doc, ok := r.manifests[req.URL.Path]; ok {
 			w.Header().Set("Content-Type", doc.contentType)
 			w.Header().Set("Docker-Content-Digest", sha256Digest([]byte(doc.body)))
+			if req.Method == http.MethodGet && !strings.Contains(req.URL.Path, "/manifests/sha256:") {
+				r.tagGets.Add(1)
+			}
+			if req.Method == http.MethodGet && r.truncateManifests.Load() {
+				w.Header().Set("Content-Length", strconv.Itoa(len(doc.body)))
+				_, _ = io.WriteString(w, doc.body[:4])
+				return
+			}
 			_, _ = io.WriteString(w, doc.body)
 			return
 		}
 		if blob, ok := r.blobs[req.URL.Path]; ok {
+			if r.onBlob != nil {
+				r.onBlob(req.URL.Path)
+			}
 			r.blobGets.Add(1)
 			_, _ = io.WriteString(w, blob)
 			return
@@ -318,8 +336,9 @@ func TestMirrorImageKeepsPreviousTagWhenMovedTagIsIncomplete(t *testing.T) {
 	registry.manifests["/v2/team/app/manifests/single"] = brokenDoc
 	registry.manifests["/v2/team/app/manifests/"+sha256Digest(broken)] = brokenDoc
 
-	if _, err := h.MirrorImage(context.Background(), ref, nil); err == nil {
-		t.Fatal("mirroring the incomplete image did not fail")
+	missing := sha256Digest([]byte("missing layer"))
+	if _, err := h.MirrorImage(context.Background(), ref, nil); err == nil || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("mirroring the incomplete image: err = %v, want a failure naming layer %s", err, missing)
 	}
 	registry.offline.Store(true)
 
@@ -329,5 +348,105 @@ func TestMirrorImageKeepsPreviousTagWhenMovedTagIsIncomplete(t *testing.T) {
 	}
 	if response.Body.String() != previous.body {
 		t.Errorf("offline tag points to %s, want the previously mirrored image", sha256Digest(response.Body.Bytes()))
+	}
+}
+
+func TestMirrorImagePlatformFilterAcrossNestedIndex(t *testing.T) {
+	registry, image := newFakeImageRegistry(t)
+	proxy := newMirrorTestProxy(t, registry)
+	h := NewContainerHandlerWithRegistry(proxy, "http://proxy.example", registry.server.URL)
+
+	nested := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[` +
+		`{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"` + image.arm64Digest + `","platform":{"os":"linux","architecture":"arm64"}}]}`
+	nestedDigest := sha256Digest([]byte(nested))
+	top := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[` +
+		`{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"` + image.amd64Digest + `","platform":{"os":"linux","architecture":"amd64"}},` +
+		`{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"` + nestedDigest + `"}]}`
+	for _, reference := range []string{"nested", nestedDigest} {
+		registry.manifests["/v2/team/app/manifests/"+reference] = fakeManifest{contentType: ociImageIndexMediaType, body: nested}
+	}
+	for _, reference := range []string{"top", sha256Digest([]byte(top))} {
+		registry.manifests["/v2/team/app/manifests/"+reference] = fakeManifest{contentType: ociImageIndexMediaType, body: top}
+	}
+
+	amd64, _ := ParsePlatform("linux/amd64")
+	if _, err := h.MirrorImage(context.Background(), ImageRef{Name: "team/app", References: []string{"top"}}, []Platform{amd64}); err != nil {
+		t.Fatalf("MirrorImage: %v (a nested index without amd64 must not fail the image)", err)
+	}
+	riscv, _ := ParsePlatform("linux/riscv64")
+	if _, err := h.MirrorImage(context.Background(), ImageRef{Name: "team/app", References: []string{"top"}}, []Platform{riscv}); err == nil {
+		t.Error("a filter matching nothing in the whole image did not fail")
+	}
+}
+
+func TestMirrorImageRevalidatesUnchangedTagWithHead(t *testing.T) {
+	registry, _ := newFakeImageRegistry(t)
+	proxy := newMirrorTestProxy(t, registry)
+	h := NewContainerHandlerWithRegistry(proxy, "http://proxy.example", registry.server.URL)
+	ref := ImageRef{Name: "team/app", References: []string{"multi"}}
+
+	if _, err := h.MirrorImage(context.Background(), ref, nil); err != nil {
+		t.Fatalf("first MirrorImage: %v", err)
+	}
+	gets := registry.tagGets.Load()
+	if _, err := h.MirrorImage(context.Background(), ref, nil); err != nil {
+		t.Fatalf("second MirrorImage: %v", err)
+	}
+	if extra := registry.tagGets.Load() - gets; extra != 0 {
+		t.Errorf("second run sent %d GETs for the unchanged tag, want a HEAD only", extra)
+	}
+}
+
+func TestMirrorImageFallsBackWhenTagBodyIsCutOff(t *testing.T) {
+	registry, image := newFakeImageRegistry(t)
+	proxy := newMirrorTestProxy(t, registry)
+	h := NewContainerHandlerWithRegistry(proxy, "http://proxy.example", registry.server.URL)
+	ref := ImageRef{Name: "team/app", References: []string{"single"}}
+
+	if _, err := h.MirrorImage(context.Background(), ref, nil); err != nil {
+		t.Fatalf("first MirrorImage: %v", err)
+	}
+	// Point the tag elsewhere so the HEAD check sends a GET, then cut that
+	// GET's body short.
+	registry.manifests["/v2/team/app/manifests/single"] = registry.manifests["/v2/team/app/manifests/"+image.amd64Digest]
+	registry.truncateManifests.Store(true)
+
+	result, err := h.MirrorImage(context.Background(), ref, nil)
+	if err != nil {
+		t.Fatalf("MirrorImage with a cut-off body: %v, want the cached tag to be used", err)
+	}
+	if !strings.Contains(strings.Join(result.Warnings, "\n"), "stale cache") {
+		t.Errorf("warnings = %v, want the stale-cache warning", result.Warnings)
+	}
+}
+
+func TestMirrorImageKeepsTagMovedByPullDuringWalk(t *testing.T) {
+	registry, image := newFakeImageRegistry(t)
+	proxy := newMirrorTestProxy(t, registry)
+	h := NewContainerHandlerWithRegistry(proxy, "http://proxy.example", registry.server.URL)
+
+	// While the mirror fetches the first layer of "single", the tag moves
+	// upstream and a client pull caches the new target.
+	moved := registry.manifests["/v2/team/app/manifests/"+image.amd64Digest]
+	var once atomic.Bool
+	registry.onBlob = func(string) {
+		if once.CompareAndSwap(false, true) {
+			registry.manifests["/v2/team/app/manifests/single"] = moved
+			if response := pull(t, h, "/team/app/manifests/single", dockerManifestAccept); response.Code != http.StatusOK {
+				t.Errorf("client pull during the walk: status %d", response.Code)
+			}
+		}
+	}
+	result, err := h.MirrorImage(context.Background(), ImageRef{Name: "team/app", References: []string{"single"}}, nil)
+	if err != nil {
+		t.Fatalf("MirrorImage: %v", err)
+	}
+	if !strings.Contains(strings.Join(result.Warnings, "\n"), "moved") {
+		t.Errorf("warnings = %v, want the moved-tag warning", result.Warnings)
+	}
+	registry.onBlob = nil
+	registry.offline.Store(true)
+	if response := pull(t, h, "/team/app/manifests/single", dockerManifestAccept); response.Body.String() != moved.body {
+		t.Errorf("offline tag points to %s, want the newer target %s", sha256Digest(response.Body.Bytes()), image.amd64Digest)
 	}
 }

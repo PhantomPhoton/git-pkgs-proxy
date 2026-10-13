@@ -127,6 +127,9 @@ type imageMirror struct {
 	platforms    []Platform
 	seen         map[string]bool
 	result       ImageResult
+	// platformMatches counts index entries that matched the platform filter
+	// during the current walk.
+	platformMatches int
 }
 
 // MirrorImage fetches an image the way a client pull does: the manifest or
@@ -214,9 +217,9 @@ var errTagUpstreamUnavailable = errors.New("upstream unavailable")
 func (m *imageMirror) mirrorTag(ctx context.Context, tag string) (string, error) {
 	accept := containerManifestAccept(&http.Request{Header: http.Header{}})
 	cacheAccept := normalizeContainerManifestAccept(accept)
-	before := m.h.loadContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, tag, accept, cacheAccept)
+	before, _ := m.h.loadContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, tag, accept, cacheAccept)
 
-	manifest, err := m.fetchTagManifest(ctx, tag, accept)
+	manifest, err := m.resolveTag(ctx, tag, accept, before)
 	if err != nil {
 		if before == nil || !errors.Is(err, errTagUpstreamUnavailable) {
 			return "", fmt.Errorf("manifest %s: %w", tag, err)
@@ -231,41 +234,53 @@ func (m *imageMirror) mirrorTag(ctx context.Context, tag string) (string, error)
 	digest := manifest.contentDigest
 	if before == nil || before.contentDigest != digest {
 		m.result.Fetched++
+		m.h.storeContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, digest, accept, cacheAccept, manifest)
 	}
-	m.h.storeContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, digest, accept, cacheAccept, manifest)
 	if _, err := m.mirrorManifest(ctx, digest, 0); err != nil {
 		return "", err
+	}
+
+	// A client pull may have moved the tag while the walk ran. Its entry is
+	// newer than what this mirror resolved, so it is kept.
+	current, _ := m.h.loadContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, tag, accept, cacheAccept)
+	if current != nil && current.contentDigest != digest && (before == nil || current.contentDigest != before.contentDigest) {
+		m.result.Warnings = append(m.result.Warnings, fmt.Sprintf("tag %s moved to %s while it was mirrored; kept that entry", tag, current.contentDigest))
+		return digest, nil
 	}
 	m.h.storeContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, tag, accept, cacheAccept, manifest)
 	return digest, nil
 }
 
-// fetchTagManifest fetches and verifies the manifest a tag points to without
-// caching it.
-func (m *imageMirror) fetchTagManifest(ctx context.Context, tag, accept string) (*cachedContainerManifest, error) {
-	upstreamURL := fmt.Sprintf("%s/v2/%s/manifests/%s", m.registryURL, m.upstreamName, tag)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
+// resolveTag returns the manifest a tag points to upstream without caching
+// it. A HEAD request comes first: if the tag still points to the cached
+// digest, the cached manifest is reused with a new fetch time, which spares a
+// GET (registries such as Docker Hub do not count HEAD requests against pull
+// limits).
+func (m *imageMirror) resolveTag(ctx context.Context, tag, accept string, before *cachedContainerManifest) (*cachedContainerManifest, error) {
+	if before != nil {
+		response, err := m.requestTag(ctx, http.MethodHead, tag, accept)
+		if err != nil {
+			return nil, err
+		}
+		_ = response.Body.Close()
+		if response.Header.Get("Docker-Content-Digest") == before.contentDigest {
+			unchanged := *before
+			unchanged.fetchedAt = time.Now()
+			return &unchanged, nil
+		}
+	}
+
+	response, err := m.requestTag(ctx, http.MethodGet, tag, accept)
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Accept", accept)
-	response, err := m.h.proxy.HTTPClient.Do(request)
+	defer func() { _ = response.Body.Close() }()
+	body, err := m.h.proxy.ReadMetadata(response.Body)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("%w: %w", errTagUpstreamUnavailable, err)
-	}
-	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode != http.StatusOK {
-		if shouldServeStaleManifest(response.StatusCode) {
-			return nil, fmt.Errorf("%w: status %d", errTagUpstreamUnavailable, response.StatusCode)
-		}
-		return nil, fmt.Errorf("upstream status %d", response.StatusCode)
-	}
-	body, err := m.h.proxy.ReadMetadata(response.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading manifest: %w", err)
+		return nil, fmt.Errorf("%w: reading manifest: %w", errTagUpstreamUnavailable, err)
 	}
 	digest := sha256Digest(body)
 	if contentDigest := response.Header.Get("Docker-Content-Digest"); strings.HasPrefix(contentDigest, "sha256:") && contentDigest != digest {
@@ -282,12 +297,38 @@ func (m *imageMirror) fetchTagManifest(ctx context.Context, tag, accept string) 
 	}, nil
 }
 
+// requestTag sends a manifest request for a tag upstream. Only 200 responses
+// are returned; network errors, 429 and 5xx wrap errTagUpstreamUnavailable.
+func (m *imageMirror) requestTag(ctx context.Context, method, tag, accept string) (*http.Response, error) {
+	upstreamURL := fmt.Sprintf("%s/v2/%s/manifests/%s", m.registryURL, m.upstreamName, tag)
+	request, err := http.NewRequestWithContext(ctx, method, upstreamURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept", accept)
+	response, err := m.h.proxy.HTTPClient.Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("%w: %w", errTagUpstreamUnavailable, err)
+	}
+	if response.StatusCode != http.StatusOK {
+		_ = response.Body.Close()
+		if shouldServeStaleManifest(response.StatusCode) {
+			return nil, fmt.Errorf("%w: status %d", errTagUpstreamUnavailable, response.StatusCode)
+		}
+		return nil, fmt.Errorf("upstream status %d", response.StatusCode)
+	}
+	return response, nil
+}
+
 // mirrorManifest stores the manifest for reference through the handler's own
 // manifest route, then follows what it references. It returns the manifest
 // digest.
 func (m *imageMirror) mirrorManifest(ctx context.Context, reference string, depth int) (string, error) {
 	cacheAccept := normalizeContainerManifestAccept(containerManifestAccept(&http.Request{Header: http.Header{}}))
-	before := m.h.loadContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, reference, cacheAccept, cacheAccept)
+	before, _ := m.h.loadContainerManifestForAccept(ctx, m.registryURL, m.upstreamName, reference, cacheAccept, cacheAccept)
 
 	target := "/" + m.ref.Name + "/manifests/" + reference
 	if m.ref.Registry != "" {
@@ -324,10 +365,21 @@ func (m *imageMirror) mirrorManifest(ctx context.Context, reference string, dept
 	if manifest.SchemaVersion == 1 {
 		return "", fmt.Errorf("manifest %s: schema 1 manifests are not supported", reference)
 	}
-	if manifest.Manifests != nil {
-		return digest, m.mirrorIndex(ctx, reference, &manifest, depth)
+	if manifest.Manifests == nil {
+		return digest, m.mirrorBlobs(ctx, &manifest)
 	}
-	return digest, m.mirrorBlobs(ctx, &manifest)
+	if depth == 0 {
+		m.platformMatches = 0
+	}
+	if err := m.mirrorIndex(ctx, reference, &manifest, depth); err != nil {
+		return "", err
+	}
+	// A nested index may lack the wanted platforms as long as the image as a
+	// whole has them.
+	if depth == 0 && len(m.platforms) > 0 && m.platformMatches == 0 {
+		return "", fmt.Errorf("index %s: no manifest for the requested platforms", reference)
+	}
+	return digest, nil
 }
 
 // mirrorIndex follows the index entries for the wanted platforms. Docker
@@ -350,10 +402,10 @@ func (m *imageMirror) mirrorIndex(ctx context.Context, reference string, index *
 		if m.wantsPlatform(entry.Platform) {
 			selected = append(selected, entry)
 			selectedDigests[entry.Digest] = true
+			if entry.Platform != nil {
+				m.platformMatches++
+			}
 		}
-	}
-	if len(selected) == 0 && len(m.platforms) > 0 {
-		return fmt.Errorf("index %s: no manifest for the requested platforms", reference)
 	}
 	for _, entry := range attestations {
 		if len(m.platforms) == 0 || selectedDigests[entry.Annotations[dockerReferenceDigestAnnotation]] {

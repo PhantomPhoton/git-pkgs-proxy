@@ -47,7 +47,7 @@ type cachedContainerManifest struct {
 func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request, registryURL, name, reference string) {
 	accept := containerManifestAccept(r)
 	cacheAccept := normalizeContainerManifestAccept(accept)
-	cached := h.loadContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept)
+	cached, fromFallback := h.loadContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept)
 
 	immutable := manifestDigestReferencePattern.MatchString(reference)
 	if cached != nil && (immutable || h.containerManifestFresh(cached)) {
@@ -75,7 +75,13 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 
 	if resp.StatusCode == http.StatusNotModified && cached != nil {
 		cached.fetchedAt = time.Now()
-		h.storeContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
+		if fromFallback {
+			// The shared entry holds another representation for other
+			// clients; only this client's own entries are refreshed.
+			h.storeContainerManifestLegacyEntries(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
+		} else {
+			h.storeContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
+		}
 		writeContainerManifest(w, r, cached, false)
 		return
 	}
@@ -184,15 +190,18 @@ func (h *ContainerHandler) containerManifestLegacyCacheKeys(registryURL, name, r
 	return keys
 }
 
-func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, registryURL, name, reference, accept, cacheAccept string) *cachedContainerManifest {
+// loadContainerManifestForAccept returns the cached manifest for the client and
+// whether it came from a per-Accept fallback key while the shared key holds a
+// representation the client does not accept.
+func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, registryURL, name, reference, accept, cacheAccept string) (*cachedContainerManifest, bool) {
 	cacheKey := h.containerManifestSharedCacheKey(registryURL, name, reference, cacheAccept)
 	cached, err := h.loadContainerManifest(ctx, cacheKey)
 	if err != nil {
 		h.proxy.Logger.Warn("failed to read cached container manifest", "error", err)
-		return nil
+		return nil, false
 	}
 	if cached != nil && containerManifestCacheCompatible(accept, cached) {
-		return cached
+		return cached, false
 	}
 	// The shared entry may hold a representation this client does not accept,
 	// for example an OCI index for a client that only accepts Docker manifest
@@ -203,7 +212,7 @@ func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, r
 		cached, err = h.loadContainerManifest(ctx, legacyCacheKey)
 		if err != nil {
 			h.proxy.Logger.Warn("failed to read legacy cached container manifest", "error", err)
-			return nil
+			return nil, false
 		}
 		if cached == nil || !containerManifestCacheCompatible(accept, cached) {
 			continue
@@ -213,9 +222,9 @@ func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, r
 				h.proxy.Logger.Warn("failed to migrate cached container manifest", "error", err)
 			}
 		}
-		return cached
+		return cached, sharedEntryExists
 	}
-	return nil
+	return nil, false
 }
 
 func (h *ContainerHandler) storeContainerManifestForAccept(ctx context.Context, registryURL, name, reference, accept, cacheAccept string, manifest *cachedContainerManifest) {
@@ -224,6 +233,12 @@ func (h *ContainerHandler) storeContainerManifestForAccept(ctx context.Context, 
 		h.proxy.Logger.Warn("failed to cache container manifest", "error", err)
 	}
 
+	h.storeContainerManifestLegacyEntries(ctx, registryURL, name, reference, accept, cacheAccept, manifest)
+}
+
+// storeContainerManifestLegacyEntries writes only the per-Accept keys.
+func (h *ContainerHandler) storeContainerManifestLegacyEntries(ctx context.Context, registryURL, name, reference, accept, cacheAccept string, manifest *cachedContainerManifest) {
+	cacheKey := h.containerManifestSharedCacheKey(registryURL, name, reference, cacheAccept)
 	for _, legacyCacheKey := range h.containerManifestLegacyCacheKeys(registryURL, name, reference, accept, cacheAccept, cacheKey) {
 		if err := h.storeContainerManifest(ctx, legacyCacheKey, manifest); err != nil {
 			h.proxy.Logger.Warn("failed to cache legacy container manifest", "error", err)

@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -188,7 +189,55 @@ func TestContainerHandler_IncompatibleSharedEntryFallsBackToAcceptEntry(t *testi
 	if response.Body.String() != list {
 		t.Errorf("offline Docker-only body = %q, want the manifest list", response.Body.String())
 	}
-	if response := getManifest(t, h, "/library/app/manifests/latest", ociImageIndexMediaType); response.Body.String() != index {
-		t.Errorf("offline OCI body = %q, want the index still in the shared entry", response.Body.String())
+	if response.Header().Get("Warning") == "" {
+		t.Error("offline Docker-only response has no stale warning, so it did not come from the stale path")
+	}
+	// Serving the fallback entry must not copy it over the shared entry,
+	// which still holds the index for clients that accept both.
+	if response := getManifest(t, h, "/library/app/manifests/latest", dockerManifestAccept); response.Body.String() != index {
+		t.Errorf("offline body for a client accepting both = %q, want the index still in the shared entry", response.Body.String())
+	}
+}
+
+func TestContainerHandler_NotModifiedFallbackKeepsSharedEntry(t *testing.T) {
+	list := `{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}`
+	index := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`
+	var offline atomic.Bool
+	// The registry answers per Accept header, with ETags, like registries
+	// that convert OCI indexes for clients without OCI support.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if offline.Load() {
+			http.Error(w, "offline", http.StatusServiceUnavailable)
+			return
+		}
+		body, contentType := list, dockerManifestListMediaType
+		if strings.Contains(r.Header.Get("Accept"), ociImageIndexMediaType) {
+			body, contentType = index, ociImageIndexMediaType
+		}
+		etag := `"` + sha256Digest([]byte(body)) + `"`
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("ETag", etag)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(upstream.Close)
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	h := &ContainerHandler{proxy: proxy, registryURL: upstream.URL, proxyURL: "http://localhost:8080"}
+
+	const dockerOnly = "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+	getManifest(t, h, "/library/app/manifests/latest", dockerOnly)
+	getManifest(t, h, "/library/app/manifests/latest", ociImageIndexMediaType)
+	// Revalidates the Docker-only fallback entry and gets 304.
+	if response := getManifest(t, h, "/library/app/manifests/latest", dockerOnly); response.Body.String() != list {
+		t.Fatalf("Docker-only revalidation body = %q, want the list", response.Body.String())
+	}
+	offline.Store(true)
+
+	if response := getManifest(t, h, "/library/app/manifests/latest", dockerManifestAccept); response.Body.String() != index {
+		t.Errorf("body for a client accepting both = %q, want the index; the 304 refresh overwrote the shared entry", response.Body.String())
 	}
 }
