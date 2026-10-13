@@ -274,6 +274,15 @@ upstream:
   #   alpine: "https://dl-cdn.alpinelinux.org/alpine"
   #   private: "https://apk.example.com"
 
+  # Named Arch Linux pacman mirrors (used by /arch/{name}/).
+  # Defaults to {"archlinux": "https://geo.mirror.pkgbuild.com"} when empty;
+  # configuring any entry replaces that default. Arch Linux ARM needs a
+  # regional HTTPS mirror of your choice, not the mirror.archlinuxarm.org
+  # redirector.
+  # arch:
+  #   archlinux: "https://geo.mirror.pkgbuild.com"
+  #   archlinuxarm: "https://<region>.mirror.archlinuxarm.org"
+
   # Named generic HTTP upstreams (used by /generic/{name}/). The remaining
   # request path and query are appended to the upstream URL. GitHub release
   # assets ({owner}/{repo}/releases/download/{tag}/{asset}) are cached

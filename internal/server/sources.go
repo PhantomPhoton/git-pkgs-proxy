@@ -64,6 +64,7 @@ var knownClients = map[string]string{
 	"dnf":               "dnf",
 	"urlgrabber":        "dnf",
 	"apk":               "apk",
+	"pacman":            "pacman",
 	"conda":             "conda",
 	"mamba":             "conda",
 	"conan":             "conan",

@@ -475,6 +475,26 @@ verification keeps working; `.apk` packages use the shared artifact cache.
 When `upstream.apk` is empty, a single repository named `alpine` pointing at
 the official mirror is available; configuring any entry replaces that default.
 
+```yaml
+upstream:
+
+  # Named Arch Linux pacman mirrors, served at /arch/{name}/.
+  arch:
+    archlinux: "https://geo.mirror.pkgbuild.com"
+```
+
+Arch Linux repositories are read-only. Requests to `/arch/{name}/…` are passed
+to the mirror unchanged, so both the Arch Linux layout
+(`/arch/archlinux/core/os/x86_64/core.db`) and the Arch Linux ARM layout
+(`/arch/archlinuxarm/aarch64/core/core.db`) work. Databases (`{repo}.db`,
+`{repo}.files` and their `.tar.*` forms) are cached with the metadata TTL and
+served byte-for-byte unchanged; a database's `.sig` is refreshed together with
+the database. Packages and package signatures use the shared artifact cache.
+When `upstream.arch` is empty, a single repository named `archlinux` pointing at
+`https://geo.mirror.pkgbuild.com` is available; configuring any entry replaces
+that default. Arch Linux ARM has no default: pick a regional HTTPS mirror, not
+the `mirror.archlinuxarm.org` redirector.
+
 ### Debian archives
 
 ```yaml

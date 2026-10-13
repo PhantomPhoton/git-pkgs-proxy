@@ -65,7 +65,7 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | Debian | Debian/Ubuntu | | ✓ |
 | RPM | RHEL/Fedora | | ✓ |
 | Alpine | Alpine Linux | | ✓ |
-| Arch | Arch Linux | | ✗ |
+| Arch | Arch Linux | | ✓ |
 | Chef | Chef | | ✗ |
 | Generic | Any | | ✓ |
 | Helm | Kubernetes | Yes | ✓ |
@@ -676,6 +676,71 @@ http://localhost:8080/apk/private
 apk appends the architecture and index filename to each repository line
 itself.
 
+### Arch Linux / pacman
+
+Put the proxy at the top of `/etc/pacman.d/mirrorlist`. The default repository
+name `archlinux` proxies the official GeoIP mirror
+(`https://geo.mirror.pkgbuild.com`):
+
+```
+Server = http://localhost:8080/arch/archlinux/$repo/os/$arch
+```
+
+Then:
+
+```bash
+pacman -Syu
+```
+
+Repository databases (`core.db`, `core.files` and their `.tar.*` forms),
+database signatures, packages and package signatures are served byte-for-byte
+unchanged, so pacman's signature checks keep working. Databases use the
+metadata cache (`metadata_ttl`, stale fallback). Each database refresh also
+fetches its signature and stores it for exactly that database, so a signature
+is only ever served with the database it signs. Enable `cache_metadata` (or set `PROXY_CACHE_METADATA=true`) so
+`pacman -Sy` keeps working while the upstream is down; without it databases are
+fetched fresh on every request. Packages and their `.sig` files are stored in the shared artifact
+cache and remain available when the upstream is unreachable.
+
+The proxy only starts sending a package once it has the whole file, and pacman
+gives up on a download that sends nothing for 10 seconds. The fetch keeps
+running and the next try is served from the cache. On a slow upstream, set
+`DisableDownloadTimeout` in `/etc/pacman.conf` to avoid the failed first try.
+
+`extra.files` is about 50 MB and is read into memory on each `pacman -F`
+request. Raise `metadata_max_size` (100 MB by default) for larger custom
+repositories.
+
+A custom repository that rebuilds a package under the same version leaves the
+old package and signature in the cache. Bump `pkgrel` instead, or remove the
+cached version.
+
+#### Arch Linux ARM
+
+Arch Linux ARM has no built-in repository. Add one under `upstream.arch`, using a
+regional mirror from <https://archlinuxarm.org/about/mirrors> that serves HTTPS:
+
+```yaml
+upstream:
+  arch:
+    archlinux: "https://geo.mirror.pkgbuild.com"
+    archlinuxarm: "https://<region>.mirror.archlinuxarm.org"
+```
+
+Setting `upstream.arch` replaces the built-in default, so keep `archlinux` in the map
+if you also proxy x86_64 Arch.
+
+Arch Linux ARM mirrors use `$arch/$repo` instead of `$repo/os/$arch`. In
+`/etc/pacman.d/mirrorlist`:
+
+```
+Server = http://localhost:8080/arch/archlinuxarm/$arch/$repo
+```
+
+Avoid `mirror.archlinuxarm.org` as the upstream. It redirects each request to a
+changing regional mirror over plain HTTP, so the database and the packages can come
+from mirrors with a different sync state.
+
 ### GitHub Releases / mise (aqua backend)
 
 Configure named generic upstreams:
@@ -1030,6 +1095,7 @@ Recently cached:
 | `GET /v2/*` | OCI/Docker registry protocol |
 | `GET /v2/homebrew/core/*` | Homebrew core bottle manifests and blobs from GHCR |
 | `GET /apk/{repository}/*` | Alpine APK repository protocol |
+| `GET /arch/{repository}/*` | Arch Linux pacman repository protocol |
 | `GET /generic/{name}/*` | Generic HTTP download proxy (GitHub release assets, mise/aqua) |
 | `GET /debian/*` | Debian/APT repository protocol (main archive) |
 | `GET /debian/{repository}/*` | Debian/APT repository protocol (named archive, e.g. security) |
