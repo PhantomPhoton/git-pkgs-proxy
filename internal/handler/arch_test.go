@@ -202,7 +202,7 @@ func TestArchHandler_DatabasesServedUnchanged(t *testing.T) {
 	}
 	upstream := newArchUpstream(t, files)
 	proxy := newArchTestProxy(t, upstream)
-	proxy.AuthForURL = func(string) (string, string) { return "Authorization", "Bearer arch-token" }
+	authorizeUpstream(proxy, "Bearer arch-token")
 	h := NewArchHandler(proxy, "http://proxy.example", map[string]string{"archlinux": upstream.URL})
 
 	// The database goes first, as pacman requests it.
