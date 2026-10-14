@@ -122,6 +122,8 @@ type Server struct {
 
 	// browseLimits overrides defaultBrowseLimits when set; tests use it.
 	browseLimits archives.StreamOptions
+
+	compares compareLimiter
 }
 
 // New creates a new Server with the given configuration.
