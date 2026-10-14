@@ -8,11 +8,12 @@ import (
 // Error codes returned in API error responses. These are stable identifiers
 // that clients can match on; the message text is for humans and may change.
 const (
-	ErrCodeBadRequest = "BAD_REQUEST"
-	ErrCodeNotFound   = "NOT_FOUND"
-	ErrCodeUpstream   = "UPSTREAM_ERROR"
-	ErrCodeInternal   = "INTERNAL_ERROR"
-	ErrCodeBusy       = "BUSY"
+	ErrCodeBadRequest   = "BAD_REQUEST"
+	ErrCodeNotFound     = "NOT_FOUND"
+	ErrCodeUnauthorized = "UNAUTHORIZED"
+	ErrCodeUpstream     = "UPSTREAM_ERROR"
+	ErrCodeInternal     = "INTERNAL_ERROR"
+	ErrCodeBusy         = "BUSY"
 )
 
 // ErrorResponse is the JSON body returned for API errors.

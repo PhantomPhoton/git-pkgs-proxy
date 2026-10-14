@@ -125,6 +125,14 @@ func decodePURLComponent(s string) string {
 	return decoded
 }
 
+// Artifact sources. Upstream artifacts are a cache of a registry and may be
+// evicted; local artifacts were pushed to the proxy and are only removed by a
+// delete.
+const (
+	SourceUpstream = "upstream"
+	SourceLocal    = "local"
+)
+
 // Artifact represents a cached artifact in the database.
 // This table is proxy-specific and not part of git-pkgs.
 type Artifact struct {
@@ -141,6 +149,15 @@ type Artifact struct {
 	LastAccessedAt sql.NullTime   `db:"last_accessed_at" json:"last_accessed_at,omitempty"`
 	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
+	Source         string         `db:"source" json:"source"`
+	Manifest       sql.NullString `db:"manifest" json:"manifest,omitempty"`
+}
+
+func (a *Artifact) sourceOrUpstream() string {
+	if a.Source == "" {
+		return SourceUpstream
+	}
+	return a.Source
 }
 
 // IsCached returns true if the artifact has been fetched and stored locally.

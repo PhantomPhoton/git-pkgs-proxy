@@ -364,6 +364,18 @@ gradle:
     # How often eviction runs when max_age or max_size is set
     sweep_interval: "10m"
 
+# Pushing package archives to /api/hosted (disabled by default).
+# A pushed version replaces the upstream one for every client, so a token is
+# required to push and delete.
+# hosted:
+#   enabled: true
+#   token: "${PROXY_HOSTED_TOKEN}"
+#   max_upload_size: "100MB"
+#   # Namespaces served from pushed packages only; the upstream is never asked
+#   # about them, so nobody can mix in versions by publishing the same name.
+#   npm_scopes: ["@acme"]
+#   composer_vendors: ["acme"]
+
 # Health endpoint configuration.
 health:
   # Minimum time between storage backend probes.

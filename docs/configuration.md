@@ -982,6 +982,93 @@ Or via environment variable: `PROXY_HTTP_TIMEOUT=2m`.
 
 Set to `"0"` to disable the timeout entirely (requests then rely only on the server's write timeout). Independently of this setting, the shared transport gives up on an upstream that has not sent response headers within 60 seconds.
 
+## Hosted Packages
+
+Operators can push a package archive into the proxy under a name and version. The proxy serves it in place of the upstream archive with the same version, or in addition to the upstream's versions. Use it to ship a patched build of a dependency without running a separate registry.
+
+The `/api/hosted` endpoints are disabled by default. Because a pushed version replaces the upstream one for every client, enabling them requires a token:
+
+```yaml
+hosted:
+  enabled: true
+  token: "${PROXY_HOSTED_TOKEN}"
+  max_upload_size: "100MB"
+  npm_scopes: ["@acme"]
+  composer_vendors: ["acme"]
+```
+
+| Config | Environment | Description |
+|--------|-------------|-------------|
+| `hosted.enabled` | `PROXY_HOSTED_ENABLED` | Register the `/api/hosted` endpoints (default `false`) |
+| `hosted.token` | `PROXY_HOSTED_TOKEN` | Bearer token required to push and delete; required when enabled, supports `${VAR}` |
+| `hosted.max_upload_size` | `PROXY_HOSTED_MAX_UPLOAD_SIZE` | Maximum size of one pushed archive (default `100MB`) |
+| `hosted.npm_scopes` | `PROXY_HOSTED_NPM_SCOPES` | npm scopes served from pushed packages only (comma-separated in the environment) |
+| `hosted.composer_vendors` | `PROXY_HOSTED_COMPOSER_VENDORS` | Composer vendors served from pushed packages only |
+
+`hosted.enabled` cannot be combined with `storage.cache_artifacts: false`.
+
+### Pushing a patched package
+
+1. Build the archive with the original package name and the version you push in its manifest (`package.json` or `composer.json`), e.g. `request-2.88.3.tgz`.
+2. Push it:
+
+   ```bash
+   export PROXY_HOSTED_TOKEN=...
+   proxy hosted push -url https://proxy.example.com npm request 2.88.3 ./request-2.88.3.tgz
+   ```
+
+   or with curl:
+
+   ```bash
+   curl -X PUT --data-binary @request-2.88.3.tgz \
+     -H "Authorization: Bearer $PROXY_HOSTED_TOKEN" \
+     https://proxy.example.com/api/hosted/npm/request/2.88.3
+   ```
+
+3. Install it as usual, e.g. `npm install request@2.88.3`. The version is listed in the package metadata, so ranges like `^2.88.0` resolve to it too.
+4. Check what is pushed: `proxy hosted list npm request` or `GET /api/hosted/npm/request`.
+5. Remove it again: `proxy hosted delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
+
+### Supported ecosystems
+
+Download handlers look archives up by the filename clients request, so a push is stored under that name:
+
+| Ecosystem | Name | Filename |
+|-----------|------|----------|
+| `npm` | `{name}` or `@{scope}/{name}` | `{name}-{version}.tgz`, without the scope |
+| `composer` | `{vendor}/{package}` | `{package}-{version}.zip` |
+
+Other ecosystems are not supported yet.
+
+The archive must contain the package manifest: `package.json` in the top directory of an npm tarball, or `composer.json` at the root or in the single top directory of a Composer zip. Its name, and its version when it has one, must match the push. Otherwise the push is refused with 400.
+
+### Package metadata
+
+Pushed versions are listed in the package metadata clients resolve against, with the dependencies from their manifest:
+
+- A pushed version takes the place of an upstream version with the same number.
+- Pushed versions are added next to the upstream ones and are never held back by cooldown. npm `dist-tags` stay as the upstream has them.
+- A package the upstream doesn't know is served from its pushed versions alone. Its npm `latest` tag is the highest pushed version.
+- Pushed Composer dev versions (`dev-*`, `*-dev`) are listed in the `~dev` metadata file.
+- npm entries carry the archive's sha512 as `dist.integrity`. Composer entries carry its sha256 as `dist.reference` and leave `shasum` empty.
+
+Metadata of packages with pushed versions is rewritten on every request instead of being cached, so a push or delete shows up on the next request.
+
+### Hosted-only namespaces
+
+A package the upstream doesn't know is served from its pushed versions, but the proxy still asks the upstream about it on every request. If someone later publishes the same name there, their versions are listed next to yours, and a range such as `^1.0.0` can resolve to one of them (dependency confusion).
+
+For private packages:
+
+1. Prefer a namespace you own on the public registry: an npm scope registered on npmjs.com, or a Composer vendor with packages on Packagist. Nobody else can publish under it.
+2. List the namespace in `hosted.npm_scopes` or `hosted.composer_vendors`. Its packages are served from pushed versions alone: the upstream is never asked about them, and anything not pushed answers 404.
+
+Other packages, including ones in other scopes and vendors, are proxied as usual.
+
+### Storage and eviction
+
+Pushed archives are stored like cached ones but marked as local. The cache size limit and storage retention never remove them; only a delete does. Scanning, when enabled, checks pushed archives like fetched ones.
+
 ## Mirror API
 
 The `/api/mirror` endpoints are disabled by default. Enable them to allow starting mirror jobs via HTTP:

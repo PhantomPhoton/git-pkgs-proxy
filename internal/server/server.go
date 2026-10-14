@@ -256,6 +256,9 @@ func (s *Server) serve(listener net.Listener) error {
 	proxy.MetadataMaxSize = s.cfg.ParseMetadataMaxSize()
 	proxy.SetMetadataRewriteCacheSize(s.cfg.ParseMetadataRewriteCacheSize())
 	proxy.GradleReadOnly = s.cfg.Gradle.BuildCache.ReadOnly
+	proxy.HostedEnabled = s.cfg.Hosted.Enabled
+	proxy.HostedNPMScopes = s.cfg.Hosted.NPMScopes
+	proxy.HostedComposerVendors = s.cfg.Hosted.ComposerVendors
 	proxy.NPMFullMetadata = s.cfg.Upstream.NPMFullMetadata
 	proxy.GradleMaxUploadSize = s.cfg.ParseGradleBuildCacheMaxUploadSize()
 	proxy.DirectServe = s.cfg.Storage.DirectServe
@@ -352,6 +355,12 @@ func (s *Server) serve(listener net.Listener) error {
 		r.Get("/api/mirror/{id}", mirrorAPI.HandleGet)
 		r.Delete("/api/mirror/{id}", mirrorAPI.HandleCancel)
 		go jobStore.StartCleanup(bgCtx)
+	}
+
+	// Hosted package endpoints (opt-in via hosted.enabled or PROXY_HOSTED_ENABLED)
+	if s.cfg.Hosted.Enabled {
+		hostedAPI := NewHostedAPIHandler(proxy, s.cfg.Hosted.MaxUploadBytes(), s.logger)
+		registerHostedRoutes(r, hostedAPI, s.cfg.Hosted.TokenExpanded())
 	}
 
 	s.http = &http.Server{

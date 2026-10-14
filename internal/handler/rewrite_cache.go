@@ -272,6 +272,17 @@ func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name str
 	return rewrittenMetadata{out, v}, err
 }
 
+// uncachedRewrite gives a rewrite made outside the cache its validators: an
+// ETag of the output itself and, as cachedRewrite does, a date that replicas
+// agree on.
+func (p *Proxy) uncachedRewrite(ecosystem, proxyURL, name string, out []byte) rewrittenMetadata {
+	v := metadataValidators{etag: metadataETag(out)}
+	if !p.cooldownEnabled() {
+		v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
+	}
+	return rewrittenMetadata{out, v}
+}
+
 func (p *Proxy) cooldownEnabled() bool {
 	return p.Cooldown != nil && p.Cooldown.Enabled()
 }

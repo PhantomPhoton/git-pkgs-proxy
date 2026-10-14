@@ -216,7 +216,7 @@ func (db *DB) GetArtifact(versionPURL, filename string) (*Artifact, error) {
 	query := db.Rebind(`
 		SELECT id, version_purl, filename, upstream_url, storage_path, content_hash,
 		       size, content_type, fetched_at, hit_count, last_accessed_at,
-		       created_at, updated_at
+		       created_at, updated_at, source
 		FROM artifacts WHERE version_purl = ? AND filename = ?
 	`)
 	err := db.Get(&a, query, versionPURL, filename)
@@ -284,7 +284,7 @@ func (db *DB) GetArtifactByPath(storagePath string) (*Artifact, error) {
 	query := db.Rebind(`
 		SELECT id, version_purl, filename, upstream_url, storage_path, content_hash,
 		       size, content_type, fetched_at, hit_count, last_accessed_at,
-		       created_at, updated_at
+		       created_at, updated_at, source
 		FROM artifacts WHERE storage_path = ?
 	`)
 	err := db.Get(&a, query, storagePath)
@@ -302,7 +302,7 @@ func (db *DB) GetArtifactsByVersionPURL(versionPURL string) ([]Artifact, error) 
 	query := db.Rebind(`
 		SELECT id, version_purl, filename, upstream_url, storage_path, content_hash,
 		       size, content_type, fetched_at, hit_count, last_accessed_at,
-		       created_at, updated_at
+		       created_at, updated_at, source
 		FROM artifacts WHERE version_purl = ?
 		ORDER BY filename
 	`)
@@ -367,8 +367,8 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 		query = `
 			INSERT INTO artifacts (version_purl, filename, upstream_url, storage_path, content_hash,
 			                       size, content_type, fetched_at, hit_count, last_accessed_at,
-			                       created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			                       created_at, updated_at, source, manifest)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT(version_purl, filename) DO UPDATE SET
 				upstream_url = EXCLUDED.upstream_url,
 				storage_path = EXCLUDED.storage_path,
@@ -376,15 +376,17 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 				size = EXCLUDED.size,
 				content_type = EXCLUDED.content_type,
 				fetched_at = EXCLUDED.fetched_at,
-				updated_at = EXCLUDED.updated_at
-			WHERE artifacts.storage_path IS NOT DISTINCT FROM $13
+				updated_at = EXCLUDED.updated_at,
+				source = EXCLUDED.source,
+				manifest = EXCLUDED.manifest
+			WHERE artifacts.storage_path IS NOT DISTINCT FROM $15
 		`
 	} else {
 		query = `
 			INSERT INTO artifacts (version_purl, filename, upstream_url, storage_path, content_hash,
 			                       size, content_type, fetched_at, hit_count, last_accessed_at,
-			                       created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			                       created_at, updated_at, source, manifest)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(version_purl, filename) DO UPDATE SET
 				upstream_url = excluded.upstream_url,
 				storage_path = excluded.storage_path,
@@ -392,14 +394,17 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 				size = excluded.size,
 				content_type = excluded.content_type,
 				fetched_at = excluded.fetched_at,
-				updated_at = excluded.updated_at
+				updated_at = excluded.updated_at,
+				source = excluded.source,
+				manifest = excluded.manifest
 			WHERE artifacts.storage_path IS ?
 		`
 	}
 
 	res, err := db.Exec(query,
 		a.VersionPURL, a.Filename, a.UpstreamURL, a.StoragePath, a.ContentHash,
-		a.Size, a.ContentType, inUTC(a.FetchedAt), a.HitCount, inUTC(a.LastAccessedAt), now, now, previous,
+		a.Size, a.ContentType, inUTC(a.FetchedAt), a.HitCount, inUTC(a.LastAccessedAt), now, now,
+		a.sourceOrUpstream(), a.Manifest, previous,
 	)
 	if err != nil {
 		return false, fmt.Errorf("upserting artifact: %w", err)
@@ -445,9 +450,9 @@ func (db *DB) GetLeastRecentlyUsedArtifacts(limit int) ([]Artifact, error) {
 	query := db.Rebind(`
 		SELECT id, version_purl, filename, upstream_url, storage_path, content_hash,
 		       size, content_type, fetched_at, hit_count, last_accessed_at,
-		       created_at, updated_at
+		       created_at, updated_at, source
 		FROM artifacts
-		WHERE storage_path IS NOT NULL
+		WHERE storage_path IS NOT NULL AND source <> 'local'
 		ORDER BY last_accessed_at ASC NULLS FIRST
 		LIMIT ?
 	`)
@@ -460,7 +465,7 @@ func (db *DB) GetLeastRecentlyUsedArtifacts(limit int) ([]Artifact, error) {
 
 func (db *DB) GetTotalCacheSize() (int64, error) {
 	var total sql.NullInt64
-	err := db.Get(&total, `SELECT SUM(size) FROM artifacts WHERE storage_path IS NOT NULL`)
+	err := db.Get(&total, `SELECT SUM(size) FROM artifacts WHERE storage_path IS NOT NULL AND source <> 'local'`)
 	if err != nil {
 		return 0, err
 	}
