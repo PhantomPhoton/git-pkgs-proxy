@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -79,6 +80,38 @@ func TestNewIntegrityChecksRejectsMalformedMetadata(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := newIntegrityChecks(test.contentHash, test.native); err == nil {
 				t.Fatal("newIntegrityChecks returned nil error")
+			}
+		})
+	}
+}
+
+// TestIntegrityChecksVerifyRegistryChecksum checks native metadata given as
+// an algorithm-prefixed hex checksum, the form recorded for a registry's SHA-1
+// shasum, which is not SRI.
+func TestIntegrityChecksVerifyRegistryChecksum(t *testing.T) {
+	const data = "hello world"
+	checksum := "sha1-" + sha1Hex(data)
+	checks, err := newIntegrityChecks(sha256Hex(data), checksum)
+	if err != nil {
+		t.Fatalf("newIntegrityChecks(%q): %v", checksum, err)
+	}
+	for _, tt := range []struct {
+		name, body   string
+		wantMismatch bool
+	}{
+		{"matching", data, false},
+		{"mismatched", "other bytes", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var reasons []string
+			reader, err := checks.wrapFailOnMismatch(io.NopCloser(strings.NewReader(tt.body)), func(reason string) { reasons = append(reasons, reason) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.ReadAll(reader)
+			gotNative := slices.ContainsFunc(reasons, func(r string) bool { return strings.HasPrefix(r, "integrity: ") })
+			if gotNative != tt.wantMismatch {
+				t.Errorf("checksum mismatch reported = %v, want %v (reasons %q)", gotNative, tt.wantMismatch, reasons)
 			}
 		})
 	}

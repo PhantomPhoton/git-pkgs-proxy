@@ -27,7 +27,11 @@ var npmIntegrityCases = []struct {
 	{"strongest algorithm decides", map[string]string{"integrity": sha256SRI("other bytes") + " " + sha512SRI(npmIntegrityTarball)}, true},
 	{"any digest of the strongest algorithm", map[string]string{"integrity": sha512SRI("other bytes") + " " + sha512SRI(npmIntegrityTarball)}, true},
 	{"unparseable integrity", map[string]string{"integrity": "sha512-nope"}, true},
-	{"shasum alone is not checked yet", map[string]string{"shasum": sha1Hex("other bytes")}, true},
+	{"matching shasum", map[string]string{"shasum": sha1Hex(npmIntegrityTarball)}, true},
+	{"mismatched shasum", map[string]string{"shasum": sha1Hex("other bytes")}, false},
+	{"integrity wins over shasum", map[string]string{"integrity": sha512SRI("other bytes"), "shasum": sha1Hex(npmIntegrityTarball)}, false},
+	{"unparseable integrity falls back to shasum", map[string]string{"integrity": "sha512-nope", "shasum": sha1Hex("other bytes")}, false},
+	{"unparseable shasum", map[string]string{"shasum": "not-a-sha1"}, true},
 	{"no checksum", map[string]string{}, true},
 }
 
