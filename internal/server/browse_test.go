@@ -471,6 +471,47 @@ func TestHandleCompareDiff(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.close()
 
+	seedCompareVersions(t, ts)
+
+	// Test the compare endpoint
+	req := httptest.NewRequest("GET", "/ui/api/compare/npm/test-compare/1.0.0/2.0.0", nil)
+	w := httptest.NewRecorder()
+	ts.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Parse response
+	var result map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Check that we have files
+	files, ok := result["files"].([]interface{})
+	if !ok {
+		t.Fatal("response should have files array")
+	}
+
+	if len(files) == 0 {
+		t.Error("should have detected file changes")
+	}
+
+	// Check counts exist
+	if _, ok := result["files_changed"]; !ok {
+		t.Error("response should have files_changed")
+	}
+	if _, ok := result["files_added"]; !ok {
+		t.Error("response should have files_added")
+	}
+}
+
+// seedCompareVersions caches two versions of pkg:npm/test-compare with
+// different archives for the compare endpoint.
+func seedCompareVersions(t *testing.T, ts *testServer) {
+	t.Helper()
+
 	// Create two test archives with different content
 	archive1Data := createArchiveWithContent(t, map[string]string{
 		"README.md": "# Version 1\n",
@@ -540,38 +581,52 @@ func TestHandleCompareDiff(t *testing.T) {
 	if err := ts.db.UpsertArtifact(artifact2); err != nil {
 		t.Fatalf("failed to upsert artifact: %v", err)
 	}
+}
 
-	// Test the compare endpoint
+func compareTestVersions(ts *testServer) *httptest.ResponseRecorder {
 	req := httptest.NewRequest("GET", "/ui/api/compare/npm/test-compare/1.0.0/2.0.0", nil)
 	w := httptest.NewRecorder()
 	ts.handler.ServeHTTP(w, req)
+	return w
+}
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+// Each comparison buffers both archives in memory, so only a few may run at
+// once; the rest are refused instead of piling up until the process runs
+// out of memory.
+func TestCompareDiffRefusedWhileComparisonsAreRunning(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.close()
+	seedCompareVersions(t, ts)
+
+	for range maxConcurrentCompares {
+		if !ts.server.compares.tryAcquire() {
+			t.Fatal("could not take a free comparison slot")
+		}
 	}
 
-	// Parse response
-	var result map[string]interface{}
-	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	w := compareTestVersions(ts)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status with all slots taken = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("refused comparison has no Retry-After header")
 	}
 
-	// Check that we have files
-	files, ok := result["files"].([]interface{})
-	if !ok {
-		t.Fatal("response should have files array")
+	ts.server.compares.release()
+	if w := compareTestVersions(ts); w.Code != http.StatusOK {
+		t.Fatalf("status after a slot was freed = %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
 	}
+}
 
-	if len(files) == 0 {
-		t.Error("should have detected file changes")
-	}
+func TestCompareDiffReleasesItsSlot(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.close()
+	seedCompareVersions(t, ts)
 
-	// Check counts exist
-	if _, ok := result["files_changed"]; !ok {
-		t.Error("response should have files_changed")
-	}
-	if _, ok := result["files_added"]; !ok {
-		t.Error("response should have files_added")
+	for i := range maxConcurrentCompares + 1 {
+		if w := compareTestVersions(ts); w.Code != http.StatusOK {
+			t.Fatalf("comparison %d: status = %d, want %d: %s", i, w.Code, http.StatusOK, w.Body.String())
+		}
 	}
 }
 

@@ -167,6 +167,11 @@ type Config struct {
 	// size return ErrMetadataTooLarge. Default: "100MB".
 	MetadataMaxSize string `json:"metadata_max_size" yaml:"metadata_max_size"`
 
+	// ArtifactMaxSize is the largest upstream artifact the proxy will fetch
+	// (e.g. "2GB"). Larger artifacts are refused and not cached. Default: ""
+	// (unlimited). "0" is also unlimited.
+	ArtifactMaxSize string `json:"artifact_max_size" yaml:"artifact_max_size"`
+
 	// MetadataRewriteCacheSize is how much rewritten npm and Composer
 	// metadata to keep in memory, so a document is rewritten once rather than
 	// on every request (e.g. "256MB", "1GB"). Default: "256MB". Set to "0" to
@@ -1206,6 +1211,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvBool(&c.MirrorAPI, "PROXY_MIRROR_API")
 	setEnvString(&c.MetadataTTL, "PROXY_METADATA_TTL")
 	setEnvString(&c.MetadataMaxSize, "PROXY_METADATA_MAX_SIZE")
+	setEnvString(&c.ArtifactMaxSize, "PROXY_ARTIFACT_MAX_SIZE")
 	setEnvString(&c.MetadataRewriteCacheSize, "PROXY_METADATA_REWRITE_CACHE_SIZE")
 	setEnvString(&c.HTTPTimeout, "PROXY_HTTP_TIMEOUT")
 	setEnvBool(&c.Gradle.BuildCache.ReadOnly, "PROXY_GRADLE_BUILD_CACHE_READ_ONLY")
@@ -1303,7 +1309,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if err := validateMetadataMaxSize(c.MetadataMaxSize); err != nil {
+	if err := c.validateDownloadSizeLimits(); err != nil {
 		return err
 	}
 
@@ -1475,6 +1481,27 @@ func validateMetadataMaxSize(s string) error {
 	return nil
 }
 
+func (c *Config) validateDownloadSizeLimits() error {
+	if err := validateMetadataMaxSize(c.MetadataMaxSize); err != nil {
+		return err
+	}
+	return validateArtifactMaxSize(c.ArtifactMaxSize)
+}
+
+func validateArtifactMaxSize(s string) error {
+	if s == "" {
+		return nil
+	}
+	size, err := ParseSize(s)
+	if err != nil {
+		return fmt.Errorf("invalid artifact_max_size: %w", err)
+	}
+	if size < 0 {
+		return fmt.Errorf("invalid artifact_max_size %q: must not be negative", s)
+	}
+	return nil
+}
+
 func validateMetadataRewriteCacheSize(s string) error {
 	if s == "" || s == "0" {
 		return nil
@@ -1514,6 +1541,19 @@ func (c *Config) ParseMetadataMaxSize() int64 {
 	size, err := ParseSize(c.MetadataMaxSize)
 	if err != nil || size <= 0 {
 		return defaultMetadataMaxSize
+	}
+	return size
+}
+
+// ParseArtifactMaxSize returns the artifact size limit in bytes, or 0 for
+// no limit.
+func (c *Config) ParseArtifactMaxSize() int64 {
+	if c.ArtifactMaxSize == "" {
+		return 0
+	}
+	size, err := ParseSize(c.ArtifactMaxSize)
+	if err != nil || size < 0 {
+		return 0
 	}
 	return size
 }

@@ -12,6 +12,7 @@ const (
 	ErrCodeNotFound   = "NOT_FOUND"
 	ErrCodeUpstream   = "UPSTREAM_ERROR"
 	ErrCodeInternal   = "INTERNAL_ERROR"
+	ErrCodeBusy       = "BUSY"
 )
 
 // ErrorResponse is the JSON body returned for API errors.

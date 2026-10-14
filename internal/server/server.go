@@ -122,6 +122,8 @@ type Server struct {
 
 	// browseLimits overrides defaultBrowseLimits when set; tests use it.
 	browseLimits archives.StreamOptions
+
+	compares compareLimiter
 }
 
 // New creates a new Server with the given configuration.
@@ -233,7 +235,7 @@ func (s *Server) serve(listener net.Listener) error {
 		Ecosystems: s.cfg.Cooldown.Ecosystems,
 		Packages:   s.cfg.Cooldown.NormalizedPackages(),
 	}
-	proxy := handler.NewProxy(s.db, s.storage, fetcher, resolver, s.logger)
+	proxy := handler.NewProxy(s.db, s.storage, handler.LimitArtifactSize(fetcher, s.cfg.ParseArtifactMaxSize()), resolver, s.logger)
 	proxy.HTTPClient = metadataClient
 	cooldownPolicy, err := cooldownpolicy.New(cd, s.cfg.Cooldown.PackagePatterns)
 	if err != nil {
@@ -498,7 +500,8 @@ func (s *Server) newUpstreamClients(artifactTimeout time.Duration) (metadataClie
 func NewMirrorProxy(cfg *config.Config, db *database.DB, store storage.Storage, logger *slog.Logger) (*handler.Proxy, *handler.ContainerHandler) {
 	s := &Server{cfg: cfg, db: db, storage: store, logger: logger, ecr: newECRTokens(logger)}
 	metadataClient, artifactClient := s.newUpstreamClients(0)
-	proxy := handler.NewProxy(db, store, fetch.NewFetcher(fetch.WithHTTPClient(artifactClient)), fetch.NewResolver(), logger)
+	fetcher := handler.LimitArtifactSize(fetch.NewFetcher(fetch.WithHTTPClient(artifactClient)), cfg.ParseArtifactMaxSize())
+	proxy := handler.NewProxy(db, store, fetcher, fetch.NewResolver(), logger)
 	proxy.HTTPClient = metadataClient
 	return proxy, s.newContainerHandler(proxy)
 }

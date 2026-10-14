@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/git-pkgs/archives"
 	"github.com/git-pkgs/archives/diff"
@@ -30,6 +31,38 @@ const (
 // endpoints will read. Artifacts larger than this are rejected to prevent
 // memory exhaustion from a single request.
 const maxBrowseArchiveSize = 512 << 20 // 512 MB
+
+// maxConcurrentCompares caps how many version diffs run at once. Each one
+// buffers both archives whole, up to maxBrowseArchiveSize apiece, so without
+// a cap parallel requests could exhaust memory.
+const maxConcurrentCompares = 2
+
+// compareRetryAfter is the Retry-After, in seconds, sent with a diff refused
+// because maxConcurrentCompares are already running.
+const compareRetryAfter = "5"
+
+// compareLimiter counts running version diffs. The zero value is ready to use.
+type compareLimiter struct {
+	mu     sync.Mutex
+	active int
+}
+
+// tryAcquire takes a slot if fewer than maxConcurrentCompares are taken.
+func (l *compareLimiter) tryAcquire() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.active >= maxConcurrentCompares {
+		return false
+	}
+	l.active++
+	return true
+}
+
+func (l *compareLimiter) release() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.active--
+}
 
 // firstBrowsableArtifact returns the first cached artifact that can be opened as
 // an archive, or nil if the version has none.
@@ -594,6 +627,7 @@ type BrowseSourceData struct {
 // @Success 200 {object} map[string]any
 // @Failure 404 {object} ErrorResponse
 // @Failure 500 {object} ErrorResponse
+// @Failure 503 {object} ErrorResponse
 // @Router /ui/api/compare/{ecosystem}/{name}/{fromVersion}/{toVersion} [get]
 func (s *Server) compareDiff(w http.ResponseWriter, r *http.Request, ecosystem, name, fromVersion, toVersion string) {
 	// Get artifacts for both versions
@@ -620,6 +654,13 @@ func (s *Server) compareDiff(w http.ResponseWriter, r *http.Request, ecosystem, 
 		notFound(w, "one or both versions not cached")
 		return
 	}
+
+	if !s.compares.tryAcquire() {
+		w.Header().Set("Retry-After", compareRetryAfter)
+		writeError(w, http.StatusServiceUnavailable, ErrCodeBusy, "too many comparisons in progress, try again shortly")
+		return
+	}
+	defer s.compares.release()
 
 	// Open both archives
 	fromReader, err := s.storage.Open(r.Context(), fromArtifact.StoragePath.String)
