@@ -39,6 +39,9 @@ type JobRequest struct {
 	PURLs    []string        `json:"purls,omitempty"`
 	SBOM     json.RawMessage `json:"sbom,omitempty"`
 	Registry string          `json:"registry,omitempty"`
+	// Platforms limit which platforms of container images are mirrored,
+	// as os/architecture[/variant].
+	Platforms []string `json:"platforms,omitempty"`
 }
 
 // JobStore manages in-memory mirror jobs.
@@ -191,13 +194,16 @@ func (js *JobStore) runJob(ctx context.Context, cancel context.CancelFunc, job *
 }
 
 func (js *JobStore) sourceFromRequest(req JobRequest) (Source, error) { //nolint:ireturn // interface return is the design
+	if _, err := ParsePlatforms(req.Platforms); err != nil {
+		return nil, err
+	}
 	switch {
 	case len(req.PURLs) > 0 && len(req.SBOM) > 0:
 		return nil, fmt.Errorf("request must include only one of purls or sbom")
 	case len(req.PURLs) > 0:
-		return &PURLSource{PURLs: req.PURLs}, nil
+		return &PURLSource{PURLs: req.PURLs, Platforms: req.Platforms}, nil
 	case len(req.SBOM) > 0:
-		return &SBOMSource{Data: req.SBOM}, nil
+		return &SBOMSource{Data: req.SBOM, Platforms: req.Platforms}, nil
 	case req.Registry != "":
 		return nil, fmt.Errorf("registry mirroring is not yet implemented; use purls instead")
 	default:

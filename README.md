@@ -1002,6 +1002,9 @@ proxy mirror --dry-run pkg:npm/lodash
 
 # Control parallelism
 proxy mirror --concurrency 8 pkg:npm/lodash@4.17.21
+
+# Mirror a container image for one platform
+proxy mirror --platform linux/amd64 pkg:docker/library/alpine@3.20
 ```
 
 The mirror command accepts the same storage and database flags as `serve`. Already-cached artifacts are skipped.

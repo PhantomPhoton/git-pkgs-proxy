@@ -20,6 +20,11 @@ type PackageVersion struct {
 	Ecosystem string
 	Name      string
 	Version   string
+	// Qualifiers are the PURL qualifiers. Images use repository_url, tag and
+	// arch.
+	Qualifiers map[string]string
+	// Platforms limit which platforms of an image index are mirrored.
+	Platforms []string
 }
 
 func (pv PackageVersion) String() string {
@@ -36,6 +41,8 @@ type Source interface {
 type PURLSource struct {
 	PURLs     []string
 	RegClient *registries.Client
+	// Platforms limit which platforms of container images are mirrored.
+	Platforms []string
 }
 
 func (s *PURLSource) Enumerate(ctx context.Context, fn func(PackageVersion) error) error {
@@ -56,8 +63,15 @@ func (s *PURLSource) Enumerate(ctx context.Context, fn func(PackageVersion) erro
 			name = p.Namespace + "/" + p.Name
 		}
 
-		if p.Version != "" {
-			if err := fn(PackageVersion{Ecosystem: ecosystem, Name: name, Version: p.Version}); err != nil {
+		if p.Version != "" || isImageEcosystem(ecosystem) {
+			// Images are never expanded to all tags; an unversioned image
+			// fails when it is mirrored.
+			pv := PackageVersion{Ecosystem: ecosystem, Name: name, Version: p.Version}
+			if isImageEcosystem(ecosystem) {
+				pv.Qualifiers = p.Qualifiers.Map()
+				pv.Platforms = s.Platforms
+			}
+			if err := fn(pv); err != nil {
 				return err
 			}
 			continue
@@ -98,6 +112,8 @@ type SBOMSource struct {
 	Data      []byte
 	Name      string
 	RegClient *registries.Client
+	// Platforms limit which platforms of container images are mirrored.
+	Platforms []string
 }
 
 func (s *SBOMSource) Enumerate(ctx context.Context, fn func(PackageVersion) error) error {
@@ -109,7 +125,7 @@ func (s *SBOMSource) Enumerate(ctx context.Context, fn func(PackageVersion) erro
 		return fmt.Errorf("parsing SBOM: %w", err)
 	}
 
-	inner := &PURLSource{PURLs: purls, RegClient: s.RegClient}
+	inner := &PURLSource{PURLs: purls, RegClient: s.RegClient, Platforms: s.Platforms}
 	return inner.Enumerate(ctx, fn)
 }
 

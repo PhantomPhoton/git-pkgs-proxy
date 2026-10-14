@@ -1002,6 +1002,14 @@ curl -X POST http://localhost:8080/api/mirror \
   -d '{"sbom":{"bomFormat":"CycloneDX","components":[{"purl":"pkg:npm/lodash@4.17.21"}]}}'
 ```
 
+`platforms` limits which platforms of container images are mirrored, like the command's `--platform` flag:
+
+```bash
+curl -X POST http://localhost:8080/api/mirror \
+  -H "Content-Type: application/json" \
+  -d '{"purls":["pkg:docker/library/alpine@3.20"],"platforms":["linux/amd64"]}'
+```
+
 ## Mirror Command
 
 The `proxy mirror` command pre-populates the cache from various sources. It accepts the same storage and database flags as `serve`.
@@ -1011,6 +1019,7 @@ The `proxy mirror` command pre-populates the cache from various sources. It acce
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |
 | `--concurrency` | `4` | Number of parallel downloads |
 | `--dry-run` | `false` | Show what would be mirrored without downloading |
+| `--platform` | | Comma-separated `os/arch[/variant]` list limiting which platforms of container images are mirrored |
 | `--config` | | Path to configuration file |
 | `--storage-url` | | Storage URL |
 | `--database-driver` | | Database driver |
@@ -1022,6 +1031,24 @@ Positional arguments are treated as PURLs:
 ```bash
 proxy mirror pkg:npm/lodash@4.17.21 pkg:cargo/serde@1.0.0
 ```
+
+### Container images
+
+`pkg:docker` and `pkg:oci` PURLs mirror a container image the way a pull does: the manifest or index, the platform manifests, then config and layer blobs. Everything is stored under the keys a pull through `/v2` reads, so a later `docker pull` or containerd pull is served from cache, also when the upstream is unreachable.
+
+```bash
+proxy mirror --platform linux/amd64,linux/arm64 pkg:docker/library/alpine@3.20
+proxy mirror 'pkg:docker/containerd/alpine@3.14.0?repository_url=ghcr.io'
+proxy mirror 'pkg:oci/debian@sha256:...?repository_url=docker.io/library/debian&tag=bookworm'
+```
+
+- The version is a tag or a digest. Unversioned image PURLs fail; mirroring all tags is not supported.
+- Without `repository_url` the name is routed like a pull without containerd's `ns` parameter: the default OCI registry, repository prefix routes and `upstream/{name}/`. Single-segment Docker Hub names get the `library/` prefix.
+- `repository_url` is resolved like containerd's `ns` parameter, so it has to name the default registry, Docker Hub, a configured `upstream.oci` host or a host listed in `upstream.oci_mirrors`. Other hosts are refused.
+- `pkg:oci` needs `repository_url`. With `tag=` the tag is mirrored as well; if it now points to another digest, both are mirrored and a warning is logged. `arch=` limits the platforms when `--platform` is not given.
+- Without `--platform` every platform of an index is mirrored, including Windows images, which can be large. Attestation manifests of the selected platforms are mirrored too, because Docker fetches them on every pull.
+- Non-distributable (foreign) layers are skipped.
+- While `scanning.enabled` is set, the command refuses images, because scanners fetch staged layers from the running server. Use the mirror API instead.
 
 ## Docker
 

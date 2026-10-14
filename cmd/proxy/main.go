@@ -113,11 +113,9 @@ import (
 	"github.com/git-pkgs/proxy/internal/config"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
-	"github.com/git-pkgs/proxy/internal/handler"
 	"github.com/git-pkgs/proxy/internal/mirror"
 	"github.com/git-pkgs/proxy/internal/server"
 	"github.com/git-pkgs/proxy/internal/storage"
-	"github.com/git-pkgs/registries/fetch"
 )
 
 const defaultTopN = 10
@@ -421,6 +419,7 @@ func runMirror() {
 	sbomPath := fs.String("sbom", "", "Path to CycloneDX or SPDX SBOM file")
 	concurrency := fs.Int("concurrency", 4, "Number of parallel downloads") //nolint:mnd // default concurrency
 	dryRun := fs.Bool("dry-run", false, "Show what would be mirrored without downloading")
+	platforms := fs.String("platform", "", "Comma-separated os/arch[/variant] list limiting which platforms of container images are mirrored")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "git-pkgs proxy - Pre-populate cache\n\n")
@@ -428,13 +427,22 @@ func runMirror() {
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  proxy mirror pkg:npm/lodash@4.17.21\n")
 		fmt.Fprintf(os.Stderr, "  proxy mirror --sbom sbom.cdx.json\n")
-		fmt.Fprintf(os.Stderr, "  proxy mirror pkg:npm/lodash  # all versions\n\n")
+		fmt.Fprintf(os.Stderr, "  proxy mirror pkg:npm/lodash  # all versions\n")
+		fmt.Fprintf(os.Stderr, "  proxy mirror --platform linux/amd64 pkg:docker/library/alpine@3.20\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		fs.PrintDefaults()
 	}
 
 	_ = fs.Parse(os.Args[1:])
 	purls := fs.Args()
+	var platformList []string
+	if *platforms != "" {
+		platformList = []string{*platforms}
+	}
+	if _, err := mirror.ParsePlatforms(platformList); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Determine source
 	var source mirror.Source
@@ -445,9 +453,9 @@ func runMirror() {
 			fmt.Fprintf(os.Stderr, "error reading SBOM %s: %v\n", *sbomPath, err)
 			os.Exit(1)
 		}
-		source = &mirror.SBOMSource{Data: data, Name: *sbomPath}
+		source = &mirror.SBOMSource{Data: data, Name: *sbomPath, Platforms: platformList}
 	case len(purls) > 0:
-		source = &mirror.PURLSource{PURLs: purls}
+		source = &mirror.PURLSource{PURLs: purls, Platforms: platformList}
 	default:
 		fmt.Fprintf(os.Stderr, "error: provide PURLs or --sbom\n")
 		fs.Usage()
@@ -518,10 +526,8 @@ func runMirror() {
 		os.Exit(1) //nolint:gocritic // db closed above
 	}
 
-	// Build proxy (reuses same pipeline as serve)
-	fetcher := fetch.NewFetcher()
-	resolver := fetch.NewResolver()
-	proxy := handler.NewProxy(db, store, handler.LimitArtifactSize(fetcher, cfg.ParseArtifactMaxSize()), resolver, logger)
+	// Build proxy with the same upstream clients and authentication as serve
+	proxy, images := server.NewMirrorProxy(cfg, db, store, logger)
 	proxy.Denylist, err = denylist.New(cfg.Denylist.Packages)
 	if err != nil {
 		_ = db.Close()
@@ -533,6 +539,12 @@ func runMirror() {
 	proxy.MetadataMaxSize = cfg.ParseMetadataMaxSize()
 
 	m := mirror.New(proxy, db, store, logger, *concurrency)
+	m.Images = images
+	if cfg.Scanning.Enabled {
+		// Scanners fetch staged layers from the running server, which this
+		// command does not start.
+		m.Images = mirror.UnavailableImages{Reason: "container images cannot be mirrored by this command while scanning is enabled; use the mirror API of the running server"}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {

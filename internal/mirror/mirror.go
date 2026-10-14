@@ -22,6 +22,10 @@ type Mirror struct {
 	storage storage.Storage
 	logger  *slog.Logger
 	workers int
+
+	// Images mirrors docker and oci items. Without it they fail like any
+	// other unsupported ecosystem.
+	Images ImageMirrorer
 }
 
 // New creates a new Mirror with the given dependencies.
@@ -203,6 +207,10 @@ func (m *Mirror) RunDryRun(ctx context.Context, source Source) ([]PackageVersion
 }
 
 func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *progressTracker) {
+	if isImageEcosystem(pv.Ecosystem) && m.Images != nil {
+		m.mirrorImage(ctx, pv, tracker)
+		return
+	}
 	result, err := m.proxy.GetOrFetchArtifact(ctx, pv.Ecosystem, pv.Name, pv.Version, "")
 	if err != nil {
 		tracker.failed.Add(1)

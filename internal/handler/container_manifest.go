@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,14 @@ const (
 	containerAcceptWildcardSpecificity = iota
 	containerAcceptTypeWildcardSpecificity
 	containerAcceptExactSpecificity
+)
+
+const (
+	// containerManifestIndexCacheClass replaces the Accept header in tag cache
+	// keys for clients that accept an index type.
+	containerManifestIndexCacheClass = "index"
+	ociImageIndexMediaType           = "application/vnd.oci.image.index.v1+json"
+	dockerManifestListMediaType      = "application/vnd.docker.distribution.manifest.list.v2+json"
 )
 
 var manifestDigestReferencePattern = regexp.MustCompile(`^[a-z0-9]+:[a-f0-9]+$`)
@@ -38,8 +47,7 @@ type cachedContainerManifest struct {
 func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request, registryURL, name, reference string) {
 	accept := containerManifestAccept(r)
 	cacheAccept := normalizeContainerManifestAccept(accept)
-	cacheKey := h.containerManifestCacheKey(registryURL, name, reference, cacheAccept)
-	cached := h.loadContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheKey)
+	cached, fromFallback := h.loadContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept)
 
 	immutable := manifestDigestReferencePattern.MatchString(reference)
 	if cached != nil && (immutable || h.containerManifestFresh(cached)) {
@@ -67,7 +75,13 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 
 	if resp.StatusCode == http.StatusNotModified && cached != nil {
 		cached.fetchedAt = time.Now()
-		h.storeContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
+		if fromFallback {
+			// The shared entry holds another representation for other
+			// clients; only this client's own entries are refreshed.
+			h.storeContainerManifestLegacyEntries(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
+		} else {
+			h.storeContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
+		}
 		writeContainerManifest(w, r, cached, false)
 		return
 	}
@@ -140,49 +154,95 @@ func (h *ContainerHandler) containerManifestCacheKey(registryURL, name, referenc
 	return hex.EncodeToString(sum[:])
 }
 
-func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, registryURL, name, reference, accept, cacheKey string) *cachedContainerManifest {
+// containerManifestSharedCacheKey is the key clients with different Accept
+// headers share. A digest names exactly one document. A tag is stored once for
+// all clients that accept an index type, whatever upstream returned for it, so
+// Docker, containerd and Podman read the same entry. Clients without index
+// support keep a key per normalized Accept header, because registries may
+// convert an index into a single platform manifest for them.
+func (h *ContainerHandler) containerManifestSharedCacheKey(registryURL, name, reference, cacheAccept string) string {
+	if manifestDigestReferencePattern.MatchString(reference) {
+		identity := strings.Join([]string{registryURL, name, reference}, "\x00")
+		sum := sha256.Sum256([]byte(identity))
+		return hex.EncodeToString(sum[:])
+	}
+	if containerManifestAcceptsIndex(cacheAccept) {
+		return h.containerManifestCacheKey(registryURL, name, reference, containerManifestIndexCacheClass)
+	}
+	return h.containerManifestCacheKey(registryURL, name, reference, cacheAccept)
+}
+
+func containerManifestAcceptsIndex(accept string) bool {
+	return containerManifestAccepts(accept, ociImageIndexMediaType) || containerManifestAccepts(accept, dockerManifestListMediaType)
+}
+
+// containerManifestLegacyCacheKeys are the per-Accept keys older versions
+// used. They are still written so a rollback finds the cache, and read when
+// the shared key has no entry yet.
+func (h *ContainerHandler) containerManifestLegacyCacheKeys(registryURL, name, reference, accept, cacheAccept, sharedKey string) []string {
+	var keys []string
+	for _, variant := range []string{cacheAccept, accept} {
+		key := h.containerManifestCacheKey(registryURL, name, reference, variant)
+		if key != sharedKey && !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// loadContainerManifestForAccept returns the cached manifest for the client and
+// whether it came from a per-Accept fallback key while the shared key holds a
+// representation the client does not accept.
+func (h *ContainerHandler) loadContainerManifestForAccept(ctx context.Context, registryURL, name, reference, accept, cacheAccept string) (*cachedContainerManifest, bool) {
+	cacheKey := h.containerManifestSharedCacheKey(registryURL, name, reference, cacheAccept)
 	cached, err := h.loadContainerManifest(ctx, cacheKey)
 	if err != nil {
 		h.proxy.Logger.Warn("failed to read cached container manifest", "error", err)
-		return nil
+		return nil, false
 	}
-	if cached != nil {
-		if containerManifestCacheCompatible(accept, cached) {
-			return cached
-		}
-		return nil
+	if cached != nil && containerManifestCacheCompatible(accept, cached) {
+		return cached, false
 	}
+	// The shared entry may hold a representation this client does not accept,
+	// for example an OCI index for a client that only accepts Docker manifest
+	// lists. Its own per-Accept entry is still written, so look there.
+	sharedEntryExists := cached != nil
 
-	legacyCacheKey := h.containerManifestCacheKey(registryURL, name, reference, accept)
-	if legacyCacheKey == cacheKey {
-		return nil
+	for _, legacyCacheKey := range h.containerManifestLegacyCacheKeys(registryURL, name, reference, accept, cacheAccept, cacheKey) {
+		cached, err = h.loadContainerManifest(ctx, legacyCacheKey)
+		if err != nil {
+			h.proxy.Logger.Warn("failed to read legacy cached container manifest", "error", err)
+			return nil, false
+		}
+		if cached == nil || !containerManifestCacheCompatible(accept, cached) {
+			continue
+		}
+		if !sharedEntryExists {
+			if err := h.storeContainerManifest(ctx, cacheKey, cached); err != nil {
+				h.proxy.Logger.Warn("failed to migrate cached container manifest", "error", err)
+			}
+		}
+		return cached, sharedEntryExists
 	}
-	cached, err = h.loadContainerManifest(ctx, legacyCacheKey)
-	if err != nil {
-		h.proxy.Logger.Warn("failed to read legacy cached container manifest", "error", err)
-		return nil
-	}
-	if cached == nil || !containerManifestCacheCompatible(accept, cached) {
-		return nil
-	}
-	if err := h.storeContainerManifest(ctx, cacheKey, cached); err != nil {
-		h.proxy.Logger.Warn("failed to migrate cached container manifest", "error", err)
-	}
-	return cached
+	return nil, false
 }
 
 func (h *ContainerHandler) storeContainerManifestForAccept(ctx context.Context, registryURL, name, reference, accept, cacheAccept string, manifest *cachedContainerManifest) {
-	cacheKey := h.containerManifestCacheKey(registryURL, name, reference, cacheAccept)
+	cacheKey := h.containerManifestSharedCacheKey(registryURL, name, reference, cacheAccept)
 	if err := h.storeContainerManifest(ctx, cacheKey, manifest); err != nil {
 		h.proxy.Logger.Warn("failed to cache container manifest", "error", err)
 	}
 
-	legacyCacheKey := h.containerManifestCacheKey(registryURL, name, reference, accept)
-	if legacyCacheKey == cacheKey {
-		return
-	}
-	if err := h.storeContainerManifest(ctx, legacyCacheKey, manifest); err != nil {
-		h.proxy.Logger.Warn("failed to cache legacy container manifest", "error", err)
+	h.storeContainerManifestLegacyEntries(ctx, registryURL, name, reference, accept, cacheAccept, manifest)
+}
+
+// storeContainerManifestLegacyEntries writes only the per-Accept keys.
+func (h *ContainerHandler) storeContainerManifestLegacyEntries(ctx context.Context, registryURL, name, reference, accept, cacheAccept string, manifest *cachedContainerManifest) {
+	cacheKey := h.containerManifestSharedCacheKey(registryURL, name, reference, cacheAccept)
+	for _, legacyCacheKey := range h.containerManifestLegacyCacheKeys(registryURL, name, reference, accept, cacheAccept, cacheKey) {
+		if err := h.storeContainerManifest(ctx, legacyCacheKey, manifest); err != nil {
+			h.proxy.Logger.Warn("failed to cache legacy container manifest", "error", err)
+		}
 	}
 }
 
