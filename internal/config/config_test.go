@@ -1669,3 +1669,52 @@ func TestLoadCacheArtifactsFromEnv(t *testing.T) {
 		t.Error("Storage.CacheArtifacts should be false")
 	}
 }
+
+func TestParseArtifactMaxSize(t *testing.T) {
+	tests := []struct {
+		name string
+		size string
+		want int64
+	}{
+		{"unset is unlimited", "", 0},
+		{"zero is unlimited", "0", 0},
+		{"explicit value", "2GB", 2 << 30},
+		{"bytes", "1024", 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.ArtifactMaxSize = tt.size
+			if got := cfg.ParseArtifactMaxSize(); got != tt.want {
+				t.Errorf("ParseArtifactMaxSize() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateArtifactMaxSize(t *testing.T) {
+	for _, invalid := range []string{"not-a-size", "-1"} {
+		cfg := Default()
+		cfg.ArtifactMaxSize = invalid
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected validation error for artifact_max_size %q", invalid)
+		}
+	}
+	for _, valid := range []string{"", "0", "2GB"} {
+		cfg := Default()
+		cfg.ArtifactMaxSize = valid
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("unexpected error for artifact_max_size %q: %v", valid, err)
+		}
+	}
+}
+
+func TestLoadArtifactMaxSizeFromEnv(t *testing.T) {
+	cfg := Default()
+	t.Setenv("PROXY_ARTIFACT_MAX_SIZE", "2GB")
+	cfg.LoadFromEnv()
+
+	if cfg.ArtifactMaxSize != "2GB" {
+		t.Errorf("ArtifactMaxSize = %q, want %q", cfg.ArtifactMaxSize, "2GB")
+	}
+}

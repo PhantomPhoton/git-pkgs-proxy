@@ -245,7 +245,7 @@ func (s *Server) serve(listener net.Listener) error {
 		Ecosystems: s.cfg.Cooldown.Ecosystems,
 		Packages:   s.cfg.Cooldown.NormalizedPackages(),
 	}
-	proxy := handler.NewProxy(s.db, s.storage, fetcher, resolver, s.logger)
+	proxy := handler.NewProxy(s.db, s.storage, handler.LimitArtifactSize(fetcher, s.cfg.ParseArtifactMaxSize()), resolver, s.logger)
 	proxy.HTTPClient = &metadataClient
 	proxy.AuthForURL = s.authForURL
 	cooldownPolicy, err := cooldownpolicy.New(cd, s.cfg.Cooldown.PackagePatterns)

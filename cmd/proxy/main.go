@@ -521,7 +521,7 @@ func runMirror() {
 	// Build proxy (reuses same pipeline as serve)
 	fetcher := fetch.NewFetcher()
 	resolver := fetch.NewResolver()
-	proxy := handler.NewProxy(db, store, fetcher, resolver, logger)
+	proxy := handler.NewProxy(db, store, handler.LimitArtifactSize(fetcher, cfg.ParseArtifactMaxSize()), resolver, logger)
 	proxy.Denylist, err = denylist.New(cfg.Denylist.Packages)
 	if err != nil {
 		_ = db.Close()
