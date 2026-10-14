@@ -383,6 +383,12 @@ func (p *Proxy) lookupCache(ctx context.Context, pkgPURL, versionPURL, filename 
 	if p.StreamArtifacts {
 		return nil, nil
 	}
+	return p.readStored(ctx, pkgPURL, versionPURL, filename)
+}
+
+// readStored opens the stored object of an artifact, whether or not
+// StreamArtifacts is set. Returns nil if no usable object is stored.
+func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename string) (*CacheResult, error) {
 	artifact, err := p.DB.GetCachedArtifact(pkgPURL, versionPURL, filename)
 	if err != nil {
 		return nil, fmt.Errorf("checking artifact cache: %w", err)

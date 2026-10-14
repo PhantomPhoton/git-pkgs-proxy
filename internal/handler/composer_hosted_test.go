@@ -3,10 +3,14 @@ package handler
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/git-pkgs/registries/fetch"
 )
 
 const monologMetadata = `{"minified":"composer/2.0","packages":{"monolog/monolog":[
@@ -27,6 +31,7 @@ type composerHostedFixture struct {
 	proxy            *Proxy
 	handler          http.Handler
 	upstreamRequests *int
+	fetcher          *mockFetcher
 }
 
 func newComposerHostedFixture(t *testing.T, upstream map[string]string) composerHostedFixture {
@@ -44,11 +49,11 @@ func newComposerHostedFixture(t *testing.T, upstream map[string]string) composer
 	}))
 	t.Cleanup(srv.Close)
 
-	proxy, _, _, _ := setupTestProxy(t)
+	proxy, _, _, fetcher := setupTestProxy(t)
 	proxy.HostedEnabled = true
 	proxy.HTTPClient = srv.Client()
 	h := NewComposerHandlerWithUpstreams(proxy, "http://proxy.local", srv.URL, srv.URL)
-	return composerHostedFixture{proxy: proxy, handler: h.Routes(), upstreamRequests: &upstreamRequests}
+	return composerHostedFixture{proxy: proxy, handler: h.Routes(), upstreamRequests: &upstreamRequests, fetcher: fetcher}
 }
 
 func (f composerHostedFixture) push(t *testing.T, name, version, manifest string) HostedArtifact {
@@ -219,5 +224,22 @@ func TestComposerMetadataLeavesOutDeniedPushedVersions(t *testing.T) {
 
 	if _, ok := f.versions(t, "/p2/monolog/monolog.json", "monolog/monolog")["3.6.0"]; ok {
 		t.Error("denied pushed version listed")
+	}
+}
+
+func TestComposerDownloadOfPushedArchiveWhileStreamingArtifacts(t *testing.T) {
+	const manifest = `{"name":"monolog/monolog"}`
+	f := newComposerHostedFixture(t, map[string]string{"/p2/monolog/monolog.json": monologMetadata})
+	f.fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader("upstream archive")), ContentType: "application/zip"}
+	f.push(t, "monolog/monolog", "3.5.0", manifest)
+	f.proxy.StreamArtifacts = true
+
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/monolog/monolog/3.5.0/monolog-3.5.0.zip", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != string(composerZip("", manifest)) {
+		t.Errorf("download status = %d, want 200 and the pushed archive", rec.Code)
+	}
+	if f.fetcher.fetchCalled {
+		t.Error("a pushed archive was fetched upstream while streaming artifacts")
 	}
 }

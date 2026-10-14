@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/git-pkgs/cooldown"
+	"github.com/git-pkgs/registries/fetch"
 )
 
 const requestPackument = `{
@@ -29,6 +31,7 @@ type npmHostedFixture struct {
 	proxy            *Proxy
 	handler          http.Handler
 	upstreamRequests *int
+	fetcher          *mockFetcher
 }
 
 // newNPMHostedFixture serves packuments from upstream, keyed by request path,
@@ -48,10 +51,11 @@ func newNPMHostedFixture(t *testing.T, upstream map[string]string) npmHostedFixt
 	}))
 	t.Cleanup(srv.Close)
 
-	proxy, _, _, _ := setupTestProxy(t)
+	proxy, _, _, fetcher := setupTestProxy(t)
 	proxy.HostedEnabled = true
 	proxy.HTTPClient = srv.Client()
-	return npmHostedFixture{proxy: proxy, handler: NewNPMHandler(proxy, "http://proxy.local", srv.URL).Routes(), upstreamRequests: &upstreamRequests}
+	return npmHostedFixture{proxy: proxy, handler: NewNPMHandler(proxy, "http://proxy.local", srv.URL).Routes(),
+		upstreamRequests: &upstreamRequests, fetcher: fetcher}
 }
 
 func (f npmHostedFixture) push(t *testing.T, name, version, manifest string) HostedArtifact {
@@ -316,5 +320,32 @@ func TestNPMMetadataLeavesOutDeniedPushedVersions(t *testing.T) {
 	}
 	if doc.DistTags["latest"] != "1.0.0" {
 		t.Errorf("dist-tags.latest = %q, want 1.0.0", doc.DistTags["latest"])
+	}
+}
+
+func TestNPMDownloadOfPushedTarballWhileStreamingArtifacts(t *testing.T) {
+	const manifest = `{"name":"request","version":"2.88.3"}`
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	f.fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader("upstream tarball")), ContentType: "application/gzip"}
+	f.push(t, "request", "2.88.3", manifest)
+	f.proxy.StreamArtifacts = true
+
+	rec := f.get(t, "/request/-/request-2.88.3.tgz")
+	if rec.Code != http.StatusOK || rec.Body.String() != string(npmTarball(manifest)) {
+		t.Errorf("download status = %d, body %q, want 200 and the pushed tarball", rec.Code, rec.Body)
+	}
+	if f.fetcher.fetchCalled {
+		t.Error("a pushed tarball was fetched upstream while streaming artifacts")
+	}
+}
+
+func TestNPMDownloadOfUnreadablePushedTarballWhileStreamingArtifacts(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	f.push(t, "request", "2.88.3", `{"name":"request","version":"2.88.3"}`)
+	removeStored(t, f.proxy, "pkg:npm/request@2.88.3", "request-2.88.3.tgz")
+	f.proxy.StreamArtifacts = true
+
+	if rec := f.get(t, "/request/-/request-2.88.3.tgz"); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("download status = %d, body %s, want 503 rather than the upstream tarball", rec.Code, rec.Body)
 	}
 }

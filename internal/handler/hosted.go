@@ -342,10 +342,11 @@ func (p *Proxy) DeleteLocalVersion(ecosystem, name, version string) error {
 	return nil
 }
 
-// GetLocalArtifact serves a pushed artifact from the cache, or returns nil
+// GetLocalArtifact serves a pushed artifact from storage, or returns nil
 // when the artifact was not pushed. Handlers that must consult the upstream
 // before serving a cached copy call it first, so pushed versions the upstream
-// does not list are still served.
+// does not list are still served. Pushed artifacts are not a cache, so they
+// are served even when StreamArtifacts is set.
 func (p *Proxy) GetLocalArtifact(ctx context.Context, ecosystem, name, version, filename string) (*CacheResult, error) {
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
@@ -358,5 +359,12 @@ func (p *Proxy) GetLocalArtifact(ctx context.Context, ecosystem, name, version, 
 	if record == nil || record.Source != database.SourceLocal {
 		return nil, nil
 	}
-	return p.checkCache(ctx, pkgPURL, versionPURL, filename)
+	if p.Denylist.Denied(versionPURL) {
+		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
+	}
+	result, err := p.readStored(ctx, pkgPURL, versionPURL, filename)
+	if err != nil || result != nil {
+		return result, err
+	}
+	return nil, p.localArtifactMiss(versionPURL, filename)
 }
