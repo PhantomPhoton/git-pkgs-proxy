@@ -34,6 +34,11 @@ const (
 
 var manifestDigestReferencePattern = regexp.MustCompile(`^[a-z0-9]+:[a-f0-9]+$`)
 
+// referrersTagPattern matches the sha256-<hex> tags of the OCI referrers tag
+// schema. Docker looks one up on every pull and fails the pull on any answer
+// other than a manifest or 404.
+var referrersTagPattern = regexp.MustCompile(`^sha256-[a-f0-9]{64}$`)
+
 type cachedContainerManifest struct {
 	body          []byte
 	contentType   string
@@ -68,7 +73,7 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
-		h.serveStaleManifestOrError(w, r, cached, err)
+		h.serveStaleManifestOrError(w, r, reference, cached, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -86,8 +91,8 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		if cached != nil && shouldServeStaleManifest(resp.StatusCode) {
-			writeContainerManifest(w, r, cached, true)
+		if shouldServeStaleManifest(resp.StatusCode) && (cached != nil || referrersTagPattern.MatchString(reference)) {
+			h.serveStaleManifestOrError(w, r, reference, cached, fmt.Errorf("upstream status %d", resp.StatusCode))
 			return
 		}
 		h.proxy.relayResponse(w, r, resp, copyContainerManifestHeaders)
@@ -101,7 +106,7 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 
 	body, err := h.proxy.ReadMetadata(resp.Body)
 	if err != nil {
-		h.serveStaleManifestOrError(w, r, cached, fmt.Errorf("reading manifest: %w", err))
+		h.serveStaleManifestOrError(w, r, reference, cached, fmt.Errorf("reading manifest: %w", err))
 		return
 	}
 	computedDigest := sha256Digest(body)
@@ -134,10 +139,15 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 	writeContainerManifest(w, r, manifest, false)
 }
 
-func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *http.Request, cached *cachedContainerManifest, err error) {
+func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *http.Request, reference string, cached *cachedContainerManifest, err error) {
 	if cached != nil {
 		h.proxy.Logger.Warn("upstream manifest fetch failed, serving stale cache", "error", err)
 		writeContainerManifest(w, r, cached, true)
+		return
+	}
+	if referrersTagPattern.MatchString(reference) {
+		h.proxy.Logger.Warn("upstream manifest fetch failed, answering referrers tag as unknown", "reference", reference, "error", err)
+		h.containerError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", "manifest unknown")
 		return
 	}
 	h.proxy.Logger.Error("failed to fetch manifest", "error", err)
