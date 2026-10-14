@@ -25,6 +25,12 @@ func TestGemParseFilename(t *testing.T) {
 		{"aws-sdk-s3-1.142.0.gem", "aws-sdk-s3", "1.142.0"},
 		{"nokogiri-1.15.4-x86_64-linux.gem", "nokogiri", "1.15.4-x86_64-linux"},
 		{"activerecord-7.0.8.gem", "activerecord", "7.0.8"},
+		{"sorbet-static-0.5.11002-universal-darwin-22.gem", "sorbet-static", "0.5.11002-universal-darwin-22"},
+		{"jruby-openssl-0.14.2-universal-java-17.gem", "jruby-openssl", "0.14.2-universal-java-17"},
+		{"google-protobuf-3.25.3-arm64-darwin-23.gem", "google-protobuf", "3.25.3-arm64-darwin-23"},
+		{"nokogiri-1.16.0-x64-mingw-ucrt.gem", "nokogiri", "1.16.0-x64-mingw-ucrt"},
+		{"rake-13.1.0.pre.1.gem", "rake", "13.1.0.pre.1"},
+		{"no-version.gem", "", ""},
 		{"invalid", "", ""},
 	}
 

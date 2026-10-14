@@ -100,7 +100,7 @@ func (h *GradleBuildCacheHandler) handleGetOrHead(w http.ResponseWriter, r *http
 		exists, err := h.proxy.Storage.Exists(r.Context(), storagePath)
 		metrics.RecordStorageOperation("read", time.Since(existsStart))
 		if err != nil {
-			metrics.RecordStorageError("read")
+			metrics.RecordStorageError("read", metrics.FailureDetail{Path: storagePath, Err: err})
 			h.proxy.Logger.Error("failed to check gradle build cache entry", "key", key, "error", err)
 			http.Error(w, "failed to read cache entry", http.StatusInternalServerError)
 			return
@@ -116,7 +116,7 @@ func (h *GradleBuildCacheHandler) handleGetOrHead(w http.ResponseWriter, r *http
 		size, err := h.proxy.Storage.Size(r.Context(), storagePath)
 		metrics.RecordStorageOperation("read", time.Since(sizeStart))
 		if err != nil {
-			metrics.RecordStorageError("read")
+			metrics.RecordStorageError("read", metrics.FailureDetail{Path: storagePath, Err: err})
 		} else if size >= 0 {
 			w.Header().Set(headerContentLength, strconv.FormatInt(size, 10))
 		}
@@ -134,7 +134,7 @@ func (h *GradleBuildCacheHandler) handleGetOrHead(w http.ResponseWriter, r *http
 			http.NotFound(w, r)
 			return
 		}
-		metrics.RecordStorageError("read")
+		metrics.RecordStorageError("read", metrics.FailureDetail{Path: storagePath, Err: err})
 		h.proxy.Logger.Error("failed to open gradle build cache entry", "key", key, "error", err)
 		http.Error(w, "failed to read cache entry", http.StatusInternalServerError)
 		return
@@ -165,7 +165,7 @@ func (h *GradleBuildCacheHandler) handlePut(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		metrics.RecordStorageError("write")
+		metrics.RecordStorageError("write", metrics.FailureDetail{Path: storagePath, Err: err})
 		h.proxy.Logger.Error("failed to store gradle build cache entry", "key", key, "error", err)
 		http.Error(w, "failed to write cache entry", http.StatusInternalServerError)
 		return

@@ -313,7 +313,7 @@ func TestRequestEcosystemCoversEveryMountedRoute(t *testing.T) {
 		"/gradle/x": "gradle", "/nuget/x": "nuget", "/composer/x": "packagist",
 		"/conan/x": "conan", "/conda/x": "conda", "/cran/x": "cran",
 		"/julia/x": "julia", "/swift/x": "swift", "/v2/x": "oci",
-		"/apk/x": "alpine", "/debian/x": "debian", "/rpm/x": "rpm",
+		"/apk/x": "alpine", "/arch/x": "arch", "/debian/x": "debian", "/rpm/x": "rpm",
 		"/helm/x": "helm", "/homebrew/x": "homebrew", "/generic/x": "generic",
 	}
 	for path, want := range mounts {

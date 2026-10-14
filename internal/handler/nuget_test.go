@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/git-pkgs/cooldown"
+	"github.com/git-pkgs/purl"
 )
 
 func nugetTestProxy() *Proxy {
@@ -1061,5 +1062,31 @@ func TestNuGetHandleRegistrationWithoutCooldown(t *testing.T) {
 	// Without cooldown, should proxy directly
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestNuGetRetentionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"pkg:nuget/Newtonsoft.Json", "pkg:nuget/newtonsoft.json", true},
+		{"pkg:nuget/serilog", "pkg:nuget/serilog", true},
+		{"pkg:nuget/serilog/serilog", "", false},
+		{"pkg:npm/serilog", "", false},
+	}
+	for _, tt := range tests {
+		p, err := purl.Parse(tt.key)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tt.key, err)
+		}
+		got, ok := nugetRetentionKey(p)
+		if ok != tt.ok || (ok && got != tt.want) {
+			t.Errorf("nugetRetentionKey(%s) = %q, %v, want %q, %v", tt.key, got, ok, tt.want, tt.ok)
+		}
+	}
+	if _, ok := nugetRetentionKey(nil); ok {
+		t.Error("nugetRetentionKey(nil) accepted")
 	}
 }

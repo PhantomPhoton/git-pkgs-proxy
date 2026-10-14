@@ -240,19 +240,19 @@ func TestComposerDistURL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, _, err := composerDistURL([]byte(tt.body), "v/p", tt.version)
+			got, err := composerDistURL([]byte(tt.body), "v/p", tt.version)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tt.want {
-				t.Errorf("composerDistURL(%s) = %q, want %q", tt.version, got, tt.want)
+			if got.url != tt.want {
+				t.Errorf("composerDistURL(%s) = %q, want %q", tt.version, got.url, tt.want)
 			}
 		})
 	}
 }
 
 func TestComposerDistURLMalformed(t *testing.T) {
-	if _, _, err := composerDistURL([]byte(`{"packages":{"v/p":[{"version":`), "v/p", "1.0.0"); err == nil {
+	if _, err := composerDistURL([]byte(`{"packages":{"v/p":[{"version":`), "v/p", "1.0.0"); err == nil {
 		t.Error("expected an error for truncated JSON")
 	}
 }

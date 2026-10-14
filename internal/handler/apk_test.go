@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -143,9 +144,7 @@ func TestAPKHandler_IndexesServedUnchanged(t *testing.T) {
 	proxy.CacheMetadata = true
 	proxy.MetadataTTL = time.Hour
 	proxy.HTTPClient = upstream.Client()
-	proxy.AuthForURL = func(string) (string, string) {
-		return "Authorization", "Bearer apk-token"
-	}
+	authorizeUpstream(proxy, "Bearer apk-token")
 
 	h := NewAPKHandler(proxy, "http://proxy.example", map[string]string{"alpine": upstream.URL})
 
@@ -359,4 +358,33 @@ func serveAPKRequest(h *APKHandler, target string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
 	return w
+}
+
+func TestAPKRetentionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"pkg:apk/curl", "pkg:apk/alpine/curl", true},
+		{"pkg:apk/alpine/curl", "pkg:apk/alpine/curl", true},
+		{"pkg:apk/Alpine/Curl", "pkg:apk/alpine/curl", true},
+		{"pkg:apk/alpine/libstdc++", "pkg:apk/alpine/libstdc%2B%2B", true},
+		{"pkg:apk/wolfi/curl", "", false},
+		{"pkg:apk/alpine/main%2Fcurl", "", false},
+		{"pkg:deb/alpine/curl", "", false},
+	}
+	for _, tt := range tests {
+		p, err := purl.Parse(tt.key)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tt.key, err)
+		}
+		got, ok := apkRetentionKey(p)
+		if ok != tt.ok || (ok && got != tt.want) {
+			t.Errorf("apkRetentionKey(%s) = %q, %v, want %q, %v", tt.key, got, ok, tt.want, tt.ok)
+		}
+	}
+	if _, ok := apkRetentionKey(nil); ok {
+		t.Error("apkRetentionKey(nil) accepted")
+	}
 }

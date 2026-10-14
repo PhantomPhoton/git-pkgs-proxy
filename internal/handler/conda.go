@@ -5,14 +5,48 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
 	condaUpstream = "https://conda.anaconda.org"
 	minCondaParts = 3 // name-version-build requires at least 3 hyphen-separated parts
 )
+
+// Packages are stored under the name {channel}/{name}, which purl writes as
+// pkg:conda/{channel}%2F{name}. Package rules name the channel as the
+// namespace, pkg:conda/conda-forge/numpy, and are mapped to that form.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "conda", CanonicalPackage: condaRetentionKey})
+}
+
+// condaRetentionKey maps a package rule to the stored package PURL. It
+// takes the channel from the namespace, or from the name in the stored
+// form. Downloads are routed as /{channel}/{arch}/{filename}, so the channel
+// is always one path segment; a key without a channel, with more segments
+// or with an empty one is refused, since no stored package looks like that.
+// The package name is lowercased the way conda treats it; the channel stays
+// as the URL had it.
+func condaRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	full := p.Name
+	if p.Namespace != "" {
+		full = p.Namespace + "/" + p.Name
+	}
+	segments := strings.Split(full, "/")
+	if len(segments) != 2 || slices.Contains(segments, "") {
+		return "", false
+	}
+	channel, name := segments[0], strings.ToLower(segments[1])
+	return retention.DefaultCanonical("conda")(purl.New(p.Type, "", channel+"/"+name, "", nil))
+}
 
 // CondaHandler handles Conda/Anaconda registry protocol requests.
 type CondaHandler struct {

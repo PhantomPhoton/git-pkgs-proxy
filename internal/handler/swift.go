@@ -15,6 +15,8 @@ import (
 
 	"github.com/git-pkgs/proxy/internal/config"
 	"github.com/git-pkgs/proxy/internal/packageurl"
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
@@ -25,6 +27,41 @@ const (
 	swiftMaxScopeLength = 39
 	swiftMaxNameLength  = 100
 )
+
+// Source archives are stored under the registry identity,
+// pkg:generic/swift-registry/{scope}.{name}, lowercased. Package rules write
+// the scope as the namespace, pkg:swift/apple/swift-nio, or use the stored
+// form. A source repository URL such as pkg:swift/github.com/apple/swift-nio
+// doesn't name a registry identity and is refused.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "swift", CanonicalPackage: swiftRetentionKey})
+}
+
+// swiftRetentionKey maps a package rule to the stored package PURL, refusing
+// keys that name no valid registry scope and package. MakeCacheStrings
+// lowercases the identity the way the handler stores it.
+func swiftRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	var scope, name string
+	switch {
+	case p.Type == "swift":
+		scope, name = p.Namespace, p.Name
+	case p.Type == "generic" && strings.EqualFold(p.Namespace, "swift-registry"):
+		var found bool
+		if scope, name, found = strings.Cut(p.Name, "."); !found {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	if !validSwiftScope(scope) || !validSwiftPackageName(name) {
+		return "", false
+	}
+	packagePURL, _ := packageurl.MakeCacheStrings("swift", scope+"/"+name, "")
+	return packagePURL, packagePURL != ""
+}
 
 // SwiftHandler handles the read-only Swift Package Registry v1 protocol.
 type SwiftHandler struct {
@@ -232,7 +269,6 @@ func (h *SwiftHandler) probeSourceArchive(ctx context.Context, upstreamURL, acce
 	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("Range", "bytes=0-0")
-	h.proxy.applyUpstreamAuth(req)
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
@@ -276,7 +312,6 @@ func (h *SwiftHandler) fetchMetadataWithHeaders(
 		return nil, "", nil, fmt.Errorf("creating upstream metadata request: %w", err)
 	}
 	req.Header.Set("Accept", accept)
-	h.proxy.applyUpstreamAuth(req)
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
@@ -401,7 +436,6 @@ func (h *SwiftHandler) proxySwiftResource(w http.ResponseWriter, r *http.Request
 			req.Header.Set(name, value)
 		}
 	}
-	h.proxy.applyUpstreamAuth(req)
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {

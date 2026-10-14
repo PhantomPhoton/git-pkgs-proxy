@@ -42,6 +42,13 @@ base_url: "http://localhost:8080"
 # otherwise read the addresses of your build fleet.
 # ui_request_sources: false
 
+# List the latest failures behind each failure count on /ui/analytics (upstream,
+# storage, integrity, health probe and scan errors): the package, its upstream
+# URL or storage path, and the error. URLs lose credentials and query strings.
+#
+# Off by default, for the same reason as ui_request_sources.
+# ui_failure_details: false
+
 # Artifact storage configuration
 storage:
   # Storage backend URL
@@ -73,6 +80,21 @@ storage:
   # When exceeded, least recently used artifacts are evicted
   # Empty or "0" means unlimited
   max_size: ""
+
+  # Evict artifacts that have not been served for longer than a duration
+  # ("30d", "72h"), independent of max_size. Resolution order: package rule,
+  # then ecosystem rule, then default. "0" or empty means never evict by age.
+  # The default only applies to ecosystems that support retention; naming an
+  # ecosystem or package that does not is a configuration error. See
+  # docs/configuration.md for the supported ecosystems.
+  retention:
+    default: ""
+    # ecosystems:
+    #   npm: "30d"
+    # packages:
+    #   "pkg:npm/lodash": "0"
+    # How often to look for expired artifacts; at least "1m".
+    sweep_interval: "10m"
 
   # Store fetched artifacts. Set to false to stream every download from
   # upstream without storing it; metadata filtering, cooldown and the
@@ -252,6 +274,15 @@ upstream:
   #   alpine: "https://dl-cdn.alpinelinux.org/alpine"
   #   private: "https://apk.example.com"
 
+  # Named Arch Linux pacman mirrors (used by /arch/{name}/).
+  # Defaults to {"archlinux": "https://geo.mirror.pkgbuild.com"} when empty;
+  # configuring any entry replaces that default. Arch Linux ARM needs a
+  # regional HTTPS mirror of your choice, not the mirror.archlinuxarm.org
+  # redirector.
+  # arch:
+  #   archlinux: "https://geo.mirror.pkgbuild.com"
+  #   archlinuxarm: "https://<region>.mirror.archlinuxarm.org"
+
   # Named generic HTTP upstreams (used by /generic/{name}/). The remaining
   # request path and query are appended to the upstream URL. GitHub release
   # assets ({owner}/{repo}/releases/download/{tag}/{asset}) are cached
@@ -259,6 +290,15 @@ upstream:
   # generic:
   #   github: "https://github.com"
   #   github-api: "https://api.github.com"
+  #   apache: "https://archive.apache.org"
+
+  # Version-pinned paths of generic upstreams, cached immutably like GitHub
+  # release assets. Each pattern must match the whole path after
+  # /generic/{name}/ and have `version` and `file` named groups; an optional
+  # `name` group names the package.
+  # generic_artifacts:
+  #   apache:
+  #     - 'dist/(?P<name>maven)/maven-3/(?P<version>[^/]+)/binaries/(?P<file>[^/]+)'
 
   # Authentication for upstream registries
   # Keys are absolute URL scopes. Scheme, host, effective port, and path

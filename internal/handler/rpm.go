@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
@@ -12,6 +15,24 @@ const (
 	defaultRPMUpstream = "https://dl.fedoraproject.org/pub/fedora/linux"
 	rpmMatchCount      = 5 // full match + name + version + release + arch
 )
+
+// Packages are stored as pkg:rpm/{name}, without a vendor and with the name's
+// case kept. Package rules may name a vendor the way PURLs usually do,
+// pkg:rpm/fedora/curl; it is dropped.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "rpm", CanonicalPackage: rpmRetentionKey})
+}
+
+// rpmRetentionKey maps a package rule to the stored package PURL. A name with
+// a slash, or a namespace with more than one segment, can never match a stored
+// package and is refused.
+func rpmRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil || p.Type != "rpm" || strings.Contains(p.Namespace, "/") || strings.Contains(p.Name, "/") {
+		return "", false
+	}
+	canonical := purl.MakePURLString("rpm", p.Name, "")
+	return canonical, canonical != ""
+}
 
 // RPMHandler handles RPM/Yum repository protocol requests.
 // It proxies requests to upstream RPM repositories and caches .rpm packages.

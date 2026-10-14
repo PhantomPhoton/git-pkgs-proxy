@@ -19,6 +19,7 @@
 //   - /swift/*    - Swift Package Registry protocol
 //   - /v2/*       - OCI/Docker container registry protocol
 //   - /apk/*      - Alpine APK repository protocol
+//   - /arch/*     - Arch Linux pacman repository protocol
 //   - /debian/*   - Debian/APT repository protocol
 //   - /rpm/*      - RPM/Yum repository protocol
 //
@@ -234,7 +235,6 @@ func (s *Server) serve(listener net.Listener) error {
 	}
 	proxy := handler.NewProxy(s.db, s.storage, fetcher, resolver, s.logger)
 	proxy.HTTPClient = metadataClient
-	proxy.AuthForURL = s.authForURL
 	cooldownPolicy, err := cooldownpolicy.New(cd, s.cfg.Cooldown.PackagePatterns)
 	if err != nil {
 		return fmt.Errorf("configuring cooldown policy: %w", err)
@@ -276,6 +276,11 @@ func (s *Server) serve(listener net.Listener) error {
 				defer metrics.DecrementActiveRequests()
 			}
 			next.ServeHTTP(w, r)
+		})
+	})
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(handler.DetachUpstreamFetch(r.Context())))
 		})
 	})
 
@@ -363,6 +368,7 @@ func (s *Server) serve(listener net.Listener) error {
 		"database", s.cfg.Database.String())
 	go s.updateCacheStatsMetrics()
 	go s.startEvictionLoop(bgCtx)
+	go s.startRetentionLoop(bgCtx)
 	go s.startReclaimLoop(bgCtx)
 
 	if listener != nil {
@@ -384,6 +390,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	)
 	gemHandler := handler.NewGemHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Gem)
 	goHandler := handler.NewGoHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Go)
+	goHandler.SetSumDBs(s.cfg.Upstream.GoSumDBs, s.cfg.Upstream.GoSumDBsOffline)
 	hexHandler := handler.NewHexHandlerWithUpstreams(
 		proxy,
 		s.cfg.BaseURL,
@@ -426,6 +433,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	helmHandler := handler.NewHelmHandlerWithOCIRegistries(
 		proxy, s.cfg.BaseURL, s.cfg.Upstream.Helm, s.cfg.Upstream.OCIDefault, s.cfg.Upstream.OCI)
 	apkHandler := handler.NewAPKHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.APK)
+	archHandler := handler.NewArchHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.Arch)
 	debianHandler := handler.NewDebianHandler(
 		proxy,
 		s.cfg.BaseURL,
@@ -433,8 +441,9 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 		s.cfg.Upstream.DebianRepositories,
 	)
 	rpmHandler := handler.NewRPMHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.RPM)
-	genericHandler := handler.NewGenericHandler(proxy, s.cfg.Upstream.Generic)
+	genericHandler := handler.NewGenericHandler(proxy, s.cfg.Upstream.Generic, s.cfg.Upstream.GenericArtifacts)
 
+	r = r.With(rejectQueryInPath)
 	r.Mount("/npm", http.StripPrefix("/npm", npmHandler.Routes()))
 	r.Mount("/cargo", http.StripPrefix("/cargo", cargoHandler.Routes()))
 	r.Mount("/gem", http.StripPrefix("/gem", gemHandler.Routes()))
@@ -455,6 +464,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	r.Mount("/v2", http.StripPrefix("/v2", containerHandler.Routes()))
 	r.Mount("/helm", http.StripPrefix("/helm", helmHandler.Routes()))
 	r.Mount("/apk", http.StripPrefix("/apk", apkHandler.Routes()))
+	r.Mount("/arch", http.StripPrefix("/arch", archHandler.Routes()))
 	r.Mount("/debian", http.StripPrefix("/debian", debianHandler.Routes()))
 	r.Mount("/rpm", http.StripPrefix("/rpm", rpmHandler.Routes()))
 	r.Mount("/generic", http.StripPrefix("/generic", genericHandler.Routes()))
@@ -490,7 +500,6 @@ func NewMirrorProxy(cfg *config.Config, db *database.DB, store storage.Storage, 
 	metadataClient, artifactClient := s.newUpstreamClients(0)
 	proxy := handler.NewProxy(db, store, fetch.NewFetcher(fetch.WithHTTPClient(artifactClient)), fetch.NewResolver(), logger)
 	proxy.HTTPClient = metadataClient
-	proxy.AuthForURL = s.authForURL
 	return proxy, s.newContainerHandler(proxy)
 }
 

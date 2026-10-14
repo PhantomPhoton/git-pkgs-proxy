@@ -173,7 +173,6 @@ type Proxy struct {
 	// storage at an internal one.
 	DirectServeBaseURL string
 	HTTPClient         *http.Client
-	AuthForURL         func(string) (headerName, headerValue string)
 
 	// StreamArtifacts streams artifacts from upstream without storing them.
 	// Each request fetches its own copy: there is no cache to check and
@@ -198,6 +197,11 @@ type Proxy struct {
 	fetchMu  sync.Mutex
 	inFlight map[string]*inflightFetch
 
+	// detachSlots caps the artifact fetches that keep running after their
+	// client went away (see DetachUpstreamFetch). Guarded by fetchMu while it
+	// is created.
+	detachSlots chan struct{}
+
 	// inFlightMeta does the same for metadata misses. Keyed by
 	// metadataCoalesceKey.
 	metaMu       sync.Mutex
@@ -206,6 +210,11 @@ type Proxy struct {
 	// rewrites caches metadata documents after their handler rewrites them.
 	// Nil leaves every request to rewrite its own copy.
 	rewrites *rewriteCache
+
+	// now is the clock rewritten metadata is dated by, and started the time
+	// the process started; see metadataDate.
+	now     func() time.Time
+	started time.Time
 }
 
 // CooldownPolicy supplies version-age filtering and package-specific durations.
@@ -230,6 +239,8 @@ func NewProxy(db *database.DB, store storage.Storage, fetcher fetch.FetcherInter
 		HTTPClient: &http.Client{
 			Timeout: defaultHTTPTimeout,
 		},
+		now:     time.Now,
+		started: time.Now(),
 	}
 }
 
@@ -244,6 +255,12 @@ type CacheResult struct {
 
 // GetOrFetchArtifact retrieves an artifact from cache or fetches from upstream.
 func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version, filename string) (*CacheResult, error) {
+	// NuGet ids are case-insensitive and the NuGet handler stores them
+	// lowercased, so a mirrored Newtonsoft.Json must land on the same record
+	// clients are served.
+	if ecosystem == "nuget" {
+		name = strings.ToLower(name)
+	}
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
 		return nil, err
@@ -367,7 +384,8 @@ func (p *Proxy) checkCache(ctx context.Context, pkgPURL, versionPURL, filename s
 	reader, err := p.Storage.Open(ctx, artifact.StoragePath)
 	metrics.RecordStorageOperation("read", time.Since(start))
 	if err != nil {
-		metrics.RecordStorageError("read")
+		metrics.RecordStorageError("read", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, Path: artifact.StoragePath, Err: err})
 		p.Logger.Warn("cached artifact missing from storage, will refetch",
 			"path", artifact.StoragePath, "error", err)
 		return nil, nil
@@ -378,7 +396,8 @@ func (p *Proxy) checkCache(ctx context.Context, pkgPURL, versionPURL, filename s
 			p.Logger.Error("cached artifact failed integrity check",
 				"purl", versionPURL, "filename", filename,
 				"path", artifact.StoragePath, "reason", reason)
-			metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem))
+			metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem), metrics.FailureDetail{
+				PURL: versionPURL, Filename: filename, Path: artifact.StoragePath, Err: errors.New(reason)})
 			if err := p.DB.DiscardArtifact(versionPURL, filename, artifact.StoragePath); err != nil {
 				p.Logger.Warn("failed to clear corrupt artifact from cache", "error", err)
 			}
@@ -421,7 +440,8 @@ func (p *Proxy) rejectUnusableCacheRecord(artifact *database.CachedArtifact, ver
 	p.Logger.Warn("cached artifact has unusable integrity metadata",
 		"purl", versionPURL, "filename", filename,
 		"path", artifact.StoragePath, "error", cause)
-	metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem))
+	metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(artifact.Ecosystem), metrics.FailureDetail{
+		PURL: versionPURL, Filename: filename, Path: artifact.StoragePath, Err: cause})
 	if err := p.DB.DiscardArtifact(versionPURL, filename, artifact.StoragePath); err != nil {
 		p.Logger.Warn("failed to clear unusable artifact from cache", "error", err)
 	}
@@ -459,7 +479,8 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 
 	if err != nil {
 		metrics.RecordUpstreamFetch(ecosystem, fetchDuration)
-		metrics.RecordUpstreamError(ecosystem, "fetch_failed")
+		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: info.URL, Err: err})
 		if errors.Is(err, fetch.ErrNotFound) {
 			return artifacts.Artifact{}, "", ErrUpstreamNotFound
 		}
@@ -491,7 +512,8 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	_ = artifact.Body.Close()
 	metrics.RecordStorageOperation("write", time.Since(storeStart))
 	if err != nil {
-		metrics.RecordStorageError("write")
+		metrics.RecordStorageError("write", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: upstreamURL, Path: storagePath, Err: err})
 		return artifacts.Artifact{}, "", fmt.Errorf("storing artifact: %w", err)
 	}
 
@@ -546,7 +568,8 @@ func (p *Proxy) openStoredArtifact(ctx context.Context, artifact artifacts.Artif
 	metrics.RecordStorageOperation("read", time.Since(readStart))
 
 	if err != nil {
-		metrics.RecordStorageError("read")
+		metrics.RecordStorageError("read", metrics.FailureDetail{
+			PURL: artifact.PURL, Filename: artifact.Filename, Path: storagePath, Err: err})
 		return nil, fmt.Errorf("opening cached artifact: %w", err)
 	}
 
@@ -612,7 +635,9 @@ type inflightFetch struct {
 // commit runs on that caller's context, so cancellation behaves as it did
 // uncoalesced and mirroring still relies on it aborting the fetch. If that
 // caller goes away, everyone sharing the fetch gets its error and the key is
-// released for a later retry.
+// released for a later retry. A context marked with DetachUpstreamFetch is the
+// exception: there commit keeps running after the caller goes away, so the
+// artifact still lands in the cache.
 //
 // Every sharing caller still records a cache miss, so the gap between
 // proxy_cache_misses_total and upstream fetch observations is what coalescing
@@ -669,12 +694,63 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		}
 	}
 
-	stored, path, err := commit(ctx)
+	commitCtx := ctx
+	if upstreamFetchDetached(ctx) && p.acquireDetachSlot() {
+		defer p.releaseDetachSlot()
+		commitCtx = context.WithoutCancel(ctx)
+	}
+	stored, path, err := commit(commitCtx)
 	f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, err
 	if err != nil {
 		return nil, err
 	}
 	return p.openStoredArtifact(ctx, stored, path)
+}
+
+type detachUpstreamFetchKey struct{}
+
+// DetachUpstreamFetch marks ctx so that an artifact fetch started under it
+// runs to completion even when ctx is cancelled. The server sets it on client
+// requests: a client that gives up on a slow cache miss (pacman aborts after
+// 10 s without data) would otherwise cancel the fetch, and every retry would
+// start again from zero, so a large artifact never reaches the cache. The
+// fetch stays bounded by the artifact HTTP client's timeout, and at most
+// maxDetachedFetches run detached at once. Mirror jobs leave it unset so
+// cancelling a job still aborts its fetches.
+func DetachUpstreamFetch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, detachUpstreamFetchKey{}, true)
+}
+
+func upstreamFetchDetached(ctx context.Context) bool {
+	detached, _ := ctx.Value(detachUpstreamFetchKey{}).(bool)
+	return detached
+}
+
+// maxDetachedFetches caps the artifact fetches that may outlive their client.
+// Without a cap a client could start any number of large uncached downloads
+// and hang up straight away, leaving each to run to the artifact client's
+// timeout. Fetches beyond the cap stay tied to their client, as before
+// detaching existed.
+const maxDetachedFetches = 64
+
+func (p *Proxy) acquireDetachSlot() bool {
+	p.fetchMu.Lock()
+	if p.detachSlots == nil {
+		p.detachSlots = make(chan struct{}, maxDetachedFetches)
+	}
+	slots := p.detachSlots
+	p.fetchMu.Unlock()
+
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Proxy) releaseDetachSlot() {
+	<-p.detachSlots
 }
 
 // fetchedArtifact is what a shared fetch hands its callers: metadata and a
@@ -982,7 +1058,6 @@ func (p *Proxy) ProxyUpstream(w http.ResponseWriter, r *http.Request, upstreamUR
 			req.Header.Set(header, v)
 		}
 	}
-	p.applyUpstreamAuth(req)
 
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
@@ -1002,7 +1077,6 @@ func (p *Proxy) ProxyFile(w http.ResponseWriter, r *http.Request, upstreamURL st
 		http.Error(w, "failed to create request", http.StatusInternalServerError)
 		return
 	}
-	p.applyUpstreamAuth(req)
 
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
@@ -1024,11 +1098,33 @@ func JSONError(w http.ResponseWriter, status int, message string) {
 // ErrUpstreamNotFound indicates the upstream returned 404.
 var ErrUpstreamNotFound = fmt.Errorf("upstream: %w", fetch.ErrNotFound)
 
+// upstreamNotFoundBodyLimit caps the part of an upstream 404 body kept in
+// upstreamNotFoundError.
+const upstreamNotFoundBodyLimit = 4 << 10
+
+// upstreamNotFoundError is ErrUpstreamNotFound with the start of the
+// upstream's 404 body, for handlers that relay the reason to clients.
+type upstreamNotFoundError struct {
+	body []byte
+}
+
+func (e *upstreamNotFoundError) Error() string { return ErrUpstreamNotFound.Error() }
+
+func (e *upstreamNotFoundError) Unwrap() error { return ErrUpstreamNotFound }
+
 // ErrArtifactBlocked indicates a pre-cache security scan blocked the artifact.
 var ErrArtifactBlocked = errors.New("artifact blocked by security scan")
 
 // ErrVersionDenied indicates an operator explicitly denied this package version.
 var ErrVersionDenied = errors.New("package version blocked by denylist")
+
+// ErrVersionNotFound indicates the requested version is not available through
+// the proxy, including when cooldown or other filtering removed it.
+var ErrVersionNotFound = errors.New("version not found")
+
+// ErrPackageNotFound indicates the requested package metadata is not available
+// through the proxy or upstream registry.
+var ErrPackageNotFound = errors.New("package not found")
 
 // serveArtifactError writes response for a failed fetch:
 // 404 when upstream reports artifact missing, 403 when a security scan or
@@ -1078,24 +1174,35 @@ func (p *Proxy) FetchOrCacheMetadata(ctx context.Context, ecosystem, cacheKey, u
 // joined a fetch gets its own validation error directly. It must not modify the
 // body, which joined callers share.
 func (p *Proxy) fetchOrCacheMetadata(ctx context.Context, ecosystem, cacheKey, upstreamURL, acceptEncoding string, validate func([]byte) error, acceptHeaders ...string) ([]byte, string, string, error) {
+	accept := contentTypeJSON
+	if len(acceptHeaders) > 0 && acceptHeaders[0] != "" {
+		accept = acceptHeaders[0]
+	}
+	res := p.lookupMetadata(ctx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate)
+	return res.body, res.contentType, res.contentEncoding, res.err
+}
+
+// fetchMetadataDocument is FetchOrCacheMetadata for callers that rewrite the
+// document and need to know which one they got: the result carries its
+// digest along with the body.
+func (p *Proxy) fetchMetadataDocument(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept string) metadataResult {
+	return p.lookupMetadata(ctx, ecosystem, cacheKey, upstreamURL, accept, "", nil)
+}
+
+// lookupMetadata implements fetchOrCacheMetadata and fetchMetadataDocument.
+func (p *Proxy) lookupMetadata(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding string, validate func([]byte) error) metadataResult {
 	if containsPathTraversal(cacheKey) {
-		return nil, "", "", fmt.Errorf("invalid cache key: %q", cacheKey)
+		return metadataResult{err: fmt.Errorf("invalid cache key: %q", cacheKey)}
 	}
 
 	// Serve from cache if within TTL (skip upstream entirely)
 	if _, hit := p.cachedMetadataState(ctx, ecosystem, cacheKey, validate); hit != nil {
 		metrics.RecordCacheHit(ecosystem)
-		return hit.body, hit.contentType, hit.contentEncoding, nil
+		return *hit
 	}
 	p.recordMetadataCacheMiss(ecosystem)
 
-	accept := contentTypeJSON
-	if len(acceptHeaders) > 0 && acceptHeaders[0] != "" {
-		accept = acceptHeaders[0]
-	}
-
-	res := p.coalescedMetadataMiss(ctx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate)
-	return res.body, res.contentType, res.contentEncoding, res.err
+	return p.coalescedMetadataMiss(ctx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate)
 }
 
 // coalescedMetadataMiss handles a metadata cache miss, sharing one upstream
@@ -1136,7 +1243,8 @@ func (p *Proxy) cachedMetadataState(ctx context.Context, ecosystem, cacheKey str
 	if entry != nil && p.MetadataTTL > 0 && entry.FetchedAt.Valid && time.Since(entry.FetchedAt.Time) < p.MetadataTTL {
 		data, ct, err := p.readCachedMetadata(ctx, entry, validate)
 		if err == nil {
-			return entry, &metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String}
+			hit := metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String}.describedBy(entry)
+			return entry, &hit
 		}
 		if validate != nil {
 			return nil, nil
@@ -1159,10 +1267,11 @@ func (p *Proxy) fetchMetadataFromUpstream(ctx context.Context, ecosystem, cacheK
 		err = validate(meta.body)
 	}
 	if err == nil {
+		var digest string
 		if p.CacheMetadata {
-			p.cacheMetadataBlob(ctx, ecosystem, cacheKey, metadataStoragePath(ecosystem, cacheKey), meta)
+			digest = p.cacheMetadataBlob(ctx, ecosystem, cacheKey, metadataStoragePath(ecosystem, cacheKey), meta)
 		}
-		return metadataResult{body: meta.body, contentType: meta.contentType, contentEncoding: meta.contentEncoding}
+		return metadataResult{body: meta.body, contentType: meta.contentType, contentEncoding: meta.contentEncoding, digest: digest}
 	}
 
 	// Upstream failed -- fall back to cache if available
@@ -1185,7 +1294,7 @@ func (p *Proxy) fetchMetadataFromUpstream(ctx context.Context, ecosystem, cacheK
 
 	p.Logger.Info("serving metadata from cache",
 		"ecosystem", ecosystem, "key", cacheKey)
-	return metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String}
+	return metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String, stale: true}.describedBy(entry)
 }
 
 // metadataResult is what a metadata lookup hands back. A shared fetch gives
@@ -1194,7 +1303,22 @@ type metadataResult struct {
 	body            []byte
 	contentType     string
 	contentEncoding string
-	err             error
+	// digest identifies body when the metadata cache stored it, and is
+	// empty otherwise.
+	digest string
+	err    error
+	// stale is set when the body is the cached copy served because upstream
+	// failed.
+	stale bool
+}
+
+// describedBy returns res with the digest that entry, the cache row its body
+// was read for, records.
+func (res metadataResult) describedBy(entry *database.MetadataCacheEntry) metadataResult {
+	if entry.ContentDigest.Valid {
+		res.digest = entry.ContentDigest.String
+	}
+	return res
 }
 
 // inflightMetadata is one metadata fetch that concurrent callers share. res is
@@ -1312,7 +1436,6 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 	if acceptEncoding != "" {
 		req.Header.Set(headerAcceptEncoding, acceptEncoding)
 	}
-	p.applyUpstreamAuth(req)
 
 	if entry != nil && entry.ETag.Valid {
 		req.Header.Set("If-None-Match", entry.ETag.String)
@@ -1351,7 +1474,8 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrUpstreamNotFound
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamNotFoundBodyLimit))
+		return nil, &upstreamNotFoundError{body: body}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
@@ -1377,16 +1501,22 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 	return meta, nil
 }
 
-// cacheMetadataBlob stores metadata bytes in storage and updates the database.
-func (p *Proxy) cacheMetadataBlob(ctx context.Context, ecosystem, cacheKey, storagePath string, meta *upstreamMetadata) {
+// cacheMetadataBlob stores metadata bytes in storage and updates the
+// database. It returns the digest it recorded for the bytes, or "" when they
+// were not cached.
+func (p *Proxy) cacheMetadataBlob(ctx context.Context, ecosystem, cacheKey, storagePath string, meta *upstreamMetadata) string {
 	if p.DB == nil || p.Storage == nil {
-		return
+		return ""
 	}
 
 	size, hash, err := p.Storage.Store(ctx, storagePath, bytes.NewReader(meta.body))
 	if err != nil {
 		p.Logger.Warn("failed to cache metadata", "ecosystem", ecosystem, "key", cacheKey, "error", err)
-		return
+		return ""
+	}
+	var digest string
+	if hash != "" {
+		digest = "sha256:" + hash
 	}
 
 	err = p.DB.UpsertMetadataCache(&database.MetadataCacheEntry{
@@ -1398,7 +1528,7 @@ func (p *Proxy) cacheMetadataBlob(ctx context.Context, ecosystem, cacheKey, stor
 		ContentEncoding: sql.NullString{String: meta.contentEncoding, Valid: meta.contentEncoding != ""},
 		// The digest identifies the stored bytes, so a rewrite cached for them
 		// can be found without reading them back (see storedRewrite).
-		ContentDigest: sql.NullString{String: "sha256:" + hash, Valid: hash != ""},
+		ContentDigest: sql.NullString{String: digest, Valid: digest != ""},
 		Size:          sql.NullInt64{Int64: size, Valid: true},
 		LastModified:  sql.NullTime{Time: meta.lastModified, Valid: !meta.lastModified.IsZero()},
 		FetchedAt:     sql.NullTime{Time: time.Now(), Valid: true},
@@ -1412,7 +1542,9 @@ func (p *Proxy) cacheMetadataBlob(ctx context.Context, ecosystem, cacheKey, stor
 		if delErr := p.Storage.Delete(ctx, storagePath); delErr != nil {
 			p.Logger.Warn("failed to discard metadata blob", "ecosystem", ecosystem, "key", cacheKey, "error", delErr)
 		}
+		return ""
 	}
+	return digest
 }
 
 // currentMetadataEntry re-reads the metadata cache row and returns it, or
@@ -1560,7 +1692,6 @@ func (p *Proxy) proxyMetadataStream(w http.ResponseWriter, r *http.Request, upst
 	if acceptEncoding != "" {
 		req.Header.Set(headerAcceptEncoding, acceptEncoding)
 	}
-	p.applyUpstreamAuth(req)
 
 	for _, header := range []string{"If-Modified-Since", "If-None-Match"} {
 		if v := r.Header.Get(header); v != "" {
@@ -1582,17 +1713,6 @@ func (p *Proxy) proxyMetadataStream(w http.ResponseWriter, r *http.Request, upst
 			}
 		}
 	})
-}
-
-func (p *Proxy) applyUpstreamAuth(req *http.Request) {
-	if p.AuthForURL == nil {
-		return
-	}
-
-	headerName, headerValue := p.AuthForURL(req.URL.String())
-	if headerName != "" && headerValue != "" {
-		req.Header.Set(headerName, headerValue)
-	}
 }
 
 // GetOrFetchArtifactFromURL retrieves an artifact from cache or fetches from a specific URL.
@@ -1711,7 +1831,8 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 	artifact, err := p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
-		metrics.RecordUpstreamError(ecosystem, "fetch_failed")
+		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: downloadURL, Err: err})
 		if errors.Is(err, fetch.ErrNotFound) {
 			return artifacts.Artifact{}, "", ErrUpstreamNotFound
 		}
@@ -1736,7 +1857,8 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 	artifact, err := fetchArtifact(ctx)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
-		metrics.RecordUpstreamError(ecosystem, "fetch_failed")
+		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: err})
 		if errors.Is(err, fetch.ErrNotFound) {
 			return nil, ErrUpstreamNotFound
 		}
@@ -1748,7 +1870,8 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 		onError: func(read int64, err error) {
 			p.Logger.Warn("streaming artifact from upstream failed",
 				"purl", versionPURL, "filename", filename, "url", upstreamURL, "bytes", read, "error", err)
-			metrics.RecordUpstreamError(ecosystem, "stream_failed")
+			metrics.RecordUpstreamError(ecosystem, "stream_failed", metrics.FailureDetail{
+				PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: err})
 		},
 	}
 	result := &CacheResult{
@@ -1773,7 +1896,8 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 	result.Reader, err = checks.wrapFailOnMismatch(body, func(reason string) {
 		p.Logger.Error("streamed artifact failed integrity check",
 			"purl", versionPURL, "filename", filename, "url", upstreamURL, "reason", reason)
-		metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(ecosystem))
+		metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(ecosystem), metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: errors.New(reason)})
 	})
 	if err != nil {
 		_ = artifact.Body.Close()

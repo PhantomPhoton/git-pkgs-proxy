@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/retention"
+	"github.com/git-pkgs/purl"
 )
 
 const (
@@ -25,6 +28,24 @@ const (
 )
 
 var composerUnsetJSON = []byte(`"` + composerUnset + `"`)
+
+// Archives are stored under pkg:composer/{vendor}/{package}, which purl
+// lowercases, so a package rule matches whatever case it is written in. The
+// spec also claims the "packagist" spelling git-pkgs writes into
+// packages.ecosystem.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "composer", CanonicalPackage: composerRetentionKey})
+}
+
+// composerRetentionKey maps a package rule to the stored package PURL. A
+// key without a vendor parses fine but can never match, since every stored
+// package has one, so it is refused.
+func composerRetentionKey(p *purl.PURL) (string, bool) {
+	if p == nil || p.Namespace == "" {
+		return "", false
+	}
+	return retention.DefaultCanonical("composer")(p)
+}
 
 // ComposerHandler handles Composer/Packagist registry protocol requests.
 type ComposerHandler struct {
@@ -127,14 +148,13 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 	repoURL, cacheKey := h.sourceFor(packageName)
 	upstreamURL := fmt.Sprintf("%s/p2/%s/%s.json", repoURL, vendor, pkg)
 
-	if rewritten, ok := h.proxy.storedRewrite("composer", cacheKey, h.proxyURL, cacheKey); ok {
-		w.Header().Set(headerContentType, "application/json")
-		_, _ = w.Write(rewritten)
+	if stored, ok := h.proxy.storedRewrite("composer", cacheKey, h.proxyURL, cacheKey); ok {
+		serveRewrittenMetadata(w, r, stored)
 		return
 	}
 
-	body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "composer", cacheKey, upstreamURL)
-	if err != nil {
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "composer", cacheKey, upstreamURL, contentTypeJSON)
+	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -144,19 +164,18 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	rewritten, err := h.proxy.cachedRewrite(r.Context(), "composer", h.proxyURL, cacheKey, body, h.rewriteMetadata)
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "composer", h.proxyURL, cacheKey, upstream.body, upstream.digest, h.rewriteMetadataKeeping)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return // the client left while waiting on a shared rewrite
 		}
 		h.proxy.Logger.Warn("failed to rewrite metadata, proxying original", "error", err)
 		w.Header().Set(headerContentType, "application/json")
-		_, _ = w.Write(body)
+		_, _ = w.Write(upstream.body)
 		return
 	}
 
-	w.Header().Set(headerContentType, "application/json")
-	_, _ = w.Write(rewritten)
+	serveRewrittenMetadata(w, r, rewritten)
 }
 
 // rewriteMetadata rewrites dist URLs in Composer metadata to point at this proxy.
@@ -169,16 +188,24 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 // of the original bytes: only dist values are written fresh, and minified
 // metadata stays minified.
 func (h *ComposerHandler) rewriteMetadata(body []byte) ([]byte, error) {
+	out, _, err := h.rewriteMetadataKeeping(body)
+	return out, err
+}
+
+// rewriteMetadataKeeping is rewriteMetadata that also reports the versions
+// it kept, each as its package name and version.
+func (h *ComposerHandler) rewriteMetadataKeeping(body []byte) ([]byte, []string, error) {
 	if !json.Valid(body) {
-		return nil, errors.New("composer metadata is not valid JSON")
+		return nil, nil, errors.New("composer metadata is not valid JSON")
 	}
 	format, _, err := lookupJSONString(body, "minified")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	minified := format == composerMinified
 
 	var out bytes.Buffer
+	var kept []string
 	out.Grow(len(body) + len(body)/8)
 	err = rewriteJSONMembers(&out, body, func(out *bytes.Buffer, m jsonMember) (bool, error) {
 		packages := m.value(body)
@@ -194,24 +221,25 @@ func (h *ComposerHandler) rewriteMetadata(body []byte) ([]byte, error) {
 			if err != nil {
 				return false, err
 			}
-			return true, h.writeVersions(out, packageName, versions, minified)
+			return true, h.writeVersions(out, packageName, versions, minified, &kept)
 		})
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out.Bytes(), nil
+	return out.Bytes(), kept, nil
 }
 
 // writeVersions writes one package's version list without the versions in
-// cooldown and with each dist pointing at this proxy.
+// cooldown and with each dist pointing at this proxy, and appends each version
+// it writes to kept as its package name and version.
 //
 // Minified lists stay minified. Each version written carries the fields that
 // differ from what the client has expanded so far, which is the upstream
 // entry itself unless filtered versions were dropped before it; then it also
 // carries the changes those versions made. Every version gets its own dist,
 // since the proxied URL names the version.
-func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, versions []byte, minified bool) error {
+func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, versions []byte, minified bool, kept *[]string) error {
 	packagePURL := canonicalPackagePURL("composer", packageName)
 	upstream, written := newComposerFields(), newComposerFields()
 	devReset, first := false, true
@@ -253,6 +281,7 @@ func (h *ComposerHandler) writeVersions(out *bytes.Buffer, packageName string, v
 			disableDefaultNotification(upstream)
 		}
 		h.writeVersion(out, packageName, version, upstream, written)
+		*kept = append(*kept, packageName+"\x00"+version)
 		return nil
 	})
 	out.WriteByte(']')
@@ -372,7 +401,7 @@ func (h *ComposerHandler) proxyDistURL(packageName, version, upstreamURL, distTy
 		return "", false
 	}
 	return fmt.Sprintf("%s/composer/files/%s/%s/%s/%s",
-		h.proxyURL, parts[0], parts[1], version, distFilename(upstreamURL, distType)), true
+		h.proxyURL, parts[0], parts[1], url.PathEscape(version), distFilename(upstreamURL, distType)), true
 }
 
 // distFilename returns the file name this proxy serves an archive under: the
@@ -410,6 +439,16 @@ func upstreamDistURL(listedURL, distType, filename string, branch bool) (string,
 	if filename == listed {
 		return listedURL, true
 	}
+	if commit, ok := shaQueryCommit(listed); ok {
+		requested, ok := shaQueryCommit(filename)
+		listedSha, requestedSha := "sha="+commit, "sha="+requested
+		idx := strings.LastIndex(listed, listedSha)
+		if !branch || !ok || idx < 0 || listed[:idx]+requestedSha+listed[idx+len(listedSha):] != filename {
+			return "", false
+		}
+		idx = strings.LastIndex(listedURL, listedSha)
+		return listedURL[:idx] + requestedSha + listedURL[idx+len(listedSha):], true
+	}
 	ext := path.Ext(listed)
 	commit := strings.TrimSuffix(listed, ext)
 	requested, ok := strings.CutSuffix(filename, ext)
@@ -418,6 +457,22 @@ func upstreamDistURL(listedURL, distType, filename string, branch bool) (string,
 	}
 	idx := strings.LastIndex(listedURL, commit)
 	return listedURL[:idx] + requested + listedURL[idx+len(commit):], true
+}
+
+// shaQueryCommit returns the commit an archive name passes in a sha query
+// parameter. GitLab names the archive of every commit archive.zip and picks
+// the commit that way.
+func shaQueryCommit(filename string) (string, bool) {
+	_, query, ok := strings.Cut(filename, "?")
+	if !ok {
+		return "", false
+	}
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return "", false
+	}
+	commit := values.Get("sha")
+	return commit, composerCommitPattern.MatchString(commit)
 }
 
 // composerFields holds one version's fields as Composer sees them after
@@ -520,21 +575,21 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		"package", packageName, "version", version,
 		"metadata_urls", metaURLs)
 
-	var downloadURL, distType string
+	var dist composerDist
 	for _, metaURL := range metaURLs {
-		url, typ, err := h.findDownloadURLFromMetadata(r.Context(), metaURL, packageName, version)
+		found, err := h.findDownloadURLFromMetadata(r.Context(), metaURL, packageName, version)
 		if err != nil {
 			h.proxy.Logger.Error("failed to fetch metadata", "error", err, "url", metaURL)
 			http.Error(w, "failed to fetch metadata", http.StatusBadGateway)
 			return
 		}
-		if url != "" {
-			downloadURL, distType = url, typ
+		if found.url != "" {
+			dist = found
 			break
 		}
 	}
 
-	if downloadURL == "" {
+	if dist.url == "" {
 		h.proxy.Logger.Debug("version not found in any metadata source",
 			"package", packageName, "version", version,
 			"tried_urls", metaURLs)
@@ -542,16 +597,22 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Lock files name archive URLs directly, so a version filtered out of the
+	// metadata still has to be withheld here.
+	if h.shouldFilterVersion(canonicalPackagePURL("composer", packageName), packageName, version, dist.published) {
+		http.Error(w, "version not found", http.StatusNotFound)
+		return
+	}
+
 	// The archive is cached under the file name from the path, so fetch the
 	// one that name stands for. Compare it as sent, the way rewriteDist handed
-	// it out. A query such as GitLab's ?sha= is compared but is not part of
-	// the cache key.
+	// it out, query included.
 	requested := path.Base(r.URL.EscapedPath())
 	if r.URL.RawQuery != "" {
 		requested += "?" + r.URL.RawQuery
 	}
-	listedURL := downloadURL
-	downloadURL, ok := upstreamDistURL(listedURL, distType, requested, isDevVersion(version))
+	listedURL := dist.url
+	downloadURL, ok := upstreamDistURL(listedURL, dist.distType, requested, isDevVersion(version))
 	if !ok {
 		h.proxy.Logger.Info("composer file not in upstream metadata",
 			"package", packageName, "version", version,
@@ -564,14 +625,58 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		"package", packageName, "version", version,
 		"download_url", downloadURL)
 
+	// Archives picked by ?sha= share one file name, so the commit goes into
+	// the name they are cached under. Proxy versions before that cached every
+	// commit under the shared name, which is dropped once a commit is fetched.
+	var sharedFilename string
+	if commit, ok := shaQueryCommit(requested); ok {
+		sharedFilename = h.routes.cacheFilename(packageName, filename)
+		ext := path.Ext(filename)
+		filename = strings.TrimSuffix(filename, ext) + "-" + commit + ext
+	}
 	cacheFilename := h.routes.cacheFilename(packageName, filename)
+	if commit := strings.TrimSuffix(filename, path.Ext(filename)); isDevVersion(version) && composerCommitPattern.MatchString(commit) {
+		h.discardOtherCommit(packageName, version, cacheFilename, commit)
+	}
 	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "composer", packageName, version, cacheFilename, downloadURL)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return
 	}
+	if sharedFilename != "" && !result.Cached {
+		if err := h.proxy.ClearCachedArtifact("composer", packageName, version, sharedFilename); err != nil {
+			h.proxy.Logger.Warn("failed to discard composer archive cached under a shared name",
+				"package", packageName, "version", version, "filename", sharedFilename, "error", err)
+		}
+	}
 
 	ServeArtifactRequest(w, r, result)
+}
+
+// discardOtherCommit clears a cached branch archive named for commit that was
+// fetched from another commit's URL. Proxy versions before the pinned-commit
+// fix cached the branch head under whatever commit a lock file asked for. The
+// record is only cleared while it still points at the object checked here.
+func (h *ComposerHandler) discardOtherCommit(packageName, version, cacheFilename, commit string) {
+	_, versionPURL, err := packagePURLStrings("composer", packageName, version)
+	if err != nil {
+		return
+	}
+	record, err := h.proxy.DB.GetArtifact(versionPURL, cacheFilename)
+	if err != nil {
+		h.proxy.Logger.Warn("failed to read composer cache record",
+			"purl", versionPURL, "filename", cacheFilename, "error", err)
+		return
+	}
+	if record == nil || !record.StoragePath.Valid || strings.Contains(record.UpstreamURL, commit) {
+		return
+	}
+	h.proxy.Logger.Warn("cached composer archive is from another commit, discarding",
+		"purl", versionPURL, "filename", cacheFilename, "upstream_url", record.UpstreamURL)
+	if err := h.proxy.DB.DiscardArtifact(versionPURL, cacheFilename, record.StoragePath.String); err != nil {
+		h.proxy.Logger.Warn("failed to discard composer cache record",
+			"purl", versionPURL, "filename", cacheFilename, "error", err)
+	}
 }
 
 // isDevVersion reports whether a Composer version string refers to a
@@ -597,23 +702,29 @@ func (h *ComposerHandler) metadataURLsForVersion(vendor, pkg, version string) []
 	return []string{stable, dev}
 }
 
+// composerDist is what a version's metadata says about its archive: the dist
+// URL and type, and the raw publish time the cooldown is checked against.
+type composerDist struct {
+	url, distType string
+	published     []byte
+}
+
 // findDownloadURLFromMetadata fetches a metadata document and returns the dist
-// URL and type for the given version, or an empty URL if the version is not
-// present. An error is returned only on transport failure; a missing document
-// (non-200) or a missing version both yield an empty URL so the caller can
-// fall back.
-func (h *ComposerHandler) findDownloadURLFromMetadata(ctx context.Context, metaURL, packageName, version string) (string, string, error) {
+// of the given version, with an empty URL if the version is not present. An
+// error is returned only on transport failure; a missing document (non-200)
+// or a missing version both yield an empty URL so the caller can fall back.
+func (h *ComposerHandler) findDownloadURLFromMetadata(ctx context.Context, metaURL, packageName, version string) (composerDist, error) {
 	h.proxy.Logger.Debug("fetching upstream metadata for download lookup",
 		"url", metaURL, "package", packageName, "version", version)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -621,42 +732,42 @@ func (h *ComposerHandler) findDownloadURLFromMetadata(ctx context.Context, metaU
 		"url", metaURL, "status", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
-		return "", "", nil
+		return composerDist{}, nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := h.proxy.ReadMetadata(resp.Body)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 
-	url, distType, err := composerDistURL(body, packageName, version)
+	dist, err := composerDistURL(body, packageName, version)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 	h.proxy.Logger.Debug("download URL lookup result",
 		"url", metaURL, "package", packageName, "version", version,
-		"download_url", url)
-	return url, distType, nil
+		"download_url", dist.url)
+	return dist, nil
 }
 
-// composerDistURL returns the upstream dist URL and type of version from
-// Composer metadata, or "" when the package has no such version or it has no
-// dist URL. It walks the version list in place, expanding only as much of the
-// minified format as it needs, since it runs on each archive the proxy has not
-// cached yet.
-func composerDistURL(body []byte, packageName, version string) (string, string, error) {
+// composerDistURL returns the upstream dist of version from Composer
+// metadata, with an empty URL when the package has no such version or it has
+// no dist URL. It walks the version list in place, expanding only as much of
+// the minified format as it needs, since it runs on each archive the proxy
+// has not cached yet.
+func composerDistURL(body []byte, packageName, version string) (composerDist, error) {
 	format, _, err := lookupJSONString(body, "minified")
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 	versions, err := lookupJSON(body, "packages", packageName)
 	if err != nil || len(versions) == 0 || versions[0] != '[' {
-		return "", "", err
+		return composerDist{}, err
 	}
 	minified := format == composerMinified
 
 	fields := newComposerFields()
-	var url, distType string
+	var dist composerDist
 	err = forEachJSONElement(versions, func(entry []byte) error {
 		if minified && jsonStringIs(entry, composerDevReset) {
 			fields.reset()
@@ -674,10 +785,11 @@ func composerDistURL(body []byte, packageName, version string) (string, string, 
 		if !jsonStringIs(fields.get("version"), version) {
 			return nil
 		}
-		dist := fields.get("dist")
-		url, _, _ = lookupJSONString(dist, "url")
-		if url != "" {
-			distType, _, _ = lookupJSONString(dist, "type")
+		distRaw := fields.get("dist")
+		dist.url, _, _ = lookupJSONString(distRaw, "url")
+		if dist.url != "" {
+			dist.distType, _, _ = lookupJSONString(distRaw, "type")
+			dist.published = fields.get("time")
 			return errStopScan
 		}
 		return nil
@@ -685,7 +797,7 @@ func composerDistURL(body []byte, packageName, version string) (string, string, 
 	if errors.Is(err, errStopScan) {
 		err = nil
 	}
-	return url, distType, err
+	return dist, err
 }
 
 // proxyUpstream forwards a request to packagist.org without caching.

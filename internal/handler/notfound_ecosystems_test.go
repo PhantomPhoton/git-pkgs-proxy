@@ -21,6 +21,8 @@ func TestArtifactDownloadUpstreamNotFoundReturns404(t *testing.T) {
 			func(p *Proxy) http.Handler { return NewRPMHandler(p, "http://localhost").Routes() }},
 		{"apk", "/alpine/v3.22/main/x86_64/busybox-1.37.0-r12.apk",
 			func(p *Proxy) http.Handler { return NewAPKHandler(p, "http://localhost", nil).Routes() }},
+		{"arch", "/archlinux/core/os/x86_64/bash-5.2.037-1-x86_64.pkg.tar.zst",
+			func(p *Proxy) http.Handler { return NewArchHandler(p, "http://localhost", nil).Routes() }},
 		{"nuget", "/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
 			func(p *Proxy) http.Handler { return NewNuGetHandler(p, "http://localhost").Routes() }},
 		{"pypi", "/packages/packages/ab/cd/ef0123456789/requests-2.31.0-py3-none-any.whl",

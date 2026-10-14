@@ -68,12 +68,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/git-pkgs/proxy/internal/denylist"
+	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/purl"
 	"gopkg.in/yaml.v3"
 )
@@ -116,6 +118,14 @@ type Config struct {
 	// Off by default. The proxy has no authentication of its own, so until this
 	// is enabled /ui exposes what is cached rather than who called.
 	UIRequestSources bool `json:"ui_request_sources" yaml:"ui_request_sources"`
+
+	// UIFailureDetails lists the latest failures behind each failure counter on
+	// /ui/analytics: the package, its upstream URL or storage path, and the
+	// error. URLs are shown without credentials or query strings.
+	//
+	// Off by default, for the same reason as UIRequestSources: package names and
+	// upstream hosts say what the proxy's users depend on.
+	UIFailureDetails bool `json:"ui_failure_details" yaml:"ui_failure_details"`
 
 	// Storage configures artifact storage.
 	Storage StorageConfig `json:"storage" yaml:"storage"`
@@ -407,6 +417,33 @@ type StorageConfig struct {
 	// of the proxy. False is incompatible with scanning, direct_serve and
 	// mirror_api, which all depend on stored artifacts. Default: true.
 	CacheArtifacts bool `json:"cache_artifacts" yaml:"cache_artifacts"`
+
+	// Retention evicts cached artifacts that have not been accessed for a
+	// configured time, per ecosystem and per package.
+	Retention RetentionConfig `json:"retention" yaml:"retention"`
+}
+
+// RetentionConfig configures age-based eviction of cached artifacts. An
+// artifact's age is the time since it was last served, or since it was
+// fetched when it has not been served since. Durations accept a "d" suffix
+// for days; "0" or empty means never evict by age.
+type RetentionConfig struct {
+	// Default applies to every ecosystem that supports retention and has no
+	// rule of its own.
+	Default string `json:"default" yaml:"default"`
+
+	// Ecosystems overrides the default per ecosystem key (e.g. "npm", "oci").
+	// Configuring an ecosystem whose retention is not supported yet is an
+	// error.
+	Ecosystems map[string]string `json:"ecosystems" yaml:"ecosystems"`
+
+	// Packages overrides the ecosystem rule for single packages, keyed by
+	// package PURL.
+	Packages map[string]string `json:"packages" yaml:"packages"`
+
+	// SweepInterval is how often expired artifacts are looked for, at least
+	// one minute. Default: "10m".
+	SweepInterval string `json:"sweep_interval" yaml:"sweep_interval"`
 }
 
 // GradleConfig configures Gradle-specific features.
@@ -536,6 +573,21 @@ type UpstreamConfig struct {
 	// Default: https://proxy.golang.org
 	Go string `json:"go" yaml:"go"`
 
+	// GoSumDBs maps Go checksum database names to their base URLs, served at
+	// /go/sumdb/{name}/ so the go command reaches the database through
+	// GOPROXY. Unknown names get 404, which makes the go command contact the
+	// database directly.
+	// Default when empty: {"sum.golang.org": "https://sum.golang.org"}.
+	GoSumDBs map[string]string `json:"go_sumdbs" yaml:"go_sumdbs"`
+
+	// GoSumDBsOffline keeps answering for a checksum database from its
+	// cached signed tree, however old, when the database cannot be reached.
+	// Set this when clients have no route to the database of their own;
+	// otherwise the proxy stops answering once the cached tree is older than
+	// metadata_ttl, and the go command contacts the database directly.
+	// Requires cache_metadata. Default: false.
+	GoSumDBsOffline bool `json:"go_sumdbs_offline" yaml:"go_sumdbs_offline"`
+
 	// Hex is the upstream Hex repository URL.
 	// Default: https://repo.hex.pm
 	Hex string `json:"hex" yaml:"hex"`
@@ -646,6 +698,12 @@ type UpstreamConfig struct {
 	// Default when empty: {"alpine": "https://dl-cdn.alpinelinux.org/alpine"}.
 	APK map[string]string `json:"apk" yaml:"apk"`
 
+	// Arch maps repository names to Arch Linux pacman mirror base URLs,
+	// served at /arch/{name}/. The remaining request path mirrors the
+	// upstream layout, e.g. /arch/archlinux/core/os/x86_64/core.db.
+	// Default when empty: {"archlinux": "https://geo.mirror.pkgbuild.com"}.
+	Arch map[string]string `json:"arch" yaml:"arch"`
+
 	// OCI maps names to OCI registry URLs. Requests to a named registry use
 	// the repository prefix upstream/{name}/, for example
 	// oci://proxy.example.com/upstream/ghcr/owner/chart.
@@ -660,10 +718,20 @@ type UpstreamConfig struct {
 	// Generic maps names to plain HTTP upstream base URLs, served at
 	// /generic/{name}/. The remaining request path and query string are
 	// appended to the upstream URL. GitHub release asset paths
-	// ({owner}/{repo}/releases/download/{tag}/{asset}) are cached in the
-	// artifact cache; everything else goes through the metadata cache.
+	// ({owner}/{repo}/releases/download/{tag}/{asset}) and paths matching
+	// GenericArtifacts are cached in the artifact cache; everything else
+	// goes through the metadata cache.
 	// Example: {"github": "https://github.com", "github-api": "https://api.github.com"}.
 	Generic map[string]string `json:"generic" yaml:"generic"`
+
+	// GenericArtifacts maps a Generic upstream name to regular expressions for
+	// its version-pinned download paths. A request path after
+	// /generic/{name}/ that one of them matches in full is cached in the
+	// artifact cache like a GitHub release asset. Each pattern needs `version`
+	// and `file` named groups; an optional `name` group names the package,
+	// which otherwise is the upstream name.
+	// Example: {"apache": ["dist/(?P<name>maven)/maven-3/(?P<version>[^/]+)/binaries/(?P<file>[^/]+)"]}.
+	GenericArtifacts map[string][]string `json:"generic_artifacts" yaml:"generic_artifacts"`
 
 	// Auth configures authentication for upstream registries.
 	// Keys are absolute URL scopes matched by scheme, host, effective port,
@@ -717,6 +785,12 @@ func (u *UpstreamConfig) Validate() error {
 	if err := validateNamedUpstreams("upstream.apk", u.APK); err != nil {
 		return err
 	}
+	if err := validateNamedUpstreams("upstream.arch", u.Arch); err != nil {
+		return err
+	}
+	if err := validateNamedUpstreams("upstream.go_sumdbs", u.GoSumDBs); err != nil {
+		return err
+	}
 	if err := validateNamedUpstreams("upstream.oci", u.OCI); err != nil {
 		return err
 	}
@@ -724,6 +798,9 @@ func (u *UpstreamConfig) Validate() error {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.generic", u.Generic); err != nil {
+		return err
+	}
+	if err := u.validateGenericArtifacts(); err != nil {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.debian_repositories", u.DebianRepositories); err != nil {
@@ -738,6 +815,48 @@ func (u *UpstreamConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (u *UpstreamConfig) validateGenericArtifacts() error {
+	for name, patterns := range u.GenericArtifacts {
+		if _, found := u.Generic[name]; !found {
+			return fmt.Errorf("invalid upstream.generic_artifacts name %q: no upstream.generic entry", name)
+		}
+		for _, pattern := range patterns {
+			if _, err := CompileGenericArtifactPattern(pattern); err != nil {
+				return fmt.Errorf("invalid upstream.generic_artifacts.%s pattern %q: %w", name, pattern, err)
+			}
+		}
+	}
+	return nil
+}
+
+// validateUpstream checks the upstream block, including the one setting in
+// it that depends on a top-level option.
+func (c *Config) validateUpstream() error {
+	if err := c.Upstream.Validate(); err != nil {
+		return err
+	}
+	if c.Upstream.GoSumDBsOffline && !c.CacheMetadata {
+		return fmt.Errorf("upstream.go_sumdbs_offline requires cache_metadata")
+	}
+	return nil
+}
+
+// CompileGenericArtifactPattern compiles an upstream.generic_artifacts pattern
+// so that it only matches a whole path, and checks it has the `version` and
+// `file` groups.
+func CompileGenericArtifactPattern(pattern string) (*regexp.Regexp, error) {
+	re, err := regexp.Compile(`^(?:` + pattern + `)$`)
+	if err != nil {
+		return nil, err
+	}
+	for _, group := range []string{"version", "file"} {
+		if re.SubexpIndex(group) < 0 {
+			return nil, fmt.Errorf("missing (?P<%s>...) group", group)
+		}
+	}
+	return re, nil
 }
 
 // debianReservedRepositoryNames are the upstream.debian archive's own root
@@ -895,6 +1014,9 @@ func Default() *Config {
 			Path:           "./cache/artifacts",
 			MaxSize:        "",
 			CacheArtifacts: true,
+			Retention: RetentionConfig{
+				SweepInterval: defaultRetentionSweepIntervalStr,
+			},
 		},
 		Database: DatabaseConfig{
 			Driver: "sqlite",
@@ -1027,6 +1149,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.UIBaseURL, "PROXY_UI_URL")
 	setEnvBool(&c.TrustForwardedFor, "PROXY_TRUST_FORWARDED_FOR")
 	setEnvBool(&c.UIRequestSources, "PROXY_UI_REQUEST_SOURCES")
+	setEnvBool(&c.UIFailureDetails, "PROXY_UI_FAILURE_DETAILS")
 	setEnvString(&c.Storage.URL, "PROXY_STORAGE_URL")
 	setEnvString(&c.Storage.Path, "PROXY_STORAGE_PATH")
 	setEnvString(&c.Storage.MaxSize, "PROXY_STORAGE_MAX_SIZE")
@@ -1034,6 +1157,8 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.Storage.DirectServeTTL, "PROXY_STORAGE_DIRECT_SERVE_TTL")
 	setEnvString(&c.Storage.DirectServeBaseURL, "PROXY_STORAGE_DIRECT_SERVE_BASE_URL")
 	setEnvBool(&c.Storage.CacheArtifacts, "PROXY_STORAGE_CACHE_ARTIFACTS")
+	setEnvString(&c.Storage.Retention.Default, "PROXY_STORAGE_RETENTION_DEFAULT")
+	setEnvString(&c.Storage.Retention.SweepInterval, "PROXY_STORAGE_RETENTION_SWEEP_INTERVAL")
 	setEnvString(&c.Database.Driver, "PROXY_DATABASE_DRIVER")
 	setEnvString(&c.Database.Path, "PROXY_DATABASE_PATH")
 	setEnvString(&c.Database.URL, "PROXY_DATABASE_URL")
@@ -1045,6 +1170,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvBool(&c.Upstream.AllowLoopback, "PROXY_UPSTREAM_ALLOW_LOOPBACK")
 	setEnvString(&c.Upstream.NPM, "PROXY_UPSTREAM_NPM")
 	setEnvBool(&c.Upstream.NPMFullMetadata, "PROXY_UPSTREAM_NPM_FULL_METADATA")
+	setEnvBool(&c.Upstream.GoSumDBsOffline, "PROXY_UPSTREAM_GO_SUMDBS_OFFLINE")
 	setEnvString(&c.Upstream.Cargo, "PROXY_UPSTREAM_CARGO")
 	setEnvString(&c.Upstream.CargoDownload, "PROXY_UPSTREAM_CARGO_DOWNLOAD")
 	setEnvString(&c.Upstream.Gem, "PROXY_UPSTREAM_GEM")
@@ -1212,11 +1338,15 @@ func (c *Config) validateComponents() error {
 		return err
 	}
 
+	if _, err := c.RetentionRules(retention.Default); err != nil {
+		return err
+	}
+
 	if _, err := denylist.New(c.Denylist.Packages); err != nil {
 		return err
 	}
 
-	if err := c.Upstream.Validate(); err != nil {
+	if err := c.validateUpstream(); err != nil {
 		return err
 	}
 
@@ -1262,7 +1392,7 @@ func (g *GradleBuildCacheConfig) Validate() error {
 	}
 
 	if g.MaxAge != "" && g.MaxAge != "0" {
-		if _, err := time.ParseDuration(g.MaxAge); err != nil {
+		if _, err := parseDayDuration(g.MaxAge); err != nil {
 			return fmt.Errorf("invalid gradle.build_cache.max_age %q: %w", g.MaxAge, err)
 		}
 	}
@@ -1297,6 +1427,10 @@ const (
 	defaultGradleBuildCacheSweepInterval = 10 * time.Minute
 	defaultGradleMaxUploadSizeStr        = "100MB"
 	defaultGradleSweepIntervalStr        = "10m"
+	defaultRetentionSweepInterval        = 10 * time.Minute
+	defaultRetentionSweepIntervalStr     = "10m"
+	minRetentionSweepInterval            = time.Minute
+	maxDurationDays                      = 36500
 	defaultScanningTimeoutStr            = "30s"
 )
 
@@ -1465,7 +1599,7 @@ func (c *Config) ParseGradleBuildCacheMaxAge() time.Duration {
 	if c.Gradle.BuildCache.MaxAge == "" || c.Gradle.BuildCache.MaxAge == "0" {
 		return 0
 	}
-	d, err := time.ParseDuration(c.Gradle.BuildCache.MaxAge)
+	d, err := parseDayDuration(c.Gradle.BuildCache.MaxAge)
 	if err != nil || d <= 0 {
 		return 0
 	}

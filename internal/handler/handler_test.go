@@ -990,7 +990,17 @@ func TestGetOrFetchArtifactFromURL_CacheMiss(t *testing.T) {
 	}
 }
 
+// isolateRecentFailures empties the process-wide failure history for the
+// test and again when it ends, so neither earlier tests nor repeated runs
+// reach its assertions.
+func isolateRecentFailures(t *testing.T) {
+	t.Helper()
+	metrics.ResetRecentFailures()
+	t.Cleanup(metrics.ResetRecentFailures)
+}
+
 func TestGetOrFetchArtifactFromURL_FetchError(t *testing.T) {
+	isolateRecentFailures(t)
 	proxy, _, _, fetcher := setupTestProxy(t)
 	fetcher.fetchErr = errors.New("connection refused")
 	errorsBefore := testutil.ToFloat64(metrics.UpstreamErrors.WithLabelValues("pypi", "fetch_failed"))
@@ -1005,9 +1015,15 @@ func TestGetOrFetchArtifactFromURL_FetchError(t *testing.T) {
 	if diff := testutil.ToFloat64(metrics.UpstreamErrors.WithLabelValues("pypi", "fetch_failed")) - errorsBefore; diff != 1 {
 		t.Errorf("upstream errors delta = %.0f, want 1", diff)
 	}
+	recent := metrics.RecentFailures("proxy_upstream_errors_total", map[string]string{"ecosystem": "pypi", "error_type": "fetch_failed"})
+	if len(recent) != 1 || recent[0].PURL != "pkg:pypi/fail@1.0.0" ||
+		recent[0].URL != "https://pypi.org/files/fail-1.0.0.tar.gz" || recent[0].Error != "connection refused" {
+		t.Errorf("upstream failures = %+v, want one: the failed package, its URL and the error", recent)
+	}
 }
 
 func TestGetOrFetchArtifactFromURL_StoreError(t *testing.T) {
+	isolateRecentFailures(t)
 	proxy, _, store, fetcher := setupTestProxy(t)
 	store.storeErr = errors.New("disk full")
 	errorsBefore := testutil.ToFloat64(metrics.StorageErrors.WithLabelValues("write"))
@@ -1025,6 +1041,11 @@ func TestGetOrFetchArtifactFromURL_StoreError(t *testing.T) {
 	}
 	if diff := testutil.ToFloat64(metrics.StorageErrors.WithLabelValues("write")) - errorsBefore; diff != 1 {
 		t.Errorf("storage errors delta = %.0f, want 1", diff)
+	}
+	recent := metrics.RecentFailures("proxy_storage_errors_total", map[string]string{"operation": "write"})
+	if len(recent) != 1 || recent[0].PURL != "pkg:pypi/fail@1.0.0" || recent[0].Filename != "fail-1.0.0.tar.gz" ||
+		recent[0].Path == "" || recent[0].Error != "disk full" {
+		t.Errorf("storage failures = %+v, want one: the failed package, its storage path and the error", recent)
 	}
 }
 

@@ -171,7 +171,7 @@ func (s *Server) handleAnalytics(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Error("failed to gather runtime metrics", "error", err)
 	} else {
-		data.Runtime = runtimeView(snap)
+		data.Runtime = runtimeView(snap, s.cfg != nil && s.cfg.UIFailureDetails)
 		if s.cfg != nil && s.cfg.UIRequestSources {
 			data.Runtime.SourcesOn = true
 			data.Runtime.Sources = s.sources.Top(analyticsTopSources)

@@ -7,12 +7,21 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
 	pubUpstream  = "https://pub.dev"
 	pubPathParts = 2 // name + version in path split by /versions/
 )
+
+// Packages are stored under pkg:pub/{name} with the name from the download
+// path, and purl keeps pub names as they are, so package rules use the
+// default key mapping.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "pub", CanonicalPackage: retention.DefaultCanonical("pub")})
+}
 
 // PubHandler handles pub.dev registry protocol requests.
 type PubHandler struct {

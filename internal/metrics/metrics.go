@@ -62,6 +62,14 @@ var (
 		},
 	)
 
+	ArtifactsEvicted = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "proxy_artifacts_evicted_total",
+			Help: "Total number of cached artifacts evicted, by reason (lru or retention) and ecosystem",
+		},
+		[]string{"reason", "ecosystem"},
+	)
+
 	// Upstream metrics
 	UpstreamFetchDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -250,6 +258,7 @@ func init() {
 		CacheMisses,
 		CacheSize,
 		CachedArtifacts,
+		ArtifactsEvicted,
 		UpstreamFetchDuration,
 		UpstreamErrors,
 		CircuitBreakerState,
@@ -309,6 +318,16 @@ func RecordCacheHit(ecosystem string) {
 	CacheHits.WithLabelValues(purl.NormalizeEcosystem(ecosystem)).Inc()
 }
 
+// RecordArtifactEvicted counts one evicted artifact. ecosystem is the
+// package record's value, normalized like the cache hit counter; an artifact
+// without a package record counts as "other".
+func RecordArtifactEvicted(reason, ecosystem string) {
+	if ecosystem == "" {
+		ecosystem = "other"
+	}
+	ArtifactsEvicted.WithLabelValues(reason, purl.NormalizeEcosystem(ecosystem)).Inc()
+}
+
 // RecordCacheMiss increments cache miss counter.
 func RecordCacheMiss(ecosystem string) {
 	CacheMisses.WithLabelValues(purl.NormalizeEcosystem(ecosystem)).Inc()
@@ -319,9 +338,12 @@ func RecordUpstreamFetch(ecosystem string, duration time.Duration) {
 	UpstreamFetchDuration.WithLabelValues(ecosystem).Observe(duration.Seconds())
 }
 
-// RecordUpstreamError increments upstream error counter.
-func RecordUpstreamError(ecosystem, errorType string) {
+// RecordUpstreamError increments upstream error counter and keeps the detail
+// for /ui/analytics.
+func RecordUpstreamError(ecosystem, errorType string, detail FailureDetail) {
 	UpstreamErrors.WithLabelValues(ecosystem, errorType).Inc()
+	recordFailure("proxy_upstream_errors_total",
+		map[string]string{"ecosystem": ecosystem, "error_type": errorType}, detail)
 }
 
 // RecordStorageOperation tracks storage operation duration.
@@ -329,20 +351,26 @@ func RecordStorageOperation(operation string, duration time.Duration) {
 	StorageOperationDuration.WithLabelValues(operation).Observe(duration.Seconds())
 }
 
-// RecordIntegrityFailure increments the integrity failure counter.
-func RecordIntegrityFailure(ecosystem string) {
+// RecordIntegrityFailure increments the integrity failure counter and keeps
+// the detail for /ui/analytics.
+func RecordIntegrityFailure(ecosystem string, detail FailureDetail) {
 	IntegrityFailures.WithLabelValues(ecosystem).Inc()
+	recordFailure("proxy_integrity_failures_total", map[string]string{"ecosystem": ecosystem}, detail)
 }
 
-// RecordHealthProbeFailure increments the health probe failure counter.
+// RecordHealthProbeFailure increments the health probe failure counter and
+// keeps the detail for /ui/analytics.
 // step is one of: "write", "size", "read", "verify", "delete".
-func RecordHealthProbeFailure(step string) {
+func RecordHealthProbeFailure(step string, detail FailureDetail) {
 	HealthProbeFailures.WithLabelValues(step).Inc()
+	recordFailure("proxy_health_probe_failures_total", map[string]string{"step": step}, detail)
 }
 
-// RecordStorageError increments storage error counter.
-func RecordStorageError(operation string) {
+// RecordStorageError increments storage error counter and keeps the detail
+// for /ui/analytics.
+func RecordStorageError(operation string, detail FailureDetail) {
 	StorageErrors.WithLabelValues(operation).Inc()
+	recordFailure("proxy_storage_errors_total", map[string]string{"operation": operation}, detail)
 }
 
 // RecordScanResult tracks a completed pre-cache scan call.
@@ -356,8 +384,12 @@ func RecordScanResult(ecosystem, scannerName string, allowed bool, duration time
 
 // RecordScanError increments the scan error counter.
 // errorType is one of: "error" (scanner call failed), "timeout", "cancelled".
-func RecordScanError(ecosystem, scannerName, errorType string) {
-	ScanErrors.WithLabelValues(purl.NormalizeEcosystem(ecosystem), scannerName, errorType).Inc()
+// The detail is kept for /ui/analytics.
+func RecordScanError(ecosystem, scannerName, errorType string, detail FailureDetail) {
+	ecosystem = purl.NormalizeEcosystem(ecosystem)
+	ScanErrors.WithLabelValues(ecosystem, scannerName, errorType).Inc()
+	recordFailure("proxy_scan_errors_total",
+		map[string]string{"ecosystem": ecosystem, "scanner": scannerName, "error_type": errorType}, detail)
 }
 
 // UpdateCacheStats updates cache size and artifact count gauges.

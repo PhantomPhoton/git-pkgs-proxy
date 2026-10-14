@@ -3,11 +3,22 @@ package handler
 import (
 	"net/http"
 	"strings"
+
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
 	conanUpstream = "https://center.conan.io"
 )
+
+// Recipe and package archives are stored under pkg:conan/{name}, with the
+// version as the version and the revisions and any user/channel in the
+// filename, and purl keeps conan names as they are. A package rule therefore
+// covers every version, revision and user/channel of a recipe, and uses the
+// default key mapping.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "conan", CanonicalPackage: retention.DefaultCanonical("conan")})
+}
 
 // ConanHandler handles Conan registry protocol requests.
 type ConanHandler struct {

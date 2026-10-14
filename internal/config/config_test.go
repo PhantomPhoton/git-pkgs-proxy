@@ -463,6 +463,7 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("PROXY_ACCESS_LOG_PATH", "/tmp/proxy-access.jsonl")
 	t.Setenv("PROXY_TRUST_FORWARDED_FOR", "true")
 	t.Setenv("PROXY_UI_REQUEST_SOURCES", "true")
+	t.Setenv("PROXY_UI_FAILURE_DETAILS", "true")
 	t.Setenv("PROXY_UPSTREAM_ALLOW_PRIVATE_HOSTS", "registry.internal, 10.0.0.12")
 	t.Setenv("PROXY_UPSTREAM_ALLOW_LOOPBACK", "true")
 	t.Setenv("PROXY_GRADLE_BUILD_CACHE_READ_ONLY", "true")
@@ -499,6 +500,9 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if !cfg.UIRequestSources {
 		t.Error("UIRequestSources = false, want true from the environment")
+	}
+	if !cfg.UIFailureDetails {
+		t.Error("UIFailureDetails = false, want true from the environment")
 	}
 	if got := strings.Join(cfg.Upstream.AllowPrivateHosts, ","); got != "registry.internal,10.0.0.12" {
 		t.Errorf("Upstream.AllowPrivateHosts = %q, want %q", got, "registry.internal,10.0.0.12")
@@ -1364,11 +1368,15 @@ func TestValidateNamedUpstreams(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "valid Helm, OCI, APK, and generic upstreams",
+			name: "valid Helm, OCI, APK, Arch, and generic upstreams",
 			modify: func(cfg *Config) {
 				cfg.Upstream.Helm = map[string]string{"bitnami": "https://charts.bitnami.com/bitnami"}
 				cfg.Upstream.OCI = map[string]string{"ghcr": "https://ghcr.io"}
 				cfg.Upstream.APK = map[string]string{"alpine": "https://dl-cdn.alpinelinux.org/alpine"}
+				cfg.Upstream.Arch = map[string]string{
+					"archlinux":    "https://geo.mirror.pkgbuild.com",
+					"archlinuxarm": "https://de3.mirror.archlinuxarm.org",
+				}
 				cfg.Upstream.Generic = map[string]string{
 					"github":     "https://github.com",
 					"github-api": "https://api.github.com",
@@ -1379,6 +1387,40 @@ func TestValidateNamedUpstreams(t *testing.T) {
 			name: "generic upstream name contains path separator",
 			modify: func(cfg *Config) {
 				cfg.Upstream.Generic = map[string]string{"github/releases": "https://github.com"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "generic artifact patterns",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Generic = map[string]string{"apache": "https://archive.apache.org"}
+				cfg.Upstream.GenericArtifacts = map[string][]string{
+					"apache": {`dist/(?P<name>maven)/maven-3/(?P<version>[^/]+)/binaries/(?P<file>[^/]+)`},
+				}
+			},
+		},
+		{
+			name: "generic artifact patterns for an unknown upstream",
+			modify: func(cfg *Config) {
+				cfg.Upstream.GenericArtifacts = map[string][]string{
+					"apache": {`(?P<version>[^/]+)/(?P<file>[^/]+)`},
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name: "generic artifact pattern does not compile",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Generic = map[string]string{"apache": "https://archive.apache.org"}
+				cfg.Upstream.GenericArtifacts = map[string][]string{"apache": {`(?P<version>[^/]+/(?P<file>[^/]+)`}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "generic artifact pattern without a file group",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Generic = map[string]string{"apache": "https://archive.apache.org"}
+				cfg.Upstream.GenericArtifacts = map[string][]string{"apache": {`(?P<version>[^/]+)/[^/]+`}}
 			},
 			wantErr: true,
 		},
@@ -1496,6 +1538,20 @@ func TestValidateNamedUpstreams(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "Arch upstream name contains path separator",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Arch = map[string]string{"arch/linux": "https://geo.mirror.pkgbuild.com"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "Arch upstream URL is not absolute",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Arch = map[string]string{"archlinux": "geo.mirror.pkgbuild.com"}
+			},
+			wantErr: true,
+		},
+		{
 			name: "valid Debian repository",
 			modify: func(cfg *Config) {
 				cfg.Upstream.DebianRepositories = map[string]string{
@@ -1541,6 +1597,61 @@ func TestValidateNamedUpstreams(t *testing.T) {
 				cfg.Upstream.DebianRepositories = map[string]string{"dists": "https://security.debian.org"}
 			},
 			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			tt.modify(cfg)
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateGoSumDBs(t *testing.T) {
+	tests := []struct {
+		name    string
+		modify  func(*Config)
+		wantErr bool
+	}{
+		{
+			name: "valid Go checksum database",
+			modify: func(cfg *Config) {
+				cfg.Upstream.GoSumDBs = map[string]string{"sum.golang.org": "https://sum.golang.org"}
+			},
+		},
+		{
+			name: "Go checksum database name contains path separator",
+			modify: func(cfg *Config) {
+				cfg.Upstream.GoSumDBs = map[string]string{"sum.golang.org/x": "https://sum.golang.org"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "Go checksum database URL is not absolute",
+			modify: func(cfg *Config) {
+				cfg.Upstream.GoSumDBs = map[string]string{"sum.golang.org": "sum.golang.org"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "Go checksum database offline mode requires metadata caching",
+			modify: func(cfg *Config) {
+				cfg.CacheMetadata = false
+				cfg.Upstream.GoSumDBsOffline = true
+			},
+			wantErr: true,
+		},
+		{
+			name: "Go checksum database offline mode with metadata caching",
+			modify: func(cfg *Config) {
+				cfg.CacheMetadata = true
+				cfg.Upstream.GoSumDBsOffline = true
+			},
 		},
 	}
 

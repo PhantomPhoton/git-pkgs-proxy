@@ -32,6 +32,7 @@ type RuntimeView struct {
 	StorageErrors     []LabelledCount
 	IntegrityFailures []LabelledCount
 	ProbeFailures     []LabelledCount
+	Evictions         []LabelledCount
 
 	Breakers     []BreakerRow
 	BreakerTrips []LabelledCount
@@ -49,6 +50,12 @@ type RuntimeView struct {
 	// SourcesOn gates the caller table. The page is unauthenticated, so the
 	// addresses behind it are published only when asked for.
 	SourcesOn bool
+	// FailureDetailsOn gates the recent failures listed under each failure
+	// row, for the same reason as SourcesOn.
+	FailureDetailsOn bool
+	// HasFailures is set when any failure counter has fired, which is when the
+	// note about turning failure details on is worth showing.
+	HasFailures bool
 }
 
 // ClientRow is one client tool's share of requests and bytes.
@@ -64,6 +71,21 @@ type LabelledCount struct {
 	Count string
 	// Bad marks a failure row, which the template tints.
 	Bad bool
+	// Recent lists the latest failures behind the count, newest first.
+	Recent []FailureRow
+	// series is the counter series the row was rendered from, for looking up
+	// what was recorded against it.
+	series map[string]string
+}
+
+// FailureRow is one recorded failure behind a failure counter.
+type FailureRow struct {
+	Age      string
+	PURL     string
+	Filename string
+	URL      string
+	Path     string
+	Error    string
 }
 
 // LabelledStat is a histogram series rendered as a row: how many observations,
@@ -81,13 +103,17 @@ type BreakerRow struct {
 	Open     bool
 }
 
-// runtimeView shapes a registry snapshot for the analytics page.
-func runtimeView(snap *metrics.Snapshot) RuntimeView {
+// runtimeView shapes a registry snapshot for the analytics page. With
+// failureDetails set, each failure row carries the latest failures behind it.
+func runtimeView(snap *metrics.Snapshot, failureDetails bool) RuntimeView {
 	if snap == nil {
 		return RuntimeView{}
 	}
 
-	v := RuntimeView{Available: true}
+	v := RuntimeView{Available: true, FailureDetailsOn: failureDetails}
+	failures := func(name string, labels ...string) []LabelledCount {
+		return failureRows(snap, name, failureDetails, labels...)
+	}
 
 	requests := snap.Sum("proxy_requests_total")
 	v.Requests = formatCount(int64(requests))
@@ -106,20 +132,23 @@ func runtimeView(snap *metrics.Snapshot) RuntimeView {
 
 	v.UpstreamFetches = formatCount(int64(snap.Count("proxy_upstream_fetch_duration_seconds")))
 	v.UpstreamFetchMean = formatDuration(snap.Mean("proxy_upstream_fetch_duration_seconds"))
-	v.UpstreamErrors = failureRows(snap, "proxy_upstream_errors_total", "ecosystem", "error_type")
+	v.UpstreamErrors = failures("proxy_upstream_errors_total", "ecosystem", "error_type")
 
 	v.StorageOps = histogramRows(snap, "proxy_storage_operation_duration_seconds", "operation")
-	v.StorageErrors = failureRows(snap, "proxy_storage_errors_total", "operation")
-	v.IntegrityFailures = failureRows(snap, "proxy_integrity_failures_total", "ecosystem")
-	v.ProbeFailures = failureRows(snap, "proxy_health_probe_failures_total", "step")
+	v.StorageErrors = failures("proxy_storage_errors_total", "operation")
+	v.IntegrityFailures = failures("proxy_integrity_failures_total", "ecosystem")
+	v.ProbeFailures = failures("proxy_health_probe_failures_total", "step")
+	v.Evictions = countRows(snap, "proxy_artifacts_evicted_total", "reason", "ecosystem")
 
 	v.Breakers = breakerRows(snap)
-	v.BreakerTrips = failureRows(snap, "proxy_circuit_breaker_trips_total", "registry")
+	v.BreakerTrips = failures("proxy_circuit_breaker_trips_total", "registry")
 
 	v.Scans = histogramRows(snap, "proxy_scan_duration_seconds", "ecosystem", "scanner")
-	v.ScansBlocked = failureRows(snap, "proxy_scan_blocked_total", "ecosystem", "scanner")
-	v.ScanErrors = failureRows(snap, "proxy_scan_errors_total", "ecosystem", "scanner", "error_type")
+	v.ScansBlocked = failures("proxy_scan_blocked_total", "ecosystem", "scanner")
+	v.ScanErrors = failures("proxy_scan_errors_total", "ecosystem", "scanner", "error_type")
 	v.ScanningOn = len(v.Scans) > 0 || len(v.ScansBlocked) > 0 || len(v.ScanErrors) > 0
+	v.HasFailures = len(v.UpstreamErrors) > 0 || len(v.StorageErrors) > 0 || len(v.IntegrityFailures) > 0 ||
+		len(v.ProbeFailures) > 0 || len(v.ScanErrors) > 0
 
 	v.ResponseBytes = formatSize(int64(snap.Sum("proxy_response_bytes_total")))
 	v.Clients = clientRows(snap)
@@ -200,17 +229,48 @@ func statusClasses(snap *metrics.Snapshot) []LabelledCount {
 // failureRows renders every non-zero series of a failure counter, keyed by the
 // joined values of the given labels. Zero-valued series are dropped: a counter
 // that has never fired carries no information, and a wall of zeroes buries the
-// rows that matter.
-func failureRows(snap *metrics.Snapshot, name string, labels ...string) []LabelledCount {
+// rows that matter. With withRecent set, each row carries the latest failures
+// recorded for its series.
+func failureRows(snap *metrics.Snapshot, name string, withRecent bool, labels ...string) []LabelledCount {
+	rows := countRows(snap, name, labels...)
+	for i := range rows {
+		rows[i].Bad = true
+		if withRecent {
+			rows[i].Recent = recentFailureRows(metrics.RecentFailures(name, rows[i].series))
+		}
+	}
+	return rows
+}
+
+// countRows renders every non-zero series of a counter as a row.
+func countRows(snap *metrics.Snapshot, name string, labels ...string) []LabelledCount {
 	var rows []LabelledCount
 	for _, s := range snap.Samples(name) {
 		if s.Value == 0 {
 			continue
 		}
 		rows = append(rows, LabelledCount{
-			Label: joinLabels(s, labels...),
-			Count: formatCount(int64(s.Value)),
-			Bad:   true,
+			Label:  joinLabels(s, labels...),
+			Count:  formatCount(int64(s.Value)),
+			series: s.Labels,
+		})
+	}
+	return rows
+}
+
+func recentFailureRows(failures []metrics.Failure) []FailureRow {
+	if len(failures) == 0 {
+		return nil
+	}
+	rows := make([]FailureRow, 0, len(failures))
+	for _, f := range failures {
+		rows = append(rows, FailureRow{
+			Age:      formatTimeAgo(f.At),
+			PURL:     f.PURL,
+			Filename: f.Filename,
+			URL:      f.URL,
+			Path:     f.Path,
+			Error:    f.Error,
 		})
 	}
 	return rows

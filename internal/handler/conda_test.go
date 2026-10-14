@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/git-pkgs/cooldown"
+	"github.com/git-pkgs/purl"
 )
 
 func TestCondaParseFilename(t *testing.T) {
@@ -301,5 +302,37 @@ func TestCondaHandleRepodataWithoutCooldown(t *testing.T) {
 	// Without cooldown, should proxy directly (response comes from upstream)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestCondaRetentionKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+		ok   bool
+	}{
+		{"pkg:conda/conda-forge/numpy", "pkg:conda/conda-forge%2Fnumpy", true},
+		{"pkg:conda/conda-forge%2Fnumpy", "pkg:conda/conda-forge%2Fnumpy", true},
+		{"pkg:conda/conda-forge/PyYAML", "pkg:conda/conda-forge%2Fpyyaml", true},
+		{"pkg:conda/Conda-Forge/numpy", "pkg:conda/Conda-Forge%2Fnumpy", true},
+		{"pkg:conda/conda-forge/label/rc/numpy", "", false},
+		{"pkg:conda/conda-forge%2Flabel%2Frc%2Fnumpy", "", false},
+		{"pkg:conda/numpy", "", false},
+		{"pkg:conda/%2Fnumpy", "", false},
+		{"pkg:conda/conda-forge%2F", "", false},
+		{"pkg:npm/conda-forge/numpy", "", false},
+	}
+	for _, tt := range tests {
+		p, err := purl.Parse(tt.key)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tt.key, err)
+		}
+		got, ok := condaRetentionKey(p)
+		if ok != tt.ok || (ok && got != tt.want) {
+			t.Errorf("condaRetentionKey(%s) = %q, %v, want %q, %v", tt.key, got, ok, tt.want, tt.ok)
+		}
+	}
+	if _, ok := condaRetentionKey(nil); ok {
+		t.Error("condaRetentionKey(nil) accepted")
 	}
 }

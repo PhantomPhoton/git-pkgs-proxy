@@ -44,6 +44,7 @@ var metricSurface = map[string]string{
 	"proxy_health_probe_failures_total":        "Runtime: Health probe failures",
 	"proxy_circuit_breaker_state":              "Runtime: Circuit breakers",
 	"proxy_circuit_breaker_trips_total":        "Runtime: Circuit breaker trips",
+	"proxy_artifacts_evicted_total":            "Runtime: Evicted artifacts",
 	"proxy_scan_duration_seconds":              "Runtime: Pre-cache scanning -- Scans",
 	"proxy_scan_blocked_total":                 "Runtime: Pre-cache scanning -- Artifacts blocked",
 	"proxy_scan_errors_total":                  "Runtime: Pre-cache scanning -- Scan errors",
@@ -53,6 +54,7 @@ var metricSurface = map[string]string{
 // on the analytics page. The page is meant to be a complete view of what
 // /metrics exposes, so a silently unsurfaced metric is a gap, not a detail.
 func TestEveryMetricIsSurfaced(t *testing.T) {
+	isolateRecentFailures(t)
 	// Touch every metric family so it is present in the registry output, since
 	// a vector with no observed label values gathers as nothing at all.
 	metrics.RecordRequest("npm", 200, 0)
@@ -60,16 +62,17 @@ func TestEveryMetricIsSurfaced(t *testing.T) {
 	metrics.RecordCacheHit("npm")
 	metrics.RecordCacheMiss("npm")
 	metrics.RecordUpstreamFetch("npm", 0)
-	metrics.RecordUpstreamError("npm", "fetch_failed")
+	metrics.RecordUpstreamError("npm", "fetch_failed", metrics.FailureDetail{})
 	metrics.RecordStorageOperation("get", 0)
-	metrics.RecordStorageError("get")
-	metrics.RecordIntegrityFailure("npm")
-	metrics.RecordHealthProbeFailure("write")
+	metrics.RecordStorageError("get", metrics.FailureDetail{})
+	metrics.RecordIntegrityFailure("npm", metrics.FailureDetail{})
+	metrics.RecordHealthProbeFailure("write", metrics.FailureDetail{})
 	metrics.UpdateCircuitBreakerState("example.test", 0)
 	metrics.RecordCircuitBreakerTrip("example.test")
 	metrics.RecordScanResult("npm", "clamav", false, 0)
-	metrics.RecordScanError("npm", "clamav", "timeout")
+	metrics.RecordScanError("npm", "clamav", "timeout", metrics.FailureDetail{})
 	metrics.UpdateCacheStats(1, 1)
+	metrics.RecordArtifactEvicted("retention", "npm")
 	metrics.UpdateEcosystemStats([]metrics.EcosystemStats{{Ecosystem: "npm", DownloadedBytes: 1}})
 
 	snap, err := metrics.Gather()

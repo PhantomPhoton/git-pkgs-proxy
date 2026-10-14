@@ -72,9 +72,7 @@ func TestNPMHandlerUsesConfiguredUpstream(t *testing.T) {
 
 		proxy, _, _, _ := setupTestProxy(t)
 		proxy.HTTPClient = upstream.Client()
-		proxy.AuthForURL = func(string) (string, string) {
-			return "Authorization", "Bearer npm-token"
-		}
+		authorizeUpstream(proxy, "Bearer npm-token")
 		h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL+"/root/")
 
 		req := httptest.NewRequest(http.MethodGet, "/testpkg", nil)
@@ -845,9 +843,7 @@ func TestNPMAuditCoversAllSecurityEndpoints(t *testing.T) {
 
 func TestNPMAuditAppliesUpstreamAuth(t *testing.T) {
 	h, got := newNPMAuditUpstream(t, npmAuditJSON(`{}`))
-	h.proxy.AuthForURL = func(string) (string, string) {
-		return "Authorization", "Bearer npm-token"
-	}
+	authorizeUpstream(h.proxy, "Bearer npm-token")
 
 	serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits", strings.NewReader(`{}`), nil)
 
@@ -1011,9 +1007,7 @@ func TestNPMKeysProxiesUpstream(t *testing.T) {
 
 	proxy, _, _, _ := setupTestProxy(t)
 	proxy.HTTPClient = upstream.Client()
-	proxy.AuthForURL = func(string) (string, string) {
-		return "Authorization", "Bearer npm-token"
-	}
+	authorizeUpstream(proxy, "Bearer npm-token")
 	h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL)
 
 	w := serveNPM(t, h, http.MethodGet, npmKeysPath, nil, nil)
@@ -1045,5 +1039,272 @@ func TestNPMTarballStillRoutesToDownload(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+func TestNPMMetadataPath(t *testing.T) {
+	tests := []struct {
+		path, wantName, wantRegistry string
+	}{
+		{"", "", ""},
+		{"lodash", "lodash", "lodash"},
+		{"lodash/4.17.21", "lodash", "lodash/4.17.21"},
+		{"lodash/latest", "lodash", "lodash/latest"},
+		{"@babel/core", "@babel/core", "@babel%2Fcore"},
+		{"@babel/core/7.23.0", "@babel/core", "@babel%2Fcore/7.23.0"},
+	}
+	for _, tt := range tests {
+		name, registry := npmMetadataPath(tt.path)
+		if name != tt.wantName || registry != tt.wantRegistry {
+			t.Errorf("npmMetadataPath(%q) = (%q, %q), want (%q, %q)",
+				tt.path, name, registry, tt.wantName, tt.wantRegistry)
+		}
+	}
+}
+
+func TestNPMVersionMetadataKeepsVersionSegment(t *testing.T) {
+	tests := []struct {
+		request, upstreamPath, wantTarball string
+		body                                string
+	}{
+		{
+			request:      "/lodash/4.17.21",
+			upstreamPath: "/lodash/4.17.21",
+			wantTarball:  "http://proxy.local/npm/lodash/-/lodash-4.17.21.tgz",
+			body: `{
+				"name": "lodash",
+				"version": "4.17.21",
+				"dist": {"tarball": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"}
+			}`,
+		},
+		{
+			request:      "/@babel/core/7.23.0",
+			upstreamPath: "/@babel%2Fcore/7.23.0",
+			wantTarball:  "http://proxy.local/npm/@babel%2Fcore/-/core-7.23.0.tgz",
+			body: `{
+				"name": "@babel/core",
+				"version": "7.23.0",
+				"dist": {"tarball": "https://registry.npmjs.org/@babel/core/-/core-7.23.0.tgz"}
+			}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.request, func(t *testing.T) {
+			var gotPath string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.EscapedPath()
+				if gotPath != tt.upstreamPath {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer upstream.Close()
+
+			h := &NPMHandler{proxy: testProxy(), upstreamURL: upstream.URL, proxyURL: "http://proxy.local"}
+			w := httptest.NewRecorder()
+			h.handlePackageMetadata(w, httptest.NewRequest(http.MethodGet, tt.request, nil))
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+			if gotPath != tt.upstreamPath {
+				t.Fatalf("upstream path = %q, want %q", gotPath, tt.upstreamPath)
+			}
+			var result map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				t.Fatalf("parse response: %v", err)
+			}
+			if result["dist"].(map[string]any)["tarball"] != tt.wantTarball {
+				t.Errorf("tarball = %v", result["dist"].(map[string]any)["tarball"])
+			}
+		})
+	}
+}
+
+func TestNPMMetadataRejectsEmptyPath(t *testing.T) {
+	h := NewNPMHandler(testProxy(), "http://proxy.local", "http://unused.test")
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNPMVersionMetadataRejectsTraversal(t *testing.T) {
+	called := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	defer upstream.Close()
+
+	h := &NPMHandler{proxy: testProxy(), upstreamURL: upstream.URL, proxyURL: "http://proxy.local"}
+	req := httptest.NewRequest(http.MethodGet, "/lodash/x", nil)
+	req.URL.Path = "/lodash/.."
+	w := httptest.NewRecorder()
+	h.handlePackageMetadata(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Fatal("upstream contacted for traversal path")
+	}
+}
+
+func TestNPMVersionMetadataCooldown(t *testing.T) {
+	proxyURL, upstreamPaths := npmCooldownMetadataHarness(t)
+
+	resp, err := http.Get(proxyURL + "/demo")
+	if err != nil {
+		t.Fatalf("packument request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("packument status = %d, want 200", resp.StatusCode)
+	}
+	var packument map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&packument); err != nil {
+		t.Fatalf("decode packument: %v", err)
+	}
+	distTags := packument["dist-tags"].(map[string]any)
+	if distTags["latest"] != testVersion100 {
+		t.Fatalf("dist-tags.latest = %v, want %s", distTags["latest"], testVersion100)
+	}
+	if _, ok := packument["versions"].(map[string]any)["2.0.0"]; ok {
+		t.Fatal("packument should not include version 2.0.0")
+	}
+
+	for _, tt := range []struct {
+		path        string
+		wantStatus  int
+		wantVersion string
+		wantError   string
+	}{
+		{"/demo/latest", http.StatusOK, testVersion100, ""},
+		{"/demo/1.0.0", http.StatusOK, testVersion100, ""},
+		{"/demo/2.0.0", http.StatusNotFound, "", "version not found"},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			testNPMVersionMetadataCooldownPath(t, proxyURL, upstreamPaths, tt.path, tt.wantStatus, tt.wantVersion, tt.wantError)
+		})
+	}
+}
+
+// testNPMVersionMetadataCooldownPath is a subtest helper so the parent test stays
+// under gocognit's complexity limit.
+func testNPMVersionMetadataCooldownPath(t *testing.T, proxyURL string, upstreamPaths *[]string, path string, wantStatus int, wantVersion, wantError string) {
+	t.Helper()
+	before := len(*upstreamPaths)
+	resp, err := http.Get(proxyURL + path)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body := readNPMTestBody(t, resp.Body)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, wantStatus, body)
+	}
+	for _, upstreamPath := range (*upstreamPaths)[before:] {
+		if upstreamPath == path {
+			t.Fatalf("upstream must not be called for version path %s when answering from the filtered packument", path)
+		}
+	}
+	if wantError != "" {
+		if !strings.Contains(body, wantError) {
+			t.Fatalf("error body should mention %q, got %s", wantError, body)
+		}
+		return
+	}
+	var versionDoc map[string]any
+	if err := json.Unmarshal([]byte(body), &versionDoc); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if versionDoc["version"] != wantVersion {
+		t.Fatalf("version = %v, want %s", versionDoc["version"], wantVersion)
+	}
+	wantTarball := "http://proxy.test/npm/demo/-/demo-" + wantVersion + ".tgz"
+	if versionDoc["dist"].(map[string]any)["tarball"] != wantTarball {
+		t.Fatalf("tarball = %v, want %s", versionDoc["dist"].(map[string]any)["tarball"], wantTarball)
+	}
+}
+
+func npmCooldownMetadataHarness(t *testing.T) (proxyURL string, upstreamPaths *[]string) {
+	t.Helper()
+	now := time.Now()
+	old := now.Add(-30 * 24 * time.Hour).Format(time.RFC3339)
+	recent := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	packument := `{
+		"name": "demo",
+		"dist-tags": {"latest": "2.0.0"},
+		"time": {"1.0.0": "` + old + `", "2.0.0": "` + recent + `"},
+		"versions": {
+			"1.0.0": {
+				"name": "demo",
+				"version": "1.0.0",
+				"dist": {"tarball": "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}
+			},
+			"2.0.0": {
+				"name": "demo",
+				"version": "2.0.0",
+				"dist": {"tarball": "https://registry.npmjs.org/demo/-/demo-2.0.0.tgz"}
+			}
+		}
+	}`
+	version200 := `{"name":"demo","version":"2.0.0","dist":{"tarball":"https://registry.npmjs.org/demo/-/demo-2.0.0.tgz"}}`
+	version100 := `{"name":"demo","version":"1.0.0","dist":{"tarball":"https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}}`
+
+	var paths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", contentTypeJSON)
+		switch r.URL.Path {
+		case "/demo":
+			_, _ = io.WriteString(w, packument)
+		case "/demo/latest", "/demo/2.0.0":
+			_, _ = io.WriteString(w, version200)
+		case "/demo/1.0.0":
+			_, _ = io.WriteString(w, version100)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	proxy.Cooldown = &cooldown.Config{Default: "7d"}
+	srv := httptest.NewServer(NewNPMHandler(proxy, "http://proxy.test", upstream.URL).Routes())
+	t.Cleanup(srv.Close)
+	return srv.URL, &paths
+}
+
+func readNPMTestBody(t *testing.T, r io.Reader) string {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
+}
+
+func TestNPMVersionMetadataDenied(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{
+			"name": "lodash",
+			"version": "4.17.21",
+			"dist": {"tarball": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"}
+		}`)
+	}))
+	defer upstream.Close()
+
+	proxy := testProxy()
+	setTestDenylist(t, proxy, "pkg:npm/lodash@4.17.21")
+	h := &NPMHandler{proxy: proxy, upstreamURL: upstream.URL, proxyURL: "http://proxy.local"}
+
+	w := httptest.NewRecorder()
+	h.handlePackageMetadata(w, httptest.NewRequest(http.MethodGet, "/lodash/4.17.21", nil))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body: %s", w.Code, w.Body.String())
 	}
 }

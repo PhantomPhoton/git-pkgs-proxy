@@ -21,6 +21,7 @@ See `config.example.yaml` in the repository root for a complete example.
 | `ui_base_url` | `PROXY_UI_URL` | - | (defaults to `base_url`) | Public URL where the web UI is reached. Set separately when the UI lives behind a different hostname than package endpoints (e.g. public domain vs Docker network alias). Used for canonical/og:url tags and the install guide banner. The proxy still serves package endpoints on the same listener, so any reverse proxy fronting the UI publicly should restrict the public route to `PathPrefix(/ui)` to avoid exposing package endpoints. |
 | `trust_forwarded_for` | `PROXY_TRUST_FORWARDED_FOR` | - | `false` | Attribute requests to the leftmost `X-Forwarded-For` entry instead of the TCP peer address, in the structured log, the access log and the request-source table on `/ui/analytics`. |
 | `ui_request_sources` | `PROXY_UI_REQUEST_SOURCES` | - | `false` | Show the request-source table on `/ui/analytics`, which reports caller addresses, the tool each ran and how much each pulled. |
+| `ui_failure_details` | `PROXY_UI_FAILURE_DETAILS` | - | `false` | List the latest failures behind each failure count on `/ui/analytics`: the package, its upstream URL or storage path, and the error. URLs are shown without credentials or query strings. |
 
 ## Storage
 
@@ -46,6 +47,8 @@ storage:
 | `storage.path` | `PROXY_STORAGE_PATH` | `-storage-path` | Local path (deprecated, use url) |
 | `storage.max_size` | `PROXY_STORAGE_MAX_SIZE` | - | Max cache size (e.g., "10GB") |
 | `storage.cache_artifacts` | `PROXY_STORAGE_CACHE_ARTIFACTS` | - | Store fetched artifacts (default: true); `false` streams them from upstream |
+| `storage.retention.default` | `PROXY_STORAGE_RETENTION_DEFAULT` | - | Evict artifacts not served for this long (e.g. "30d"); see [Retention](#retention) |
+| `storage.retention.sweep_interval` | `PROXY_STORAGE_RETENTION_SWEEP_INTERVAL` | - | How often expired artifacts are looked for (default: "10m", at least "1m") |
 
 `storage.max_size` counts cached artifacts only. An artifact replaced by a refetch stays in storage for at least an hour, or `storage.direct_serve_ttl` if longer, so requests already reading it can finish, and storage use can exceed the limit by what was replaced in that time.
 
@@ -61,6 +64,57 @@ storage:
 Every download is a fresh upstream fetch, and concurrent requests for the same artifact are not combined. Artifacts with a digest known up front (OCI blobs, Swift archives, Helm charts) are verified while streaming: the response is sent chunked, and on a mismatch the connection is aborted before the response completes so the client never receives a tampered artifact as a good one. The same happens when the upstream connection fails mid-download.
 
 `cache_artifacts: false` cannot be combined with `scanning.enabled`, `storage.direct_serve` or `mirror_api`, which all need stored artifacts, and the `mirror` command refuses to run with it.
+
+### Retention
+
+Retention evicts cached artifacts that nobody has downloaded for a while. It works alongside `storage.max_size`: retention removes what has gone unused, and the size limit still applies to whatever is left.
+
+The `ecosystems` and `packages` entries below only pass validation once the ecosystems they name support retention; see the table further down.
+
+```yaml
+storage:
+  retention:
+    default: "30d"
+    ecosystems:
+      npm: "14d"
+      maven: "0"
+    packages:
+      "pkg:npm/lodash": "0"
+    sweep_interval: "10m"
+```
+
+Each cached file ages on its own, counted from the last time the proxy served it, or from when it was fetched if it has not been served since. A newer release of the same package does not shorten the life of older versions. Durations take a `d` suffix for days, and `"0"` or an empty value means never evict by age. With no retention configured, artifacts stay until `max_size` evicts them. `sweep_interval` must be at least `1m`.
+
+A package rule wins over an ecosystem rule, which wins over `default`. Package rules are keyed by package PURL without a version, written in one of the forms the table below lists for the ecosystem. The ecosystems and package rules can only name ecosystems that support retention in the running version; anything else, including a typo, stops the proxy at startup with an error naming the setting. `default` applies only to supported ecosystems. Support is added one ecosystem at a time, so a later release can make an existing `default` cover more ecosystems. On startup the proxy logs which ecosystems retention covers (`covered`) and which ones `default` does not reach yet (`default_not_applied`).
+
+| Ecosystem key | Retention supported | Package rule form |
+|---------------|---------------------|-------------------|
+| `alpine` | yes | `pkg:apk/curl` or `pkg:apk/alpine/curl`; case doesn't matter. A rule covers the package in every configured APK repository. Alpine mirrors keep only the current build of each package per release, so an evicted older one can't be fetched again. |
+| `cargo` | yes | `pkg:cargo/serde`, the crate name as published; case, `-` and `_` have to match, so `pkg:cargo/inflector` doesn't cover `Inflector`. |
+| `composer` | yes | `pkg:composer/symfony/console`; case doesn't matter. A key without a vendor is refused. |
+| `conan` | yes | `pkg:conan/zlib`, the recipe name; a rule covers every version, revision and user/channel of it. |
+| `conda` | yes | `pkg:conda/conda-forge/numpy`, with the channel as the namespace; the package name's case doesn't matter. A key without a channel is refused. |
+| `cran` | yes | `pkg:cran/ggplot2`, the package name as published, case included (`pkg:cran/Rcpp`). A rule covers source and binary builds alike. |
+| `deb` | yes | `pkg:deb/curl`; case doesn't matter. A vendor namespace such as `pkg:deb/debian/curl` is accepted and dropped, so a rule covers the package from every configured archive. Debian and Ubuntu archives only keep the current version per suite, so an evicted older one can't be fetched again. |
+| `gem` | yes | `pkg:gem/rails`, the gem name as published, case included. |
+| `golang` | yes | `pkg:golang/github.com/stretchr/testify`, the module path as in `go.mod`; case doesn't matter. A major version like `/v2` (or `.v3` on gopkg.in) is a module of its own and needs its own rule. The `!`-escaped form from proxy URLs and the module cache (`github.com/!azure/...`) is refused. |
+| `helm` | yes | No package rules: charts are cached per repository and digest, not under the chart name. The `helm` rule and `default` cover charts from HTTP repositories; charts pulled over OCI fall under `oci`. |
+| `hex` | yes | `pkg:hex/phoenix`, the package name as published. |
+| `julia` | yes | No package rules: a julia PURL needs a `uuid` qualifier, which the cache doesn't store. The `julia` rule and `default` cover package tarballs, artifacts and registry snapshots alike. |
+| `maven` | yes | `pkg:maven/com.google.guava/guava`, group and artifact as published, case included. Gradle build cache entries are not covered; they use `gradle.build_cache.max_age`. |
+| `npm` | yes | `pkg:npm/lodash`, `pkg:npm/@babel/core`; the name has to match exactly, case included, so `pkg:npm/jsonstream` doesn't cover `JSONStream`. |
+| `nuget` | yes | `pkg:nuget/Newtonsoft.Json`; case doesn't matter. |
+| `oci` | yes | `pkg:oci/library/nginx`, the repository name of the pull. A named upstream keeps its prefix, also when containerd reaches it through `ns`: `ghcr.io/owner/app` pulled that way is `pkg:oci/upstream/ghcr/owner/app`. Homebrew bottles use Homebrew's image name, with `@` written as `/` and `+` as `x` (`openssl@3` is `pkg:oci/homebrew/core/openssl/3`). Helm charts pulled over OCI are stored like images. Only blobs are evicted; manifests stay in the metadata cache. |
+| `pub` | yes | `pkg:pub/http`, the package name as published. |
+| `pypi` | yes | `pkg:pypi/requests`; case and single `_`/`-` don't matter. Dots and repeated separators are kept as written, so a project like `zope.interface` can be stored as `zope.interface` and `zope-interface`; add a rule for each. |
+| `rpm` | yes | `pkg:rpm/curl`, the name as packaged, case included (`pkg:rpm/NetworkManager`). A vendor namespace such as `pkg:rpm/fedora/curl` is accepted and dropped. Fedora and EPEL update repositories keep only the latest build of a package, so an evicted older one may not be fetchable again. |
+| `swift` | yes | `pkg:swift/apple/swift-nio`, with the registry scope as the namespace, or the stored form `pkg:generic/swift-registry/apple.swift-nio`; case doesn't matter. A source repository key like `pkg:swift/github.com/apple/swift-nio` is refused, since it doesn't name a registry identity. |
+
+An evicted artifact is fetched again from upstream on the next request. Packages preloaded with `proxy mirror` age from the time they were mirrored, so an unused mirrored package is evicted like any other. Running `proxy mirror` again over a package that is still cached counts as a download and restarts its clock, so packages a scheduled mirror job keeps listing never age out. A registry that removes old releases (Linux distribution archives in particular) cannot serve an evicted version again, so set those ecosystems' rules with that in mind.
+
+Expired artifacts are not deleted right away. Their records are cleared and the files wait in the same queue a replaced artifact goes through, for at least an hour (or `storage.direct_serve_ttl` if longer), so downloads already in progress can finish. `storage.max_size` counts the space as free from the moment the record is cleared. Once that wait is over, each minute the queue is worked through for up to 30 seconds, pausing until the next minute after a delete fails. One sweep clears at most 10,000 artifacts, so the first sweep over a large, old cache spreads its evictions, and the downloads that bring popular artifacts back, over several intervals.
+
+With several proxies sharing one database and `database.hit_flush_interval` set, a proxy's sweep cannot see downloads another proxy has not written yet. Keep retention durations well above the flush interval.
 
 ### Amazon S3
 
@@ -183,6 +237,7 @@ Each upstream used by a built-in package route can be set in YAML or JSON under 
 | `upstream.cargo_download` | `PROXY_UPSTREAM_CARGO_DOWNLOAD` | `https://static.crates.io/crates` |
 | `upstream.gem` | `PROXY_UPSTREAM_GEM` | `https://rubygems.org` |
 | `upstream.go` | `PROXY_UPSTREAM_GO` | `https://proxy.golang.org` |
+| `upstream.go_sumdbs_offline` | `PROXY_UPSTREAM_GO_SUMDBS_OFFLINE` | `false` |
 | `upstream.hex` | `PROXY_UPSTREAM_HEX` | `https://repo.hex.pm` |
 | `upstream.hex_api` | `PROXY_UPSTREAM_HEX_API` | `https://hex.pm` |
 | `upstream.pub` | `PROXY_UPSTREAM_PUB` | `https://pub.dev` |
@@ -306,7 +361,38 @@ Only configured upstreams are reachable, so this is not an open HTTP proxy.
 Paths shaped like `{owner}/{repo}/releases/download/{tag}/{asset}` are
 version-pinned GitHub release assets: they are stored in the artifact cache
 and served from it without revalidation, including while the upstream is
-down. Every other path is served through the metadata cache (`cache_metadata`
+down.
+
+Upstreams pointed at these hosts get version-pinned paths built in, whatever
+the upstream is named:
+
+| Upstream URL | Cached as artifacts | Package name |
+|---|---|---|
+| `https://archive.apache.org` | `dist/{project dirs}/{version}/[binaries/]{file}`, where `{version}` starts with a digit | the project dirs, e.g. `maven/maven-3`, `maven/mvnd` |
+| `https://nodejs.org` | `dist/v{version}/{file}` | the upstream name |
+| `https://dl.google.com/go` | `go{version}.{os}-{arch}.tar.gz`, `.zip` and their `.sha256` | the upstream name |
+
+Other upstreams can declare their own version-pinned paths in
+`generic_artifacts`. These are tried before any built-in ones, so a configured
+pattern that overlaps a built-in decides the package name. Each pattern is a regular expression that must match the
+whole path after `/generic/{name}/`, with `version` and `file` named groups
+(single path segments) and an optional `name` group for the package name,
+which otherwise is the upstream name. Matching downloads are cached like
+release assets and listed under the `generic` ecosystem:
+
+```yaml
+upstream:
+  generic:
+    eclipse: "https://download.eclipse.org"
+  generic_artifacts:
+    eclipse:
+      - 'jdtls/milestones/(?P<version>[^/]+)/(?P<file>[^/]+)'
+```
+
+Only list paths whose content never changes for a given version: a match is
+never revalidated.
+
+Every other path is served through the metadata cache (`cache_metadata`
 must be enabled for offline fallback): fresh within `metadata_ttl`, then
 revalidated with the upstream's `ETag`/`Last-Modified`, and served stale with
 a `Warning: 110` header when the upstream fails, refuses or rate-limits the
@@ -389,6 +475,83 @@ with the metadata TTL and served byte-for-byte unchanged so apk signature
 verification keeps working; `.apk` packages use the shared artifact cache.
 When `upstream.apk` is empty, a single repository named `alpine` pointing at
 the official mirror is available; configuring any entry replaces that default.
+
+```yaml
+upstream:
+
+  # Named Arch Linux pacman mirrors, served at /arch/{name}/.
+  arch:
+    archlinux: "https://geo.mirror.pkgbuild.com"
+```
+
+Arch Linux repositories are read-only. Requests to `/arch/{name}/…` are passed
+to the mirror unchanged, so both the Arch Linux layout
+(`/arch/archlinux/core/os/x86_64/core.db`) and the Arch Linux ARM layout
+(`/arch/archlinuxarm/aarch64/core/core.db`) work. Databases (`{repo}.db`,
+`{repo}.files` and their `.tar.*` forms) are cached with the metadata TTL and
+served byte-for-byte unchanged; a database's `.sig` is refreshed together with
+the database. Packages and package signatures use the shared artifact cache.
+When `upstream.arch` is empty, a single repository named `archlinux` pointing at
+`https://geo.mirror.pkgbuild.com` is available; configuring any entry replaces
+that default. Arch Linux ARM has no default: pick a regional HTTPS mirror, not
+the `mirror.archlinuxarm.org` redirector.
+
+### Go checksum database
+
+```yaml
+upstream:
+
+  # Named Go checksum databases, served at /go/sumdb/{name}/.
+  go_sumdbs:
+    sum.golang.org: "https://sum.golang.org"
+
+  # Keep answering for a database from its cached tree, however old, when
+  # the database cannot be reached. For networks where clients have no
+  # route to the database of their own. Requires cache_metadata.
+  go_sumdbs_offline: false
+```
+
+The `go` command asks `GOPROXY` for the checksum database before contacting it
+directly. The proxy answers for every name listed here and fetches lookups and
+tiles from the database's URL, not from `upstream.go`. Unknown names get 404,
+so the `go` command falls back to contacting that database itself. When
+`upstream.go_sumdbs` is empty, `sum.golang.org` is served; configuring any
+entry replaces that default.
+
+Once the proxy says it serves a database, the `go` command no longer contacts
+that database directly. The proxy therefore only says so when it can fetch the
+database's latest signed tree, or has a fresh one cached (fetched within
+`metadata_ttl`). If it cannot, it answers 404 as for an unknown name, and
+clients go to the database themselves, as they would without the proxy. The
+check waits five seconds at most, and after a failed check the proxy waits a
+minute before it tries the database again.
+
+Set `upstream.go_sumdbs_offline: true` when clients have no route to the
+database of their own. The proxy then keeps answering for it from the cached
+tree for as long as the outage lasts and serves cached lookups and tiles.
+That does not mean every cached module still verifies: the `go` command
+checks each lookup against tiles of the signed tree that came with it, the
+database attaches a different tree to almost every lookup, and a tile no
+client fetched through the proxy before cannot be served during the outage.
+Lookups for modules that were never cached fail as well. Builds whose
+`go.sum` already lists every module do not ask the database at all and are
+not affected. This requires `cache_metadata`.
+
+With `cache_metadata` enabled, lookups, partial hash tiles and the latest
+signed tree follow `metadata_ttl` and are served from cache when the database
+is unreachable. Complete hash tiles never change and are not revalidated once
+cached; a tile of the wrong size is refused and not stored. Data tiles are
+always forwarded and never stored: the `go` command does not fetch them, only
+mirrors and auditors do.
+Without `cache_metadata` the requests are forwarded and nothing is stored.
+
+A 404 from the database keeps its text, which the `go` command prints to
+explain why a version is missing. With `cache_metadata` enabled the text is
+cut at 4 KiB; without it the response is passed on unchanged.
+
+If `upstream.go` points at a module proxy that serves the checksum database
+itself, such as Athens, point the entry there instead, for example
+`sum.golang.org: "https://athens.example/sumdb/sum.golang.org"`.
 
 ### Debian archives
 
@@ -520,7 +683,7 @@ gradle:
 |--------|-------------|-------------|
 | `gradle.build_cache.read_only` | `PROXY_GRADLE_BUILD_CACHE_READ_ONLY` | Disable PUT uploads and keep GET/HEAD read-only |
 | `gradle.build_cache.max_upload_size` | `PROXY_GRADLE_BUILD_CACHE_MAX_UPLOAD_SIZE` | Maximum accepted PUT body size (must be > 0) |
-| `gradle.build_cache.max_age` | `PROXY_GRADLE_BUILD_CACHE_MAX_AGE` | Delete entries older than this duration (default `168h`, set `0` to disable) |
+| `gradle.build_cache.max_age` | `PROXY_GRADLE_BUILD_CACHE_MAX_AGE` | Delete entries older than this duration (default `168h`, also accepts days such as `7d`; set `0` to disable) |
 | `gradle.build_cache.max_size` | `PROXY_GRADLE_BUILD_CACHE_MAX_SIZE` | Total size cap for `_gradle/http-build-cache`, deleting oldest first (`0` disables) |
 | `gradle.build_cache.sweep_interval` | `PROXY_GRADLE_BUILD_CACHE_SWEEP_INTERVAL` | Frequency for background eviction sweeps |
 

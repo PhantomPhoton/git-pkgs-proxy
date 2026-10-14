@@ -189,7 +189,18 @@ metadata_cache (
     updated_at    DATETIME
 )
 -- indexes: (ecosystem, name) unique
+
+metadata_dates (
+    ecosystem     TEXT NOT NULL,
+    proxy_url     TEXT NOT NULL,      -- each proxy URL rewrites to its own download URLs
+    name          TEXT NOT NULL,
+    etag          TEXT NOT NULL,      -- the rewritten representation being dated
+    last_modified INTEGER NOT NULL,   -- Unix seconds; BIGINT on Postgres
+    PRIMARY KEY (ecosystem, proxy_url, name)
+)
 ```
+
+`metadata_dates` holds the `Last-Modified` served with rewritten npm and Composer metadata. A package's date is the second it started serving its current representation, and a new representation is only dated in a later second. Keeping it in the database means replicas sharing one serve the same date, and never give one representation's date to another, so `If-Modified-Since` cannot return 304 for a body the client does not have.
 
 On PostgreSQL, `INTEGER PRIMARY KEY` becomes `SERIAL`, `DATETIME` becomes `TIMESTAMP`, `INTEGER DEFAULT 0` booleans become `BOOLEAN DEFAULT FALSE`, and size/count columns use `BIGINT`.
 

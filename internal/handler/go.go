@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -14,11 +15,25 @@ const (
 	asciiCaseOffset = 32 // difference between lowercase and uppercase ASCII letters
 )
 
+// Module zips are stored under pkg:golang/{module path}, which the PURL
+// rules lowercase, so a package rule covers a module whatever case either
+// is written in. A major version suffix (/v2) is part of the module path
+// and so a module of its own. A key in the escaped form proxy URLs and the
+// module cache use (github.com/!azure) does not survive the default
+// mapping's round trip and is refused; the handler stores decoded paths,
+// so such a key could never match.
+func init() {
+	retention.Default.Register(retention.Spec{Key: "golang", CanonicalPackage: retention.DefaultCanonical("golang")})
+}
+
 // GoHandler handles Go module proxy protocol requests.
 type GoHandler struct {
-	proxy       *Proxy
-	upstreamURL string
-	proxyURL    string
+	proxy        *Proxy
+	upstreamURL  string
+	proxyURL     string
+	sumDBs       map[string]string
+	sumDBOffline bool
+	sumDBProbes  goSumDBProbes
 }
 
 // NewGoHandler creates a new Go module proxy handler.
@@ -27,6 +42,7 @@ func NewGoHandler(proxy *Proxy, proxyURL string) *GoHandler {
 		proxy:       proxy,
 		upstreamURL: goUpstream,
 		proxyURL:    strings.TrimSuffix(proxyURL, "/"),
+		sumDBs:      map[string]string{defaultGoSumDBName: defaultGoSumDBURL},
 	}
 }
 
@@ -53,9 +69,9 @@ func (h *GoHandler) Routes() http.Handler {
 func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
-	// Sumdb requests - proxy through
-	if strings.HasPrefix(path, "sumdb/") {
-		h.proxyUpstream(w, r)
+	// Checksum database requests go to the database, not the module upstream
+	if rest, ok := strings.CutPrefix(path, "sumdb/"); ok {
+		h.handleSumDB(w, r, rest)
 		return
 	}
 
@@ -127,11 +143,6 @@ func (h *GoHandler) handleDownload(w http.ResponseWriter, r *http.Request, modul
 	}
 
 	ServeArtifactRequest(w, r, result)
-}
-
-// proxyUpstream forwards a request to proxy.golang.org without caching.
-func (h *GoHandler) proxyUpstream(w http.ResponseWriter, r *http.Request) {
-	h.proxy.ProxyUpstream(w, r, h.upstreamURL+r.URL.Path, nil)
 }
 
 // proxyCached forwards a request with metadata caching.

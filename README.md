@@ -65,7 +65,7 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | Debian | Debian/Ubuntu | | ✓ |
 | RPM | RHEL/Fedora | | ✓ |
 | Alpine | Alpine Linux | | ✓ |
-| Arch | Arch Linux | | ✗ |
+| Arch | Arch Linux | | ✓ |
 | Chef | Chef | | ✗ |
 | Generic | Any | | ✓ |
 | Helm | Kubernetes | Yes | ✓ |
@@ -201,6 +201,16 @@ export GOPROXY=http://localhost:8080/go,direct
 ```
 
 Or in your shell profile for persistence.
+
+Checksum lookups go through the same URL: the proxy serves `sum.golang.org` at
+`/go/sumdb/sum.golang.org/`, and the `go` command uses it without further
+setup, so clients need no route of their own to `sum.golang.org`. If the
+proxy loses `https://sum.golang.org`, it keeps answering until its cached
+copy of the database's signed tree is older than `metadata_ttl`; after that
+the `go` command contacts the database directly as before. Set
+`upstream.go_sumdbs_offline` on networks where clients cannot do that. Other
+checksum databases are listed under `upstream.go_sumdbs`, see
+[Go checksum database](docs/configuration.md#go-checksum-database).
 
 ### Homebrew
 
@@ -451,6 +461,17 @@ Or pull images directly:
 docker pull localhost:8080/library/nginx:latest
 ```
 
+SBOMs, signatures and attestations attached to an image are found through the
+OCI 1.1 referrers API (`GET /v2/{name}/referrers/{digest}`). `oras discover`
+and `notation verify` use it, and so does cosign for its newer signature
+bundles. The proxy forwards these requests and caches the returned index with
+the same TTL as other metadata, so they keep working offline. It does not
+filter by `artifactType`; it returns the full list and the client filters it,
+as the spec allows. Registries without the referrers API (GHCR, for example)
+answer 404, and clients then look up the `sha256-<digest>` tag instead, which
+the proxy serves like any other manifest. The proxy is pull-only, so attaching
+new artifacts through it is not supported.
+
 #### containerd (Kubernetes, k3s, nerdctl)
 
 containerd mirrors send the original registry host in an `ns` query
@@ -665,6 +686,71 @@ http://localhost:8080/apk/private
 apk appends the architecture and index filename to each repository line
 itself.
 
+### Arch Linux / pacman
+
+Put the proxy at the top of `/etc/pacman.d/mirrorlist`. The default repository
+name `archlinux` proxies the official GeoIP mirror
+(`https://geo.mirror.pkgbuild.com`):
+
+```
+Server = http://localhost:8080/arch/archlinux/$repo/os/$arch
+```
+
+Then:
+
+```bash
+pacman -Syu
+```
+
+Repository databases (`core.db`, `core.files` and their `.tar.*` forms),
+database signatures, packages and package signatures are served byte-for-byte
+unchanged, so pacman's signature checks keep working. Databases use the
+metadata cache (`metadata_ttl`, stale fallback). Each database refresh also
+fetches its signature and stores it for exactly that database, so a signature
+is only ever served with the database it signs. Enable `cache_metadata` (or set `PROXY_CACHE_METADATA=true`) so
+`pacman -Sy` keeps working while the upstream is down; without it databases are
+fetched fresh on every request. Packages and their `.sig` files are stored in the shared artifact
+cache and remain available when the upstream is unreachable.
+
+The proxy only starts sending a package once it has the whole file, and pacman
+gives up on a download that sends nothing for 10 seconds. The fetch keeps
+running and the next try is served from the cache. On a slow upstream, set
+`DisableDownloadTimeout` in `/etc/pacman.conf` to avoid the failed first try.
+
+`extra.files` is about 50 MB and is read into memory on each `pacman -F`
+request. Raise `metadata_max_size` (100 MB by default) for larger custom
+repositories.
+
+A custom repository that rebuilds a package under the same version leaves the
+old package and signature in the cache. Bump `pkgrel` instead, or remove the
+cached version.
+
+#### Arch Linux ARM
+
+Arch Linux ARM has no built-in repository. Add one under `upstream.arch`, using a
+regional mirror from <https://archlinuxarm.org/about/mirrors> that serves HTTPS:
+
+```yaml
+upstream:
+  arch:
+    archlinux: "https://geo.mirror.pkgbuild.com"
+    archlinuxarm: "https://<region>.mirror.archlinuxarm.org"
+```
+
+Setting `upstream.arch` replaces the built-in default, so keep `archlinux` in the map
+if you also proxy x86_64 Arch.
+
+Arch Linux ARM mirrors use `$arch/$repo` instead of `$repo/os/$arch`. In
+`/etc/pacman.d/mirrorlist`:
+
+```
+Server = http://localhost:8080/arch/archlinuxarm/$arch/$repo
+```
+
+Avoid `mirror.archlinuxarm.org` as the upstream. It redirects each request to a
+changing regional mirror over plain HTTP, so the database and the packages can come
+from mirrors with a different sync state.
+
 ### GitHub Releases / mise (aqua backend)
 
 Configure named generic upstreams:
@@ -690,6 +776,30 @@ cached for `metadata_ttl` and served stale during an outage or rate limit.
 Commit a `mise.lock` and install with `mise install --locked` so pinned
 installs need no API call at all. Add a bearer token for `https://api.github.com`
 under `upstream.auth` if the fleet exceeds GitHub's anonymous rate limit.
+
+Maven, mvnd, Node and Go downloads are cached the same way once their hosts
+are configured as generic upstreams; their version-pinned paths are built in
+(see [configuration](docs/configuration.md)):
+
+```yaml
+upstream:
+  generic:
+    apache: "https://archive.apache.org"
+    nodejs: "https://nodejs.org"
+    golang: "https://dl.google.com/go"
+```
+
+```toml
+[settings]
+node.mirror_url = "http://localhost:8080/generic/nodejs/dist/"
+go.download_mirror = "http://localhost:8080/generic/golang"
+
+[settings.url_replacements]
+"https://archive.apache.org/" = "http://localhost:8080/generic/apache/"
+```
+
+Other download hosts need their version-pinned paths declared in
+`upstream.generic_artifacts`.
 
 ## Configuration
 
@@ -741,6 +851,8 @@ base_url: "http://localhost:8080"
 storage:
   url: "file:///var/cache/proxy/artifacts"
   max_size: "10GB"  # Optional: evict LRU when exceeded
+  retention:
+    default: "30d"  # Optional: evict artifacts not downloaded for 30 days
 
 database:
   driver: "sqlite"
@@ -996,6 +1108,7 @@ Recently cached:
 | `GET /v2/*` | OCI/Docker registry protocol |
 | `GET /v2/homebrew/core/*` | Homebrew core bottle manifests and blobs from GHCR |
 | `GET /apk/{repository}/*` | Alpine APK repository protocol |
+| `GET /arch/{repository}/*` | Arch Linux pacman repository protocol |
 | `GET /generic/{name}/*` | Generic HTTP download proxy (GitHub release assets, mise/aqua) |
 | `GET /debian/*` | Debian/APT repository protocol (main archive) |
 | `GET /debian/{repository}/*` | Debian/APT repository protocol (named archive, e.g. security) |
@@ -1217,6 +1330,7 @@ The proxy exposes Prometheus metrics at `GET /metrics`. All metric names are pre
 | `proxy_cache_misses_total` | counter | `ecosystem` | Cache misses |
 | `proxy_cache_size_bytes` | gauge | | Total size of cached artifacts |
 | `proxy_cached_artifacts_total` | gauge | | Number of cached artifacts |
+| `proxy_artifacts_evicted_total` | counter | `reason`, `ecosystem` | Artifacts evicted by the size limit (`lru`) or by age (`retention`) |
 | `proxy_upstream_fetch_duration_seconds` | histogram | `ecosystem` | Time spent fetching from upstream |
 | `proxy_upstream_errors_total` | counter | `ecosystem`, `error_type` | Upstream fetch failures |
 | `proxy_storage_operation_duration_seconds` | histogram | `operation` | Storage read/write latency |
@@ -1279,7 +1393,7 @@ The same figures are available as JSON from `GET /stats`, which reports `downloa
 
 `ecosystem` means three slightly different things across `/metrics`, and queries that join across them need to know which.
 
-**From the package record, normalized.** The six `proxy_ecosystem_*` gauges, `proxy_cache_hits_total`, `proxy_cache_misses_total`, `proxy_integrity_failures_total` and the scan metrics. Aliases collapse here: `gem` reads as `rubygems`, `composer` as `packagist`, `go` as `golang`.
+**From the package record, normalized.** The six `proxy_ecosystem_*` gauges, `proxy_cache_hits_total`, `proxy_cache_misses_total`, `proxy_artifacts_evicted_total`, `proxy_integrity_failures_total` and the scan metrics. Aliases collapse here: `gem` reads as `rubygems`, `composer` as `packagist`, `go` as `golang`.
 
 **From the request path.** `proxy_requests_total`, `proxy_request_duration_seconds` and `proxy_response_bytes_total`. The names mostly coincide with the normalized ones -- these also report `rubygems`, `packagist` and `golang` -- but the Debian route reports `debian` where the package record says `deb`, and any path that is not a package endpoint reports `other`, which corresponds to no ecosystem at all.
 
@@ -1300,6 +1414,14 @@ Set `ui_request_sources: true` and both appear on `/ui/analytics` under **Runtim
 **What this can and cannot tell you.** How much an address gives you depends entirely on your network. A fleet of build machines with stable addresses attributes cleanly. Containerised CI usually does not: with Docker or Kubernetes executors every job gets an ephemeral address, and egress is commonly NAT'd behind one gateway, so you get runner-node or gateway granularity, not per-project. If you need per-project attribution the caller has to send something naming itself -- a basic-auth username, or a per-project base URL -- which the proxy does not currently read. Say so and it can be added.
 
 **Why addresses are not Prometheus labels.** Client tool names are exported as `proxy_client_requests_total{client}` because they come from a closed set. Addresses are not exported at all: the caller set is unbounded and outside the proxy's control, and every new address would create a time series that lives forever in your TSDB. The same goes for anything job-scoped -- a pipeline ID must never become a label. Per-address and per-request detail belongs in the access log, which records `remote_ip`, `user_agent`, `client`, `ecosystem` and `bytes` on every line as JSONL, ready for `jq`, Loki or whatever you ship logs to.
+
+### Failure details
+
+The failure counts under **Runtime** on `/ui/analytics` -- upstream errors, storage errors, integrity failures, health probe failures and scan errors -- say how often something failed, not what. Set `ui_failure_details: true` and each count gets a **Latest** list underneath it, newest first: the package URL and filename, the upstream URL or storage path, the error, and how long ago it happened.
+
+The list keeps the last 20 failures per row, in memory only, so it starts empty when the proxy starts, like the counts above it. Credentials, query strings and fragments are stripped from every URL before it is kept, including URLs inside error messages, since that is where registry tokens and signed-URL signatures live.
+
+The flag defaults to off for the same reason as `ui_request_sources`: package names and upstream hosts say what your users depend on, and `/ui` is not authenticated. Package names and URLs are never Prometheus labels; the same detail is in the proxy's log.
 
 ### Grafana dashboard
 
