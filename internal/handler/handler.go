@@ -293,7 +293,7 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 				return nil, err
 			}
 		}
-		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, info.URL, "",
+		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, info.URL, "", "",
 			func(fetchCtx context.Context) (*fetch.Artifact, error) {
 				return p.Fetcher.Fetch(fetchCtx, info.URL)
 			})
@@ -305,7 +305,7 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 	}
 	metrics.RecordCacheMiss(ecosystem)
 
-	key := artifactCoalesceKey(versionPURL, filename, "", "")
+	key := artifactCoalesceKey(versionPURL, filename, "", "", "")
 	recheck := func() (artifacts.Artifact, string, bool) {
 		return p.cachedArtifactRecord(pkgPURL, versionPURL, filename, "")
 	}
@@ -529,12 +529,14 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 	}
 	metrics.RecordUpstreamFetch(ecosystem, fetchDuration)
 
-	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", artifact)
+	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, info.URL, "", "", artifact)
 }
 
 // storeArtifact writes a fetched artifact to storage, verifies it against
-// upstreamHash if non-empty, runs it through the scan gate if scanning is
-// enabled, and commits it to the cache database.
+// upstreamHash and declared, the integrity the registry's metadata declares,
+// if they are non-empty, runs it through the scan gate if scanning is enabled,
+// and commits it to the cache database, recording declared with the version
+// so cache hits are verified against it too.
 //
 // The scan gate sits between Storage.Store and updateCacheDB: updateCacheDB
 // is the only thing that makes an artifact visible to clients (checkCache
@@ -545,11 +547,17 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 //
 // It returns the artifact and its storage path, not a reader; callers get one
 // from openStoredArtifact.
-func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash string, artifact *fetch.Artifact) (artifacts.Artifact, string, error) {
+func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (artifacts.Artifact, string, error) {
 	storagePath := storage.FetchPath(ecosystem, name, version, storage.NewFetchID(), filename)
 
+	body, verified, err := verifyIntegrity(artifact.Body, declared)
+	if err != nil {
+		_ = artifact.Body.Close()
+		return artifacts.Artifact{}, "", err
+	}
+
 	storeStart := time.Now()
-	size, hash, err := p.Storage.Store(ctx, storagePath, artifact.Body)
+	size, hash, err := p.Storage.Store(ctx, storagePath, body)
 	_ = artifact.Body.Close()
 	metrics.RecordStorageOperation("write", time.Since(storeStart))
 	if err != nil {
@@ -563,6 +571,16 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 			p.Logger.Warn("failed to discard artifact with mismatched checksum", "path", storagePath, "error", delErr)
 		}
 		return artifacts.Artifact{}, "", fmt.Errorf("%w: upstream declared %s, got %s", ErrArtifactDigestMismatch, upstreamHash, hash)
+	}
+	if err := verified(); err != nil {
+		p.Logger.Error("fetched artifact failed integrity check",
+			"purl", versionPURL, "filename", filename, "url", upstreamURL, "error", err)
+		metrics.RecordIntegrityFailure(purl.NormalizeEcosystem(ecosystem), metrics.FailureDetail{
+			PURL: versionPURL, Filename: filename, URL: upstreamURL, Err: err})
+		if delErr := p.Storage.Delete(ctx, storagePath); delErr != nil {
+			p.Logger.Warn("failed to discard artifact with mismatched integrity", "path", storagePath, "error", delErr)
+		}
+		return artifacts.Artifact{}, "", err
 	}
 
 	if p.Scanners != nil && p.Scanners.Enabled() {
@@ -587,7 +605,7 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 	}
 
 	// Update database
-	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact); err != nil {
+	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared); err != nil {
 		p.Logger.Warn("failed to update cache database", "error", err)
 		// Continue anyway - we have the file. Queue it for deletion in case
 		// no record points at it; the queue skips it while one does.
@@ -621,13 +639,13 @@ func (p *Proxy) openStoredArtifact(ctx context.Context, artifact artifacts.Artif
 	}, nil
 }
 
-// artifactCoalesceKey identifies one artifact fetch. downloadURL and
-// upstreamHash are included so callers expecting different bytes (multiple
+// artifactCoalesceKey identifies one artifact fetch. downloadURL, upstreamHash
+// and declared are included so callers expecting different bytes (multiple
 // upstreams, or a re-published version) never share a fetch. The hash is
 // lowercased because artifactHashMatches compares case-insensitively, so one
 // digest in two casings describes one artifact and must not split the fetch.
-func artifactCoalesceKey(versionPURL, filename, downloadURL, upstreamHash string) string {
-	return strings.Join([]string{versionPURL, filename, downloadURL, strings.ToLower(upstreamHash)}, "\x00")
+func artifactCoalesceKey(versionPURL, filename, downloadURL, upstreamHash, declared string) string {
+	return strings.Join([]string{versionPURL, filename, downloadURL, strings.ToLower(upstreamHash), declared}, "\x00")
 }
 
 // cachedArtifactRecord reports an artifact already committed to the cache,
@@ -838,7 +856,7 @@ func (p *Proxy) runScan(ctx context.Context, ecosystem, name, version, filename,
 	return nil
 }
 
-func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact) error {
+func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath string, artifact artifacts.Artifact, declared string) error {
 	now := time.Now()
 
 	// Upsert package
@@ -857,6 +875,7 @@ func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath
 	ver := &database.Version{
 		PURL:        artifact.PURL,
 		PackagePURL: pkgPURL,
+		Integrity:   sql.NullString{String: declared, Valid: declared != ""},
 		EnrichedAt:  sql.NullTime{Time: now, Valid: true},
 	}
 	if err := p.DB.UpsertVersion(ver); err != nil {
@@ -1768,13 +1787,13 @@ func (p *Proxy) proxyMetadataStream(w http.ResponseWriter, r *http.Request, upst
 // GetOrFetchArtifactFromURL retrieves an artifact from cache or fetches from a specific URL.
 // This is useful for registries where download URLs are determined from metadata.
 func (p *Proxy) GetOrFetchArtifactFromURL(ctx context.Context, ecosystem, name, version, filename, downloadURL string) (*CacheResult, error) {
-	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, "")
+	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, "", "")
 }
 
 // GetOrFetchArtifactFromURLWithHeaders retrieves an artifact from cache or fetches from a URL
 // with additional request-specific HTTP headers.
 func (p *Proxy) GetOrFetchArtifactFromURLWithHeaders(ctx context.Context, ecosystem, name, version, filename, downloadURL string, headers http.Header) (*CacheResult, error) {
-	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, headers, "")
+	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, headers, "", "")
 }
 
 // GetOrFetchArtifactFromURLWithDigest retrieves an artifact and verifies its
@@ -1785,26 +1804,35 @@ func (p *Proxy) GetOrFetchArtifactFromURLWithDigest(ctx context.Context, ecosyst
 	if upstreamHash == digest {
 		upstreamHash = ""
 	}
-	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, upstreamHash)
+	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, upstreamHash, "")
 }
 
-func (p *Proxy) getOrFetchArtifactFromURL(ctx context.Context, ecosystem, name, version, filename, downloadURL string, headers http.Header, upstreamHash string) (*CacheResult, error) {
+// GetOrFetchArtifactFromURLWithIntegrity retrieves an artifact and verifies a
+// newly fetched response against declared, the Subresource Integrity string
+// the registry's metadata declares, before serving or caching it. declared is
+// recorded with the cached version, so cache hits are verified against it as
+// well. An empty declared fetches without verification.
+func (p *Proxy) GetOrFetchArtifactFromURLWithIntegrity(ctx context.Context, ecosystem, name, version, filename, downloadURL, declared string) (*CacheResult, error) {
+	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, "", declared)
+}
+
+func (p *Proxy) getOrFetchArtifactFromURL(ctx context.Context, ecosystem, name, version, filename, downloadURL string, headers http.Header, upstreamHash, declared string) (*CacheResult, error) {
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
 		return nil, err
 	}
 	return p.getOrFetchArtifactFromURLWithCachePURLs(
-		ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, headers, upstreamHash,
+		ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, headers, upstreamHash, declared,
 	)
 }
 
-func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash string) (*CacheResult, error) {
+func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (*CacheResult, error) {
 	// Some protocols use qualified cache keys. Check their package identity too.
 	if p.versionDenied(ecosystem, name, version) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, canonicalVersionPURL(ecosystem, name, version))
 	}
 	if p.StreamArtifacts {
-		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash,
+		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash, declared,
 			func(fetchCtx context.Context) (*fetch.Artifact, error) {
 				return p.Fetcher.FetchWithHeaders(fetchCtx, downloadURL, headers)
 			})
@@ -1815,20 +1843,20 @@ func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, eco
 		return cached, nil
 	}
 	metrics.RecordCacheMiss(ecosystem)
-	return p.coalescedFetchFromURL(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, headers, upstreamHash)
+	return p.coalescedFetchFromURL(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, headers, upstreamHash, declared)
 }
 
 // coalescedFetchFromURL fetches an artifact the cache could not serve, sharing
 // the fetch with concurrent callers. The caller running it discards a stale
 // entry under the key, where it cannot delete a fetch that just replaced it.
-func (p *Proxy) coalescedFetchFromURL(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash string) (*CacheResult, error) {
-	key := artifactCoalesceKey(versionPURL, filename, downloadURL, upstreamHash)
+func (p *Proxy) coalescedFetchFromURL(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (*CacheResult, error) {
+	key := artifactCoalesceKey(versionPURL, filename, downloadURL, upstreamHash, declared)
 	recheck := func() (artifacts.Artifact, string, bool) {
 		return p.cachedArtifactRecord(pkgPURL, versionPURL, filename, upstreamHash)
 	}
 	return p.coalesceFetch(ctx, key, recheck, func(fetchCtx context.Context) (artifacts.Artifact, string, error) {
 		p.discardStaleArtifact(pkgPURL, versionPURL, filename, upstreamHash)
-		return p.fetchAndCacheFromURL(fetchCtx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, headers, upstreamHash)
+		return p.fetchAndCacheFromURL(fetchCtx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, headers, upstreamHash, declared)
 	})
 }
 
@@ -1873,7 +1901,7 @@ func (p *Proxy) discardStaleArtifact(pkgPURL, versionPURL, filename, upstreamHas
 	}
 }
 
-func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash string) (artifacts.Artifact, string, error) {
+func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (artifacts.Artifact, string, error) {
 	p.Logger.Info("fetching from upstream",
 		"ecosystem", ecosystem, "name", name, "version", version, "url", downloadURL)
 
@@ -1889,17 +1917,18 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		return artifacts.Artifact{}, "", fmt.Errorf("fetching from upstream: %w", err)
 	}
 
-	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, artifact)
+	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact)
 }
 
 // streamFromUpstream fetches an artifact when StreamArtifacts is set and hands its
 // body to the caller without storing it.
 //
-// With upstreamHash set the body is verified as it streams. The size is left
+// With upstreamHash or the declared integrity set the body is verified as it
+// streams. The size is left
 // unknown so the response goes out chunked: a mismatch only shows at EOF,
 // after the bytes have been sent, and an unterminated chunked response is the
 // only way left to make the client reject them (see serveArtifact).
-func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash string, fetchArtifact func(context.Context) (*fetch.Artifact, error)) (*CacheResult, error) {
+func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, error)) (*CacheResult, error) {
 	p.Logger.Info("streaming from upstream",
 		"ecosystem", ecosystem, "name", name, "version", version, "url", upstreamURL)
 
@@ -1933,12 +1962,12 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 			MediaType: artifact.ContentType,
 		},
 	}
-	if upstreamHash == "" {
+	if upstreamHash == "" && declared == "" {
 		return result, nil
 	}
 
 	hash := strings.ToLower(upstreamHash)
-	checks, err := newIntegrityChecks(hash, "")
+	checks, err := newIntegrityChecks(hash, declared)
 	if err != nil {
 		_ = artifact.Body.Close()
 		return nil, fmt.Errorf("parsing upstream digest: %w", err)
@@ -1953,7 +1982,9 @@ func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version
 		_ = artifact.Body.Close()
 		return nil, err
 	}
-	result.Artifact.Digest = digest.Digest("sha256:" + hash)
+	if hash != "" {
+		result.Artifact.Digest = digest.Digest("sha256:" + hash)
+	}
 	result.Artifact.Size = -1
 	return result, nil
 }

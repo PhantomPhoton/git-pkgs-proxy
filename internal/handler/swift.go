@@ -217,7 +217,7 @@ func (h *SwiftHandler) handleSourceArchive(w http.ResponseWriter, r *http.Reques
 	headers.Set("Accept", requestAccept(r, swiftAcceptArchive))
 	result, err := h.proxy.getOrFetchArtifactFromURLWithCachePURLs(
 		r.Context(), "swift", packageName, version, filename, packagePURL, versionPURL,
-		upstreamURL, headers, archiveInfo.checksum,
+		upstreamURL, headers, archiveInfo.checksum, "",
 	)
 	if err != nil {
 		h.writeArtifactError(w, err)

@@ -39,6 +39,35 @@ func newIntegrityChecks(contentHash, native string) (integrityChecks, error) {
 	return checks, nil
 }
 
+// verifyIntegrity wraps body to check it against the declared integrity as
+// it is read. verified, called once body has been read, reports a mismatch as
+// ErrArtifactDigestMismatch, and also a body that was not read to its end,
+// since only a complete body can be checked. An empty declared checks
+// nothing.
+func verifyIntegrity(body io.ReadCloser, declared string) (_ io.Reader, verified func() error, _ error) {
+	if declared == "" {
+		return body, func() error { return nil }, nil
+	}
+	checks, err := newIntegrityChecks("", declared)
+	if err != nil {
+		return nil, nil, err
+	}
+	var mismatch string
+	reader, err := checks.newVerifyingReader(body, func(reason string) { mismatch = reason }, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reader, func() error {
+		if !reader.(*verifyingReader).verified {
+			return fmt.Errorf("%w: body was not read to its end", ErrArtifactDigestMismatch)
+		}
+		if mismatch != "" {
+			return fmt.Errorf("%w: %s", ErrArtifactDigestMismatch, mismatch)
+		}
+		return nil
+	}, nil
+}
+
 func (c integrityChecks) wrap(source io.ReadCloser, onMismatch func(string)) (io.ReadCloser, error) {
 	if len(c.algorithms) == 0 {
 		return source, nil
