@@ -1098,6 +1098,20 @@ func JSONError(w http.ResponseWriter, status int, message string) {
 // ErrUpstreamNotFound indicates the upstream returned 404.
 var ErrUpstreamNotFound = fmt.Errorf("upstream: %w", fetch.ErrNotFound)
 
+// upstreamNotFoundBodyLimit caps the part of an upstream 404 body kept in
+// upstreamNotFoundError.
+const upstreamNotFoundBodyLimit = 4 << 10
+
+// upstreamNotFoundError is ErrUpstreamNotFound with the start of the
+// upstream's 404 body, for handlers that relay the reason to clients.
+type upstreamNotFoundError struct {
+	body []byte
+}
+
+func (e *upstreamNotFoundError) Error() string { return ErrUpstreamNotFound.Error() }
+
+func (e *upstreamNotFoundError) Unwrap() error { return ErrUpstreamNotFound }
+
 // ErrArtifactBlocked indicates a pre-cache security scan blocked the artifact.
 var ErrArtifactBlocked = errors.New("artifact blocked by security scan")
 
@@ -1280,7 +1294,7 @@ func (p *Proxy) fetchMetadataFromUpstream(ctx context.Context, ecosystem, cacheK
 
 	p.Logger.Info("serving metadata from cache",
 		"ecosystem", ecosystem, "key", cacheKey)
-	return metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String}.describedBy(entry)
+	return metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String, stale: true}.describedBy(entry)
 }
 
 // metadataResult is what a metadata lookup hands back. A shared fetch gives
@@ -1293,6 +1307,9 @@ type metadataResult struct {
 	// empty otherwise.
 	digest string
 	err    error
+	// stale is set when the body is the cached copy served because upstream
+	// failed.
+	stale bool
 }
 
 // describedBy returns res with the digest that entry, the cache row its body
@@ -1457,7 +1474,8 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrUpstreamNotFound
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamNotFoundBodyLimit))
+		return nil, &upstreamNotFoundError{body: body}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)

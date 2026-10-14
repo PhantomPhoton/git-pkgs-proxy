@@ -401,6 +401,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	)
 	gemHandler := handler.NewGemHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Gem)
 	goHandler := handler.NewGoHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Go)
+	goHandler.SetSumDBs(s.cfg.Upstream.GoSumDBs, s.cfg.Upstream.GoSumDBsOffline)
 	hexHandler := handler.NewHexHandlerWithUpstreams(
 		proxy,
 		s.cfg.BaseURL,

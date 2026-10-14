@@ -237,6 +237,7 @@ Each upstream used by a built-in package route can be set in YAML or JSON under 
 | `upstream.cargo_download` | `PROXY_UPSTREAM_CARGO_DOWNLOAD` | `https://static.crates.io/crates` |
 | `upstream.gem` | `PROXY_UPSTREAM_GEM` | `https://rubygems.org` |
 | `upstream.go` | `PROXY_UPSTREAM_GO` | `https://proxy.golang.org` |
+| `upstream.go_sumdbs_offline` | `PROXY_UPSTREAM_GO_SUMDBS_OFFLINE` | `false` |
 | `upstream.hex` | `PROXY_UPSTREAM_HEX` | `https://repo.hex.pm` |
 | `upstream.hex_api` | `PROXY_UPSTREAM_HEX_API` | `https://hex.pm` |
 | `upstream.pub` | `PROXY_UPSTREAM_PUB` | `https://pub.dev` |
@@ -494,6 +495,63 @@ When `upstream.arch` is empty, a single repository named `archlinux` pointing at
 `https://geo.mirror.pkgbuild.com` is available; configuring any entry replaces
 that default. Arch Linux ARM has no default: pick a regional HTTPS mirror, not
 the `mirror.archlinuxarm.org` redirector.
+
+### Go checksum database
+
+```yaml
+upstream:
+
+  # Named Go checksum databases, served at /go/sumdb/{name}/.
+  go_sumdbs:
+    sum.golang.org: "https://sum.golang.org"
+
+  # Keep answering for a database from its cached tree, however old, when
+  # the database cannot be reached. For networks where clients have no
+  # route to the database of their own. Requires cache_metadata.
+  go_sumdbs_offline: false
+```
+
+The `go` command asks `GOPROXY` for the checksum database before contacting it
+directly. The proxy answers for every name listed here and fetches lookups and
+tiles from the database's URL, not from `upstream.go`. Unknown names get 404,
+so the `go` command falls back to contacting that database itself. When
+`upstream.go_sumdbs` is empty, `sum.golang.org` is served; configuring any
+entry replaces that default.
+
+Once the proxy says it serves a database, the `go` command no longer contacts
+that database directly. The proxy therefore only says so when it can fetch the
+database's latest signed tree, or has a fresh one cached (fetched within
+`metadata_ttl`). If it cannot, it answers 404 as for an unknown name, and
+clients go to the database themselves, as they would without the proxy. The
+check waits five seconds at most, and after a failed check the proxy waits a
+minute before it tries the database again.
+
+Set `upstream.go_sumdbs_offline: true` when clients have no route to the
+database of their own. The proxy then keeps answering for it from the cached
+tree for as long as the outage lasts and serves cached lookups and tiles.
+That does not mean every cached module still verifies: the `go` command
+checks each lookup against tiles of the signed tree that came with it, the
+database attaches a different tree to almost every lookup, and a tile no
+client fetched through the proxy before cannot be served during the outage.
+Lookups for modules that were never cached fail as well. Builds whose
+`go.sum` already lists every module do not ask the database at all and are
+not affected. This requires `cache_metadata`.
+
+With `cache_metadata` enabled, lookups, partial hash tiles and the latest
+signed tree follow `metadata_ttl` and are served from cache when the database
+is unreachable. Complete hash tiles never change and are not revalidated once
+cached; a tile of the wrong size is refused and not stored. Data tiles are
+always forwarded and never stored: the `go` command does not fetch them, only
+mirrors and auditors do.
+Without `cache_metadata` the requests are forwarded and nothing is stored.
+
+A 404 from the database keeps its text, which the `go` command prints to
+explain why a version is missing. With `cache_metadata` enabled the text is
+cut at 4 KiB; without it the response is passed on unchanged.
+
+If `upstream.go` points at a module proxy that serves the checksum database
+itself, such as Athens, point the entry there instead, for example
+`sum.golang.org: "https://athens.example/sumdb/sum.golang.org"`.
 
 ### Debian archives
 

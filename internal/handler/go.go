@@ -28,9 +28,12 @@ func init() {
 
 // GoHandler handles Go module proxy protocol requests.
 type GoHandler struct {
-	proxy       *Proxy
-	upstreamURL string
-	proxyURL    string
+	proxy        *Proxy
+	upstreamURL  string
+	proxyURL     string
+	sumDBs       map[string]string
+	sumDBOffline bool
+	sumDBProbes  goSumDBProbes
 }
 
 // NewGoHandler creates a new Go module proxy handler.
@@ -39,6 +42,7 @@ func NewGoHandler(proxy *Proxy, proxyURL string) *GoHandler {
 		proxy:       proxy,
 		upstreamURL: goUpstream,
 		proxyURL:    strings.TrimSuffix(proxyURL, "/"),
+		sumDBs:      map[string]string{defaultGoSumDBName: defaultGoSumDBURL},
 	}
 }
 
@@ -65,9 +69,9 @@ func (h *GoHandler) Routes() http.Handler {
 func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
-	// Sumdb requests - proxy through
-	if strings.HasPrefix(path, "sumdb/") {
-		h.proxyUpstream(w, r)
+	// Checksum database requests go to the database, not the module upstream
+	if rest, ok := strings.CutPrefix(path, "sumdb/"); ok {
+		h.handleSumDB(w, r, rest)
 		return
 	}
 
@@ -139,11 +143,6 @@ func (h *GoHandler) handleDownload(w http.ResponseWriter, r *http.Request, modul
 	}
 
 	ServeArtifactRequest(w, r, result)
-}
-
-// proxyUpstream forwards a request to proxy.golang.org without caching.
-func (h *GoHandler) proxyUpstream(w http.ResponseWriter, r *http.Request) {
-	h.proxy.ProxyUpstream(w, r, h.upstreamURL+r.URL.Path, nil)
 }
 
 // proxyCached forwards a request with metadata caching.

@@ -1612,6 +1612,61 @@ func TestValidateNamedUpstreams(t *testing.T) {
 	}
 }
 
+func TestValidateGoSumDBs(t *testing.T) {
+	tests := []struct {
+		name    string
+		modify  func(*Config)
+		wantErr bool
+	}{
+		{
+			name: "valid Go checksum database",
+			modify: func(cfg *Config) {
+				cfg.Upstream.GoSumDBs = map[string]string{"sum.golang.org": "https://sum.golang.org"}
+			},
+		},
+		{
+			name: "Go checksum database name contains path separator",
+			modify: func(cfg *Config) {
+				cfg.Upstream.GoSumDBs = map[string]string{"sum.golang.org/x": "https://sum.golang.org"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "Go checksum database URL is not absolute",
+			modify: func(cfg *Config) {
+				cfg.Upstream.GoSumDBs = map[string]string{"sum.golang.org": "sum.golang.org"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "Go checksum database offline mode requires metadata caching",
+			modify: func(cfg *Config) {
+				cfg.CacheMetadata = false
+				cfg.Upstream.GoSumDBsOffline = true
+			},
+			wantErr: true,
+		},
+		{
+			name: "Go checksum database offline mode with metadata caching",
+			modify: func(cfg *Config) {
+				cfg.CacheMetadata = true
+				cfg.Upstream.GoSumDBsOffline = true
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			tt.modify(cfg)
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateCacheArtifactsDisabled(t *testing.T) {
 	tests := []struct {
 		name    string
