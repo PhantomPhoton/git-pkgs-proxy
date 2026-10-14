@@ -207,14 +207,20 @@ func (b *Blob) Store(ctx context.Context, path string, r io.Reader) (int64, stri
 	h := sha256.New()
 	tee := io.TeeReader(r, h)
 
+	// gocloud commits whatever was written when the writer closes, unless
+	// its context is cancelled first, so a failed copy cancels it to abort.
+	writeCtx, abort := context.WithCancel(ctx)
+	defer abort()
+
 	opts := &blob.WriterOptions{}
-	w, err := b.bucket.NewWriter(ctx, path, opts)
+	w, err := b.bucket.NewWriter(writeCtx, path, opts)
 	if err != nil {
 		return 0, "", fmt.Errorf("creating writer: %w", err)
 	}
 
 	size, err := io.Copy(w, tee)
 	if err != nil {
+		abort()
 		_ = w.Close()
 		return 0, "", fmt.Errorf("writing content: %w", err)
 	}
