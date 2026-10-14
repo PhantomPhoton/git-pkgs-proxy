@@ -950,6 +950,16 @@ metadata_max_size: "100MB"   # default
 
 Or via environment variable: `PROXY_METADATA_MAX_SIZE=250MB`.
 
+### Artifact size limit
+
+Artifacts have no size limit by default. `artifact_max_size` refuses any artifact larger than the limit, so a client cannot fill storage or tie up the proxy by requesting huge downloads. An artifact whose upstream `Content-Length` is over the limit is refused before its body is read; one without a declared size fails once the download passes the limit. Either way nothing is cached and the client gets `502 Bad Gateway`, except when artifacts are streamed: one without a declared size has already started sending when it passes the limit, so the client sees the download cut off. The limit applies to `serve`, `mirror` and streamed artifacts.
+
+```yaml
+artifact_max_size: "2GB"   # default: unlimited ("" or "0")
+```
+
+Or via environment variable: `PROXY_ARTIFACT_MAX_SIZE=2GB`.
+
 ### Rewritten metadata cache
 
 The npm and Composer handlers rewrite every metadata document they serve, so that download URLs point at the proxy. That means decoding the whole document and encoding it again, and Composer's minified documents are also expanded, which together cost milliseconds per typical package and far more for very large ones. The proxy keeps rewritten documents in memory, so each distinct upstream document is rewritten once and requests arriving while it is being rewritten wait for that rewrite. New bytes from upstream are rewritten again. With version cooldown enabled the cache is bypassed, because cooldown filtering depends on the current time.

@@ -14,6 +14,10 @@ base_url: "http://localhost:8080"
 # Set to "0" to disable the timeout. Default: "30s".
 # http_timeout: "30s"
 
+# Largest upstream artifact to fetch (e.g. "2GB"). Larger ones are refused
+# and not cached. Default: unlimited.
+# artifact_max_size: ""
+
 # Memory for rewritten npm and Composer metadata, so each upstream document is
 # rewritten once rather than on every request. Set to "0" to rewrite on every
 # request. Default: "256MB".

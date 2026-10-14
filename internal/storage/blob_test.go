@@ -660,3 +660,41 @@ func TestStoreSucceedsWhenSidecarCannotBeRemoved(t *testing.T) {
 		t.Errorf("Store failed because cleanup could not complete: %v", err)
 	}
 }
+
+type failingReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// A download that breaks off midway must not leave its first half behind as
+// an object, or every failed fetch adds an orphan nothing ever deletes.
+func TestBlobStoreFailedCopyLeavesNoObject(t *testing.T) {
+	b := createTestBlob(t)
+	ctx := context.Background()
+	readErr := errors.New("connection reset")
+
+	_, _, err := b.Store(ctx, "npm/lodash/4.17.21/lodash.tgz", &failingReader{
+		data: []byte(strings.Repeat("partial", 1024)),
+		err:  readErr,
+	})
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Store error = %v, want %v", err, readErr)
+	}
+
+	exists, err := b.Exists(ctx, "npm/lodash/4.17.21/lodash.tgz")
+	if err != nil {
+		t.Fatalf("Exists failed: %v", err)
+	}
+	if exists {
+		t.Error("failed Store left a partial object behind")
+	}
+}
