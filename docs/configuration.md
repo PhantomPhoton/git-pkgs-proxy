@@ -894,7 +894,7 @@ Or via environment variable: `PROXY_METADATA_MAX_SIZE=250MB`.
 
 ### Artifact size limit
 
-Artifacts have no size limit by default. `artifact_max_size` refuses any artifact larger than the limit, so a client cannot fill storage or tie up the proxy by requesting huge downloads. An artifact whose upstream `Content-Length` is over the limit is refused before its body is read; one without a declared size fails once the download passes the limit. Either way nothing is cached and the client gets `502 Bad Gateway`. The limit applies to `serve`, `mirror` and streamed artifacts.
+Artifacts have no size limit by default. `artifact_max_size` refuses any artifact larger than the limit, so a client cannot fill storage or tie up the proxy by requesting huge downloads. An artifact whose upstream `Content-Length` is over the limit is refused before its body is read; one without a declared size fails once the download passes the limit. Either way nothing is cached and the client gets `502 Bad Gateway`, except when artifacts are streamed: one without a declared size has already started sending when it passes the limit, so the client sees the download cut off. The limit applies to `serve`, `mirror` and streamed artifacts.
 
 ```yaml
 artifact_max_size: "2GB"   # default: unlimited ("" or "0")
