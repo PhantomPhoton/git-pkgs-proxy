@@ -1371,3 +1371,61 @@ func TestOCIRetentionKey(t *testing.T) {
 		t.Error("ociRetentionKey(nil) accepted")
 	}
 }
+
+// Docker sends one Accept header per media type. All of them count, both for
+// the request upstream and for which cached representation can be served.
+func TestContainerHandler_ManifestHonoursSeparateAcceptHeaders(t *testing.T) {
+	manifest := `{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`
+	digest := sha256Digest([]byte(manifest))
+	dockerAccept := []string{
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+	}
+	upstreamAvailable := true
+	var upstreamAccept string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !upstreamAvailable {
+			http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		upstreamAccept = strings.Join(r.Header.Values("Accept"), ", ")
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		w.Header().Set("Docker-Content-Digest", digest)
+		_, _ = io.WriteString(w, manifest)
+	}))
+	defer upstream.Close()
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	proxy.MetadataTTL = 0
+	h := &ContainerHandler{proxy: proxy, registryURL: upstream.URL, proxyURL: "http://localhost:8080"}
+	pull := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/library/busybox/manifests/1", nil)
+		for _, mediaType := range dockerAccept {
+			req.Header.Add("Accept", mediaType)
+		}
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, req)
+		return w
+	}
+
+	if w := pull(); w.Code != http.StatusOK {
+		t.Fatalf("online status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	for _, mediaType := range dockerAccept {
+		if !strings.Contains(upstreamAccept, mediaType) {
+			t.Errorf("upstream Accept = %q, missing %s", upstreamAccept, mediaType)
+		}
+	}
+
+	upstreamAvailable = false
+	w := pull()
+	if w.Code != http.StatusOK {
+		t.Fatalf("offline status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if w.Body.String() != manifest {
+		t.Errorf("offline body = %q, want the cached manifest", w.Body.String())
+	}
+}

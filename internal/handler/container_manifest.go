@@ -331,8 +331,10 @@ func writeContainerManifest(w http.ResponseWriter, r *http.Request, manifest *ca
 	}
 }
 
+// containerManifestAccept joins every Accept header: Docker sends one per
+// media type, and the first alone would rule out the others.
 func containerManifestAccept(r *http.Request) string {
-	if accept := r.Header.Get("Accept"); accept != "" {
+	if accept := strings.Join(r.Header.Values("Accept"), ", "); accept != "" {
 		return accept
 	}
 	return strings.Join([]string{
