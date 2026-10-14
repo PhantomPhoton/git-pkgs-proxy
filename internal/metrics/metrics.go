@@ -105,6 +105,14 @@ var (
 		[]string{"registry"},
 	)
 
+	UpstreamRateLimitHolds = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "proxy_upstream_rate_limit_holds_total",
+			Help: "Holds placed on an upstream host after it rate limited the proxy",
+		},
+		[]string{"host"},
+	)
+
 	// Storage metrics
 	StorageOperationDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -263,6 +271,7 @@ func init() {
 		UpstreamErrors,
 		CircuitBreakerState,
 		CircuitBreakerTrips,
+		UpstreamRateLimitHolds,
 		StorageOperationDuration,
 		StorageErrors,
 		ActiveRequests,
@@ -480,6 +489,11 @@ func UpdateCircuitBreakerState(registry string, state int) {
 // RecordCircuitBreakerTrip increments circuit breaker trip counter.
 func RecordCircuitBreakerTrip(registry string) {
 	CircuitBreakerTrips.WithLabelValues(registry).Inc()
+}
+
+// RecordUpstreamRateLimitHold counts a hold placed on host.
+func RecordUpstreamRateLimitHold(host string, _ time.Duration) {
+	UpstreamRateLimitHolds.WithLabelValues(host).Inc()
 }
 
 // IncrementActiveRequests increments the active request counter.

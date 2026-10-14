@@ -117,6 +117,7 @@ type Server struct {
 	accessLog   *accesslog.Logger
 	ecr         *ecrTokens
 	breakers    *breakerMonitor
+	rateLimits  *upstreamhttp.RateLimitGate
 	ecoStats    ecosystemStatsCache
 	sources     sourceTracker
 
@@ -493,7 +494,13 @@ func (s *Server) newUpstreamClients(artifactTimeout time.Duration) (metadataClie
 	if s.accessLog != nil {
 		baseTransport = upstreamhttp.NewAccessLogTransport(baseTransport, s.accessLog, s.logger)
 	}
-	authTransport := upstreamhttp.NewTransport(baseTransport, upstreamhttp.AuthFunc(s.authForURL))
+	// The gate sits under the auth transport so it sees every final upstream
+	// answer, including the retry after a bearer challenge.
+	gate := upstreamhttp.NewRateLimitGate(baseTransport)
+	gate.Logger = s.logger
+	gate.OnHold = metrics.RecordUpstreamRateLimitHold
+	s.rateLimits = gate
+	authTransport := upstreamhttp.NewTransport(gate, upstreamhttp.AuthFunc(s.authForURL))
 	metadata := *safeClient
 	metadata.Timeout = s.cfg.ParseHTTPTimeout()
 	metadata.Transport = authTransport
@@ -1156,6 +1163,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Status:          "ok",
 		Checks:          map[string]HealthCheck{},
 		CircuitBreakers: s.breakers.snapshot(),
+		UpstreamHolds:   formatHolds(s.rateLimits.Holds()),
 	}
 
 	// Database check (short-circuit; do not waste a storage probe call when DB is down).

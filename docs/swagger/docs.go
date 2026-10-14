@@ -825,6 +825,13 @@ const docTemplate = `{
                 },
                 "status": {
                     "type": "string"
+                },
+                "upstream_holds": {
+                    "description": "UpstreamHolds lists upstream hosts that rate limited the proxy and\nthe RFC 3339 time until which it sends them nothing. A held host\nfails cache misses without contacting it and does not change Status.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
                 }
             }
         },

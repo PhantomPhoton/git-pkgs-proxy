@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	upstreamhttp "github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"github.com/git-pkgs/registries/fetch"
 	"github.com/prometheus/client_golang/prometheus"
@@ -346,3 +347,44 @@ func TestBreakerMonitor_SnapshotSerializesStateReads(t *testing.T) {
 		t.Errorf("trips = %v, want 1", trips)
 	}
 }
+
+func TestHealthEndpoint_ReportsUpstreamHolds(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.close()
+
+	gate := upstreamhttp.NewRateLimitGate(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"600"}},
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	}))
+	req, _ := http.NewRequest(http.MethodGet, "https://repo1.maven.org/maven2/x", nil)
+	if resp, err := gate.RoundTrip(req); err == nil {
+		_ = resp.Body.Close()
+	}
+	ts.server.rateLimits = gate
+
+	w := httptest.NewRecorder()
+	ts.handler.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	var resp HealthResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	until, err := time.Parse(time.RFC3339, resp.UpstreamHolds["repo1.maven.org"])
+	if err != nil {
+		t.Fatalf("upstream_holds = %v, want repo1.maven.org with an RFC 3339 deadline", resp.UpstreamHolds)
+	}
+	if remaining := time.Until(until); remaining < 9*time.Minute || remaining > 10*time.Minute {
+		t.Errorf("hold ends in %s, want about 10m", remaining)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }

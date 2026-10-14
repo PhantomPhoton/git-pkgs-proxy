@@ -6,11 +6,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/git-pkgs/proxy/internal/database"
+	"github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"github.com/git-pkgs/proxy/internal/storage"
 	"github.com/git-pkgs/purl"
@@ -1258,3 +1260,49 @@ func TestRPMHandler_DownloadCacheMiss(t *testing.T) {
 		t.Errorf("upstream URL = %q, want %q", fetcher.fetchedURL, want)
 	}
 }
+
+func TestMavenHandler_UpstreamHeldReturns503(t *testing.T) {
+	held := &httpclient.HeldError{Host: "repo1.maven.org", Until: time.Now().Add(90 * time.Second), RetryAfter: 90 * time.Second}
+
+	t.Run("artifact", func(t *testing.T) {
+		proxy, _, _, fetcher := setupTestProxy(t)
+		fetcher.fetchErr = fmt.Errorf("fetching artifact: %w", &url.Error{Op: "Get", URL: "https://repo1.maven.org/x", Err: held})
+
+		h := NewMavenHandler(proxy, "http://localhost", "", "")
+		srv := httptest.NewServer(h.Routes())
+		defer srv.Close()
+
+		resp, err := http.Get(srv.URL + "/com/example/lib/1.0/lib-1.0.jar")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "90" {
+			t.Errorf("status %d Retry-After %q, want 503 with Retry-After 90", resp.StatusCode, resp.Header.Get("Retry-After"))
+		}
+	})
+
+	t.Run("metadata", func(t *testing.T) {
+		proxy, _, _, _ := setupTestProxy(t)
+		proxy.HTTPClient = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, held
+		})}
+
+		h := NewMavenHandler(proxy, "http://localhost", "", "")
+		srv := httptest.NewServer(h.Routes())
+		defer srv.Close()
+
+		resp, err := http.Get(srv.URL + "/com/example/lib/maven-metadata.xml")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "90" {
+			t.Errorf("status %d Retry-After %q, want 503 with Retry-After 90", resp.StatusCode, resp.Header.Get("Retry-After"))
+		}
+	})
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
