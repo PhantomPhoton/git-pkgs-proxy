@@ -761,6 +761,8 @@ func TestStaticFiles(t *testing.T) {
 	}{
 		{"/ui/static/vendor/tailwind.js", []string{"text/javascript", "application/javascript"}},
 		{"/ui/static/vendor/lucide.min.js", []string{"text/javascript", "application/javascript"}},
+		{"/ui/static/vendor/diff2html-ui.min.js", []string{"text/javascript", "application/javascript"}},
+		{"/ui/static/vendor/diff2html.min.css", []string{"text/css"}},
 		{"/ui/static/style.css", []string{"text/css"}},
 	}
 

@@ -2,8 +2,10 @@ package server
 
 import (
 	"database/sql"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -707,5 +709,30 @@ func BenchmarkFirstRender(b *testing.B) {
 		if err := t.Render(w, "dashboard", DashboardData{}); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// thirdPartyAsset matches a script or stylesheet loaded from another origin.
+var thirdPartyAsset = regexp.MustCompile(`<(?:script[^>]*\ssrc|link[^>]*\shref)="(?:https?:)?//[^"]*"`)
+
+// Pages run on the proxy origin, so a script or stylesheet from elsewhere
+// would run with the proxy's privileges and break offline deployments.
+// Vendor it under static/vendor instead.
+func TestTemplatesLoadNoThirdPartyAssets(t *testing.T) {
+	err := fs.WalkDir(templatesFS, "templates", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		content, err := templatesFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, match := range thirdPartyAsset.FindAllString(string(content), -1) {
+			t.Errorf("%s loads a third-party asset: %s", path, match)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
