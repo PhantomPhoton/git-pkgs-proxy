@@ -500,3 +500,53 @@ func TestContainerHandler_ReferrersFollowsNamespace(t *testing.T) {
 		t.Errorf("upstream queries = %q, want one request without ns", upstreamQueries)
 	}
 }
+
+// Docker looks up a sha256-<digest> referrers tag on every pull. With the
+// upstream down and nothing cached, answering it as unknown lets a pull of a
+// cached image go ahead; other tags still report the failure.
+func TestContainerHandler_ReferrersTagIsUnknownWhenUpstreamFails(t *testing.T) {
+	referrersTag := "sha256-" + strings.Repeat("ab", 32)
+	tests := []struct {
+		name      string
+		reference string
+		upstream  func(t *testing.T) string
+		want      int
+	}{
+		{"referrers tag, upstream 503", referrersTag, upstreamAnswering(http.StatusServiceUnavailable), http.StatusNotFound},
+		{"referrers tag, upstream unreachable", referrersTag, unreachableUpstream, http.StatusNotFound},
+		{"referrers tag, upstream 404", referrersTag, upstreamAnswering(http.StatusNotFound), http.StatusNotFound},
+		{"other tag, upstream 503", "latest", upstreamAnswering(http.StatusServiceUnavailable), http.StatusServiceUnavailable},
+		{"other tag, upstream unreachable", "latest", unreachableUpstream, http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, _, _, _ := setupTestProxy(t)
+			proxy.HTTPClient = &http.Client{}
+			h := &ContainerHandler{proxy: proxy, registryURL: tt.upstream(t), proxyURL: "http://localhost:8080"}
+
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				w := httptest.NewRecorder()
+				h.Routes().ServeHTTP(w, httptest.NewRequest(method, "/library/nginx/manifests/"+tt.reference, nil))
+				if w.Code != tt.want {
+					t.Errorf("%s status = %d, want %d; body: %s", method, w.Code, tt.want, w.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func upstreamAnswering(status int) func(t *testing.T) string {
+	return func(t *testing.T) string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, http.StatusText(status), status)
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+}
+
+func unreachableUpstream(t *testing.T) string {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+	return srv.URL
+}
