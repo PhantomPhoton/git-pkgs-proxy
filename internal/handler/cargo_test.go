@@ -89,9 +89,7 @@ func TestCargoHandlerUsesConfiguredUpstreams(t *testing.T) {
 
 		proxy, _, _, _ := setupTestProxy(t)
 		proxy.HTTPClient = upstream.Client()
-		proxy.AuthForURL = func(string) (string, string) {
-			return "Authorization", "Bearer cargo-token"
-		}
+		authorizeUpstream(proxy, "Bearer cargo-token")
 		h := NewCargoHandler(
 			proxy,
 			"http://proxy.test",

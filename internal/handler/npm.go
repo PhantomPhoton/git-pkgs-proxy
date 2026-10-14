@@ -160,7 +160,6 @@ func (h *NPMHandler) handleSecurity(w http.ResponseWriter, r *http.Request) {
 	if req.Header.Get(headerContentType) == "" {
 		req.Header.Set(headerContentType, contentTypeJSON)
 	}
-	h.proxy.applyUpstreamAuth(req)
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {

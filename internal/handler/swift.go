@@ -269,7 +269,6 @@ func (h *SwiftHandler) probeSourceArchive(ctx context.Context, upstreamURL, acce
 	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("Range", "bytes=0-0")
-	h.proxy.applyUpstreamAuth(req)
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
@@ -313,7 +312,6 @@ func (h *SwiftHandler) fetchMetadataWithHeaders(
 		return nil, "", nil, fmt.Errorf("creating upstream metadata request: %w", err)
 	}
 	req.Header.Set("Accept", accept)
-	h.proxy.applyUpstreamAuth(req)
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
@@ -438,7 +436,6 @@ func (h *SwiftHandler) proxySwiftResource(w http.ResponseWriter, r *http.Request
 			req.Header.Set(name, value)
 		}
 	}
-	h.proxy.applyUpstreamAuth(req)
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {

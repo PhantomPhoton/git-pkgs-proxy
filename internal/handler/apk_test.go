@@ -144,9 +144,7 @@ func TestAPKHandler_IndexesServedUnchanged(t *testing.T) {
 	proxy.CacheMetadata = true
 	proxy.MetadataTTL = time.Hour
 	proxy.HTTPClient = upstream.Client()
-	proxy.AuthForURL = func(string) (string, string) {
-		return "Authorization", "Bearer apk-token"
-	}
+	authorizeUpstream(proxy, "Bearer apk-token")
 
 	h := NewAPKHandler(proxy, "http://proxy.example", map[string]string{"alpine": upstream.URL})
 

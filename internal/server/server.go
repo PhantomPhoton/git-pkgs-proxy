@@ -247,7 +247,6 @@ func (s *Server) serve(listener net.Listener) error {
 	}
 	proxy := handler.NewProxy(s.db, s.storage, fetcher, resolver, s.logger)
 	proxy.HTTPClient = &metadataClient
-	proxy.AuthForURL = s.authForURL
 	cooldownPolicy, err := cooldownpolicy.New(cd, s.cfg.Cooldown.PackagePatterns)
 	if err != nil {
 		return fmt.Errorf("configuring cooldown policy: %w", err)

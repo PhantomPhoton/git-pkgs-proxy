@@ -72,9 +72,7 @@ func TestNPMHandlerUsesConfiguredUpstream(t *testing.T) {
 
 		proxy, _, _, _ := setupTestProxy(t)
 		proxy.HTTPClient = upstream.Client()
-		proxy.AuthForURL = func(string) (string, string) {
-			return "Authorization", "Bearer npm-token"
-		}
+		authorizeUpstream(proxy, "Bearer npm-token")
 		h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL+"/root/")
 
 		req := httptest.NewRequest(http.MethodGet, "/testpkg", nil)
@@ -845,9 +843,7 @@ func TestNPMAuditCoversAllSecurityEndpoints(t *testing.T) {
 
 func TestNPMAuditAppliesUpstreamAuth(t *testing.T) {
 	h, got := newNPMAuditUpstream(t, npmAuditJSON(`{}`))
-	h.proxy.AuthForURL = func(string) (string, string) {
-		return "Authorization", "Bearer npm-token"
-	}
+	authorizeUpstream(h.proxy, "Bearer npm-token")
 
 	serveNPM(t, h, http.MethodPost, "/-/npm/v1/security/audits", strings.NewReader(`{}`), nil)
 
@@ -1011,9 +1007,7 @@ func TestNPMKeysProxiesUpstream(t *testing.T) {
 
 	proxy, _, _, _ := setupTestProxy(t)
 	proxy.HTTPClient = upstream.Client()
-	proxy.AuthForURL = func(string) (string, string) {
-		return "Authorization", "Bearer npm-token"
-	}
+	authorizeUpstream(proxy, "Bearer npm-token")
 	h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL)
 
 	w := serveNPM(t, h, http.MethodGet, npmKeysPath, nil, nil)
