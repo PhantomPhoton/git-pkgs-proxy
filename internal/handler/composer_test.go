@@ -494,13 +494,13 @@ func TestComposerDownloadDevVersionUsesDevMetadata(t *testing.T) {
 	// OLD behavior: fetching only the regular file fails to resolve the dev
 	// version, which is what produced the 404 before the fix.
 	stableURL := srv.URL + "/p2/phpmd/phpmd.json"
-	got, _, err := h.findDownloadURLFromMetadata(ctx, stableURL, pkg, version)
+	found, err := h.findDownloadURLFromMetadata(ctx, stableURL, pkg, version)
 	if err != nil {
 		t.Fatalf("unexpected error fetching regular metadata: %v", err)
 	}
-	if got != "" {
+	if found.url != "" {
 		t.Fatalf("regular metadata unexpectedly contained dev version %q (got %q); "+
-			"the test no longer reproduces the original bug", version, got)
+			"the test no longer reproduces the original bug", version, found.url)
 	}
 
 	// FIXED behavior: the handler consults the ~dev file (it is first in the
@@ -512,10 +512,11 @@ func TestComposerDownloadDevVersionUsesDevMetadata(t *testing.T) {
 
 	var resolved string
 	for _, u := range urls {
-		resolved, _, err = h.findDownloadURLFromMetadata(ctx, u, pkg, version)
+		found, err := h.findDownloadURLFromMetadata(ctx, u, pkg, version)
 		if err != nil {
 			t.Fatalf("unexpected error fetching metadata %q: %v", u, err)
 		}
+		resolved = found.url
 		if resolved != "" {
 			break
 		}
@@ -1005,5 +1006,72 @@ func TestComposerRetentionKey(t *testing.T) {
 	}
 	if _, ok := composerRetentionKey(nil); ok {
 		t.Error("composerRetentionKey(nil) accepted")
+	}
+}
+
+// TestComposerDownloadCooldown checks that an archive still in cooldown is
+// withheld when a lock file requests it directly, without the metadata that
+// would have filtered it out. In minified metadata a version inherits the
+// time of the entry before it.
+func TestComposerDownloadCooldown(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-10 * 24 * time.Hour).Format(time.RFC3339)
+	recent := now.Add(-1 * time.Hour).Format(time.RFC3339)
+
+	var archiveRequests atomic.Int32
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dist := func(version string) string {
+			return fmt.Sprintf(`"dist":{"url":%q,"type":"zip"}`, srv.URL+"/archives/"+version+".zip")
+		}
+		switch r.URL.Path {
+		case "/p2/v/p.json":
+			_, _ = fmt.Fprintf(w, `{"minified":"composer/2.0","packages":{"v/p":[`+
+				`{"version":"2.0.0","time":%q,%s},`+
+				`{"version":"1.9.0",%s},`+
+				`{"version":"1.0.0","time":%q,%s}]}}`,
+				recent, dist("2.0.0"), dist("1.9.0"), old, dist("1.0.0"))
+		case "/p2/v/p~dev.json":
+			http.NotFound(w, r)
+		default:
+			archiveRequests.Add(1)
+			_, _ = io.WriteString(w, "archive "+r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.Cooldown = &cooldown.Config{Default: "3d"}
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(srv.Client()), fetch.WithMaxRetries(0))
+	proxy.Fetcher = fetcher
+	t.Cleanup(func() { _ = fetcher.Close() })
+	h := NewComposerHandlerWithUpstreams(proxy, "http://proxy", srv.URL, srv.URL).Routes()
+
+	tests := []struct {
+		version    string
+		wantStatus int
+	}{
+		{"2.0.0", http.StatusNotFound},
+		{"1.9.0", http.StatusNotFound},
+		{"1.0.0", http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			archiveRequests.Store(0)
+			req := httptest.NewRequest(http.MethodGet, "/files/v/p/"+tt.version+"/"+tt.version+".zip", nil)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %q)", w.Code, tt.wantStatus, w.Body.String())
+			}
+			wantRequests := int32(0)
+			if tt.wantStatus == http.StatusOK {
+				wantRequests = 1
+			}
+			if got := archiveRequests.Load(); got != wantRequests {
+				t.Errorf("upstream archive requests = %d, want %d", got, wantRequests)
+			}
+		})
 	}
 }

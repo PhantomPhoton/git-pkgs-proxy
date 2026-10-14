@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -576,24 +575,31 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		"package", packageName, "version", version,
 		"metadata_urls", metaURLs)
 
-	var downloadURL, distType string
+	var dist composerDist
 	for _, metaURL := range metaURLs {
-		url, typ, err := h.findDownloadURLFromMetadata(r.Context(), metaURL, packageName, version)
+		found, err := h.findDownloadURLFromMetadata(r.Context(), metaURL, packageName, version)
 		if err != nil {
 			h.proxy.Logger.Error("failed to fetch metadata", "error", err, "url", metaURL)
 			http.Error(w, "failed to fetch metadata", http.StatusBadGateway)
 			return
 		}
-		if url != "" {
-			downloadURL, distType = url, typ
+		if found.url != "" {
+			dist = found
 			break
 		}
 	}
 
-	if downloadURL == "" {
+	if dist.url == "" {
 		h.proxy.Logger.Debug("version not found in any metadata source",
 			"package", packageName, "version", version,
 			"tried_urls", metaURLs)
+		http.Error(w, "version not found", http.StatusNotFound)
+		return
+	}
+
+	// Lock files name archive URLs directly, so a version filtered out of the
+	// metadata still has to be withheld here.
+	if h.shouldFilterVersion(canonicalPackagePURL("composer", packageName), packageName, version, dist.published) {
 		http.Error(w, "version not found", http.StatusNotFound)
 		return
 	}
@@ -605,8 +611,8 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	if r.URL.RawQuery != "" {
 		requested += "?" + r.URL.RawQuery
 	}
-	listedURL := downloadURL
-	downloadURL, ok := upstreamDistURL(listedURL, distType, requested, isDevVersion(version))
+	listedURL := dist.url
+	downloadURL, ok := upstreamDistURL(listedURL, dist.distType, requested, isDevVersion(version))
 	if !ok {
 		h.proxy.Logger.Info("composer file not in upstream metadata",
 			"package", packageName, "version", version,
@@ -696,23 +702,29 @@ func (h *ComposerHandler) metadataURLsForVersion(vendor, pkg, version string) []
 	return []string{stable, dev}
 }
 
+// composerDist is what a version's metadata says about its archive: the dist
+// URL and type, and the raw publish time the cooldown is checked against.
+type composerDist struct {
+	url, distType string
+	published     []byte
+}
+
 // findDownloadURLFromMetadata fetches a metadata document and returns the dist
-// URL and type for the given version, or an empty URL if the version is not
-// present. An error is returned only on transport failure; a missing document
-// (non-200) or a missing version both yield an empty URL so the caller can
-// fall back.
-func (h *ComposerHandler) findDownloadURLFromMetadata(ctx context.Context, metaURL, packageName, version string) (string, string, error) {
+// of the given version, with an empty URL if the version is not present. An
+// error is returned only on transport failure; a missing document (non-200)
+// or a missing version both yield an empty URL so the caller can fall back.
+func (h *ComposerHandler) findDownloadURLFromMetadata(ctx context.Context, metaURL, packageName, version string) (composerDist, error) {
 	h.proxy.Logger.Debug("fetching upstream metadata for download lookup",
 		"url", metaURL, "package", packageName, "version", version)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -720,42 +732,42 @@ func (h *ComposerHandler) findDownloadURLFromMetadata(ctx context.Context, metaU
 		"url", metaURL, "status", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
-		return "", "", nil
+		return composerDist{}, nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := h.proxy.ReadMetadata(resp.Body)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 
-	url, distType, err := composerDistURL(body, packageName, version)
+	dist, err := composerDistURL(body, packageName, version)
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 	h.proxy.Logger.Debug("download URL lookup result",
 		"url", metaURL, "package", packageName, "version", version,
-		"download_url", url)
-	return url, distType, nil
+		"download_url", dist.url)
+	return dist, nil
 }
 
-// composerDistURL returns the upstream dist URL and type of version from
-// Composer metadata, or "" when the package has no such version or it has no
-// dist URL. It walks the version list in place, expanding only as much of the
-// minified format as it needs, since it runs on each archive the proxy has not
-// cached yet.
-func composerDistURL(body []byte, packageName, version string) (string, string, error) {
+// composerDistURL returns the upstream dist of version from Composer
+// metadata, with an empty URL when the package has no such version or it has
+// no dist URL. It walks the version list in place, expanding only as much of
+// the minified format as it needs, since it runs on each archive the proxy
+// has not cached yet.
+func composerDistURL(body []byte, packageName, version string) (composerDist, error) {
 	format, _, err := lookupJSONString(body, "minified")
 	if err != nil {
-		return "", "", err
+		return composerDist{}, err
 	}
 	versions, err := lookupJSON(body, "packages", packageName)
 	if err != nil || len(versions) == 0 || versions[0] != '[' {
-		return "", "", err
+		return composerDist{}, err
 	}
 	minified := format == composerMinified
 
 	fields := newComposerFields()
-	var url, distType string
+	var dist composerDist
 	err = forEachJSONElement(versions, func(entry []byte) error {
 		if minified && jsonStringIs(entry, composerDevReset) {
 			fields.reset()
@@ -773,10 +785,11 @@ func composerDistURL(body []byte, packageName, version string) (string, string, 
 		if !jsonStringIs(fields.get("version"), version) {
 			return nil
 		}
-		dist := fields.get("dist")
-		url, _, _ = lookupJSONString(dist, "url")
-		if url != "" {
-			distType, _, _ = lookupJSONString(dist, "type")
+		distRaw := fields.get("dist")
+		dist.url, _, _ = lookupJSONString(distRaw, "url")
+		if dist.url != "" {
+			dist.distType, _, _ = lookupJSONString(distRaw, "type")
+			dist.published = fields.get("time")
 			return errStopScan
 		}
 		return nil
@@ -784,7 +797,7 @@ func composerDistURL(body []byte, packageName, version string) (string, string, 
 	if errors.Is(err, errStopScan) {
 		err = nil
 	}
-	return url, distType, err
+	return dist, err
 }
 
 // proxyUpstream forwards a request to packagist.org without caching.
