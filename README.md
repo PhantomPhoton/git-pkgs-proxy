@@ -461,6 +461,9 @@ Or pull images directly:
 docker pull localhost:8080/library/nginx:latest
 ```
 
+The registry is pull-only. BuildKit cache exports (`--cache-to type=registry`)
+and other pushes need a separate registry.
+
 SBOMs, signatures and attestations attached to an image are found through the
 OCI 1.1 referrers API (`GET /v2/{name}/referrers/{digest}`). `oras discover`
 and `notation verify` use it, and so does cosign for its newer signature
