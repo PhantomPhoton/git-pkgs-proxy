@@ -104,7 +104,7 @@ function renderFileTree(files, basePath) {
         const parentPath = basePath.split('/').slice(0, -2).join('/');
         html += `
             <div class="px-2 py-1 hover:bg-gray-100 dark:hover:bg-gray-800 rounded cursor-pointer text-sm flex items-center gap-2 text-gray-500 dark:text-gray-400"
-                 onclick="loadFileTree('${escapeHTML(parentPath)}'); currentPath='${escapeHTML(parentPath)}';">
+                 data-action="open-dir" data-path="${escapeHTML(parentPath)}">
                 <i data-lucide="corner-left-up" class="w-4 h-4 shrink-0"></i><span>..</span>
             </div>
         `;
@@ -119,13 +119,13 @@ function renderFileTree(files, basePath) {
 
         if (file.is_dir) {
             html += `
-                <div class="${classes}" onclick="loadFileTree('${escapeHTML(file.path)}'); currentPath='${escapeHTML(file.path)}';">
+                <div class="${classes}" data-action="open-dir" data-path="${escapeHTML(file.path)}">
                     ${iconHTML}<span class="truncate">${escapeHTML(file.name)}</span>
                 </div>
             `;
         } else {
             html += `
-                <div class="${classes}" onclick="loadFile('${escapeHTML(file.path)}')">
+                <div class="${classes}" data-action="open-file" data-path="${escapeHTML(file.path)}">
                     ${iconHTML}<span class="truncate">${escapeHTML(file.name)}</span>
                     <span class="text-xs text-gray-500 dark:text-gray-400 ml-auto shrink-0">${formatSize(file.size)}</span>
                 </div>
@@ -179,10 +179,10 @@ async function loadFile(path) {
             container.innerHTML = `
                 <div class="text-center text-gray-500 dark:text-gray-400 py-8">
                     <p class="mb-4">Binary file (${formatSize(content.length)})</p>
-                    <button onclick="window.location.href='${escapeHTML(url)}'"
-                            class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
+                    <a href="${escapeHTML(url)}"
+                       class="inline-block px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
                         Download
-                    </button>
+                    </a>
                 </div>
             `;
         }
@@ -206,6 +206,21 @@ function formatSize(bytes) {
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
+
+// Entries carry their path in data-path rather than in inline handlers: the
+// browser decodes entities in a handler attribute before running it, so an
+// escaped quote in a file name would end the handler's string.
+document.getElementById('file-tree').addEventListener('click', (event) => {
+    const entry = event.target.closest('[data-action]');
+    if (!entry) return;
+    const path = entry.dataset.path;
+    if (entry.dataset.action === 'open-dir') {
+        loadFileTree(path);
+        currentPath = path;
+    } else if (entry.dataset.action === 'open-file') {
+        loadFile(path);
+    }
+});
 
 // Load root directory on page load
 loadFileTree();
