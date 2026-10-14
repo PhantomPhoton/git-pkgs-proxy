@@ -712,7 +712,7 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		h.discardOtherCommit(packageName, version, cacheFilename, commit)
 	}
 	result, err := h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "composer", packageName, version, cacheFilename, downloadURL,
-		composerIntegrity(dist.shasum, downloadURL == listedURL))
+		composerIntegrity(dist.shasum, version, downloadURL == listedURL))
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return
@@ -876,13 +876,17 @@ func composerDistURL(body []byte, packageName, version string) (composerDist, er
 	return dist, err
 }
 
-// composerIntegrity returns the integrity to verify an archive against: the
-// SHA-1 its dist lists as shasum. That only describes the listed archive, not
-// another commit of a branch fetched in its place. Packagist lists no shasum
-// for GitHub archives, and an unusable one is ignored, so those are served
-// unverified as before.
-func composerIntegrity(shasum string, listed bool) string {
-	if !listed {
+// composerIntegrity returns the integrity to verify an archive of version
+// against: the SHA-1 its dist lists as shasum. A dev branch is left
+// unverified: its listed shasum describes only the current head, while every
+// commit of the branch is cached under the same version, which holds a single
+// recorded integrity, so a cache hit for an older pinned commit would be
+// checked against the head's shasum. Composer checks dist.shasum itself
+// anyway. A shasum also only describes the listed archive, and Packagist
+// lists none for GitHub archives; an unusable one is ignored. Those archives
+// are served unverified as before.
+func composerIntegrity(shasum, version string, listed bool) string {
+	if !listed || isDevVersion(version) {
 		return ""
 	}
 	return sha1Checksum(shasum)

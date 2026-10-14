@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/git-pkgs/registries/fetch"
@@ -59,6 +60,16 @@ func TestComposerDownloadPinnedCommitIgnoresListedShasum(t *testing.T) {
 
 func setupComposerShasum(t *testing.T, version, distPath, shasum string, archives map[string]string) (http.Handler, *Proxy) {
 	t.Helper()
+	h, proxy, _ := setupComposerShasumCounting(t, version, distPath, shasum, archives)
+	return h, proxy
+}
+
+// setupComposerShasumCounting is setupComposerShasum that also reports how
+// many times each archive path was fetched from upstream.
+func setupComposerShasumCounting(t *testing.T, version, distPath, shasum string, archives map[string]string) (http.Handler, *Proxy, func(string) int) {
+	t.Helper()
+	var mu sync.Mutex
+	fetched := map[string]int{}
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/p2/v/p.json" || r.URL.Path == "/p2/v/p~dev.json" {
@@ -71,6 +82,9 @@ func setupComposerShasum(t *testing.T, version, distPath, shasum string, archive
 			http.NotFound(w, r)
 			return
 		}
+		mu.Lock()
+		fetched[r.URL.Path]++
+		mu.Unlock()
 		_, _ = io.WriteString(w, body)
 	}))
 	t.Cleanup(srv.Close)
@@ -79,7 +93,11 @@ func setupComposerShasum(t *testing.T, version, distPath, shasum string, archive
 	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(srv.Client()), fetch.WithMaxRetries(0))
 	proxy.Fetcher = fetcher
 	t.Cleanup(func() { _ = fetcher.Close() })
-	return NewComposerHandlerWithUpstreams(proxy, "http://proxy", srv.URL, srv.URL).Routes(), proxy
+	return NewComposerHandlerWithUpstreams(proxy, "http://proxy", srv.URL, srv.URL).Routes(), proxy, func(path string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return fetched[path]
+	}
 }
 
 func isComposerArchiveCached(t *testing.T, proxy *Proxy, version, filename string) bool {
@@ -93,4 +111,34 @@ func isComposerArchiveCached(t *testing.T, proxy *Proxy, version, filename strin
 	}
 	_ = cached.Reader.Close()
 	return true
+}
+
+// TestComposerDevBranchArchivesStayServableFromCache is a regression test: a
+// version's integrity is one value shared by all its cached archives, but a
+// dev branch caches one archive per commit. Recording the head's shasum made
+// a pinned older commit fail its check when served from the cache, so its
+// archive was discarded and fetched again, which in turn cleared the head's
+// recorded shasum.
+func TestComposerDevBranchArchivesStayServableFromCache(t *testing.T) {
+	h, proxy, fetched := setupComposerShasumCounting(t, "dev-master", "/zip/"+composerCommitB, sha1Hex("commit B"), map[string]string{
+		"/zip/" + composerCommitA: "commit A",
+		"/zip/" + composerCommitB: "commit B",
+	})
+
+	for i, commit := range []string{composerCommitA, composerCommitB, composerCommitA, composerCommitB} {
+		want := map[string]string{composerCommitA: "commit A", composerCommitB: "commit B"}[commit]
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/files/v/p/dev-master/"+commit+".zip", nil))
+		if w.Code != http.StatusOK || w.Body.String() != want {
+			t.Errorf("request %d for %s: status %d, body %q; want 200 %q", i+1, commit[:4], w.Code, w.Body.String(), want)
+		}
+	}
+	for _, commit := range []string{composerCommitA, composerCommitB} {
+		if n := fetched("/zip/" + commit); n != 1 {
+			t.Errorf("commit %s fetched from upstream %d times, want once and then served from the cache", commit[:4], n)
+		}
+		if !isComposerArchiveCached(t, proxy, "dev-master", commit+".zip") {
+			t.Errorf("commit %s is no longer cached", commit[:4])
+		}
+	}
 }
