@@ -27,7 +27,7 @@ func seedCachedArtifact(t *testing.T, proxy *Proxy, store *mockStorage, content 
 		t.Fatalf("seeding storage: %v", err)
 	}
 	artifact := testArtifact(content, staleVersionPURL, staleFilename, "application/gzip")
-	if err := proxy.updateCacheDB("npm", "pkg", stalePkgPURL, staleURL, staleStoragePath, artifact); err != nil {
+	if err := proxy.updateCacheDB("npm", "pkg", stalePkgPURL, staleURL, staleStoragePath, artifact, ""); err != nil {
 		t.Fatalf("seeding cache record: %v", err)
 	}
 }
@@ -142,7 +142,7 @@ func TestLateLeaderKeepsRefreshedEntry(t *testing.T) {
 	upstream := sha256Hex("new bytes")
 
 	res, err := proxy.coalescedFetchFromURL(context.Background(),
-		"npm", "pkg", "1.0.0", staleFilename, stalePkgPURL, staleVersionPURL, staleURL, nil, upstream)
+		"npm", "pkg", "1.0.0", staleFilename, stalePkgPURL, staleVersionPURL, staleURL, nil, upstream, "")
 	if err != nil {
 		t.Fatalf("late leader failed: %v", err)
 	}

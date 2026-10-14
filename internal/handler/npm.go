@@ -864,6 +864,7 @@ func (h *NPMHandler) getTarball(r *http.Request, registryURL, packageName, versi
 		return cached, err
 	}
 	downloadURL := fmt.Sprintf("%s/%s/-/%s", registryURL, escapeNPMDownloadPackage(packageName), url.PathEscape(filename))
+	var sri string
 	body, err := metadata()
 	if err == nil {
 		if tarball := npmVersionTarball(body, version); tarball != "" {
@@ -872,8 +873,23 @@ func (h *NPMHandler) getTarball(r *http.Request, registryURL, packageName, versi
 				return nil, err
 			}
 		}
+		sri = npmVersionIntegrity(body, version)
 	}
-	return h.proxy.GetOrFetchArtifactFromURL(r.Context(), "npm", packageName, version, cacheFilename, downloadURL)
+	return h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "npm", packageName, version, cacheFilename, downloadURL, sri)
+}
+
+// npmVersionIntegrity returns versions[version].dist.integrity from a
+// packument when it is a Subresource Integrity string the proxy can verify,
+// or "" otherwise, in which case the tarball is fetched unverified as before.
+func npmVersionIntegrity(body []byte, version string) string {
+	sri, _, _ := lookupJSONString(body, "versions", version, "dist", "integrity")
+	if sri == "" {
+		return ""
+	}
+	if _, err := newIntegrityChecks("", sri); err != nil {
+		return ""
+	}
+	return sri
 }
 
 // npmVersionTarball returns versions[version].dist.tarball from a packument,
