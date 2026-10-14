@@ -347,6 +347,30 @@ func TestBrowseFileFirstDuplicateWins(t *testing.T) {
 	}
 }
 
+// TestBrowseFileEscapedPath requests files the way the source browser does,
+// with each path segment percent-encoded, so names holding URL syntax resolve.
+func TestBrowseFileEscapedPath(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.close()
+	names := []string{"src/a#b.txt", "src/what?.txt", "src/100%.txt", "dir with space/c.txt"}
+	entries := make([]archiveEntry, len(names))
+	for i, name := range names {
+		entries[i] = archiveEntry{name: "package/" + name, body: name}
+	}
+	cacheBrowseArtifact(t, ts, "npm", "escaped", "escaped-1.0.0.tgz", buildTarGz(t, entries))
+
+	for _, name := range names {
+		segments := strings.Split(name, "/")
+		for i, seg := range segments {
+			segments[i] = url.PathEscape(seg)
+		}
+		w := browseGet(ts, browseFileURL("npm", "escaped", strings.Join(segments, "/")))
+		if w.Code != http.StatusOK || w.Body.String() != name {
+			t.Errorf("file %q: got %d %q, want 200 %q", name, w.Code, w.Body.String(), name)
+		}
+	}
+}
+
 func TestBrowseLimits(t *testing.T) {
 	entries := []archiveEntry{
 		{name: "package/a.txt", body: strings.Repeat("a", 100)},

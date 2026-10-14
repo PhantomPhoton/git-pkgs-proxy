@@ -140,7 +140,8 @@ function renderFileTree(files, basePath) {
 // Load and display file content
 async function loadFile(path) {
     try {
-        const url = `/ui/api/browse/${ecosystem}/${packageName}/${versionPath}/file/${path}`;
+        const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+        const url = `/ui/api/browse/${ecosystem}/${packageName}/${versionPath}/file/${encodedPath}`;
         const response = await fetch(url);
         if (!response.ok) throw new Error('Failed to load file');
 
