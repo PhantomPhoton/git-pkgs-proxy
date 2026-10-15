@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/git-pkgs/integrity"
 	"github.com/git-pkgs/proxy/internal/retention"
 )
 
@@ -878,18 +879,21 @@ func (h *NPMHandler) getTarball(r *http.Request, registryURL, packageName, versi
 	return h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "npm", packageName, version, cacheFilename, downloadURL, sri)
 }
 
-// npmVersionIntegrity returns versions[version].dist.integrity from a
-// packument when it is a Subresource Integrity string the proxy can verify,
-// or "" otherwise, in which case the tarball is fetched unverified as before.
+// npmVersionIntegrity returns the integrity a packument declares for a
+// version's tarball: dist.integrity when it is a Subresource Integrity string
+// the proxy can verify, or else the SHA-1 in dist.shasum, which is all
+// versions published before integrity existed carry, as "sha1-<hex>". It
+// returns "" when neither is usable, and the tarball is fetched unverified as
+// before.
 func npmVersionIntegrity(body []byte, version string) string {
 	sri, _, _ := lookupJSONString(body, "versions", version, "dist", "integrity")
-	if sri == "" {
-		return ""
+	if sri != "" {
+		if _, err := integrity.ParseSRI(sri); err == nil {
+			return sri
+		}
 	}
-	if _, err := newIntegrityChecks("", sri); err != nil {
-		return ""
-	}
-	return sri
+	shasum, _, _ := lookupJSONString(body, "versions", version, "dist", "shasum")
+	return sha1Checksum(shasum)
 }
 
 // npmVersionTarball returns versions[version].dist.tarball from a packument,

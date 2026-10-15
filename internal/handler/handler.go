@@ -1808,10 +1808,11 @@ func (p *Proxy) GetOrFetchArtifactFromURLWithDigest(ctx context.Context, ecosyst
 }
 
 // GetOrFetchArtifactFromURLWithIntegrity retrieves an artifact and verifies a
-// newly fetched response against declared, the Subresource Integrity string
-// the registry's metadata declares, before serving or caching it. declared is
-// recorded with the cached version, so cache hits are verified against it as
-// well. An empty declared fetches without verification.
+// newly fetched response against declared, the integrity the registry's
+// metadata declares, before serving or caching it: a Subresource Integrity
+// string, or a single algorithm-prefixed hex checksum such as "sha1-<hex>".
+// declared is recorded with the cached version, so cache hits are verified
+// against it as well. An empty declared fetches without verification.
 func (p *Proxy) GetOrFetchArtifactFromURLWithIntegrity(ctx context.Context, ecosystem, name, version, filename, downloadURL, declared string) (*CacheResult, error) {
 	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, "", declared)
 }

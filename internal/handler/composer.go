@@ -711,7 +711,8 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	if commit := strings.TrimSuffix(filename, path.Ext(filename)); isDevVersion(version) && composerCommitPattern.MatchString(commit) {
 		h.discardOtherCommit(packageName, version, cacheFilename, commit)
 	}
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "composer", packageName, version, cacheFilename, downloadURL)
+	result, err := h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "composer", packageName, version, cacheFilename, downloadURL,
+		composerIntegrity(dist.shasum, version, downloadURL == listedURL))
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return
@@ -776,10 +777,11 @@ func (h *ComposerHandler) metadataURLsForVersion(vendor, pkg, version string) []
 }
 
 // composerDist is what a version's metadata says about its archive: the dist
-// URL and type, and the raw publish time the cooldown is checked against.
+// URL, type and shasum, and the raw publish time the cooldown is checked
+// against.
 type composerDist struct {
-	url, distType string
-	published     []byte
+	url, distType, shasum string
+	published             []byte
 }
 
 // findDownloadURLFromMetadata fetches a metadata document and returns the dist
@@ -862,6 +864,7 @@ func composerDistURL(body []byte, packageName, version string) (composerDist, er
 		dist.url, _, _ = lookupJSONString(distRaw, "url")
 		if dist.url != "" {
 			dist.distType, _, _ = lookupJSONString(distRaw, "type")
+			dist.shasum, _, _ = lookupJSONString(distRaw, "shasum")
 			dist.published = fields.get("time")
 			return errStopScan
 		}
@@ -871,6 +874,22 @@ func composerDistURL(body []byte, packageName, version string) (composerDist, er
 		err = nil
 	}
 	return dist, err
+}
+
+// composerIntegrity returns the integrity to verify an archive of version
+// against: the SHA-1 its dist lists as shasum. A dev branch is left
+// unverified: its listed shasum describes only the current head, while every
+// commit of the branch is cached under the same version, which holds a single
+// recorded integrity, so a cache hit for an older pinned commit would be
+// checked against the head's shasum. Composer checks dist.shasum itself
+// anyway. A shasum also only describes the listed archive, and Packagist
+// lists none for GitHub archives; an unusable one is ignored. Those archives
+// are served unverified as before.
+func composerIntegrity(shasum, version string, listed bool) string {
+	if !listed || isDevVersion(version) {
+		return ""
+	}
+	return sha1Checksum(shasum)
 }
 
 // proxyUpstream forwards a request to packagist.org without caching.
