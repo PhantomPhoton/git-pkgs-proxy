@@ -481,17 +481,17 @@ func TestRewriteCacheETag(t *testing.T) {
 	exclaim := func(b []byte) ([]byte, error) { return []byte(string(b) + "!"), nil }
 	key := rewriteCacheKey("npm", "http://proxy", "demo", []byte("doc"))
 
-	out, etag, err := c.rewrite(t.Context(), key, []byte("doc"), exclaim)
-	if err != nil || string(out) != "doc!" {
-		t.Fatalf("rewrite = %q, %v", out, err)
+	m, err := c.rewrite(t.Context(), key, []byte("doc"), exclaim)
+	if err != nil || string(m.body) != "doc!" {
+		t.Fatalf("rewrite = %q, %v", m.body, err)
 	}
-	if want := metadataETag([]byte("doc!")); etag.etag != want {
-		t.Errorf("rewrite ETag = %q, want %q", etag.etag, want)
+	if want := metadataETag([]byte("doc!")); m.etag != want {
+		t.Errorf("rewrite ETag = %q, want %q", m.etag, want)
 	}
-	if _, cached, ok := c.get(key); !ok || cached != etag {
-		t.Errorf("get validators = %+v, %v; want %+v", cached, ok, etag)
+	if cached, ok := c.get(key); !ok || cached.metadataValidators != m.metadataValidators {
+		t.Errorf("get validators = %+v, %v; want %+v", cached.metadataValidators, ok, m.metadataValidators)
 	}
-	if metadataETag([]byte("other")) == etag.etag {
+	if metadataETag([]byte("other")) == m.etag {
 		t.Error("different output has the same ETag")
 	}
 }

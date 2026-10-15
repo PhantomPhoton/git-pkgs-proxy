@@ -966,6 +966,8 @@ Or via environment variable: `PROXY_ARTIFACT_MAX_SIZE=2GB`.
 
 The npm and Composer handlers rewrite every metadata document they serve, so that download URLs point at the proxy. That means decoding the whole document and encoding it again, and Composer's minified documents are also expanded, which together cost milliseconds per typical package and far more for very large ones. The proxy keeps rewritten documents in memory, so each distinct upstream document is rewritten once and requests arriving while it is being rewritten wait for that rewrite. New bytes from upstream are rewritten again. With version cooldown enabled the cache is bypassed, because cooldown filtering depends on the current time.
 
+Each cached document is also kept gzip-compressed, when that makes it smaller, and served with `Content-Encoding: gzip` to clients that accept it. A large packument is compressed once rather than on every request, by the proxy or by a reverse proxy in front of it. The compressed copy counts against the cache size and typically adds about an eighth to each entry. Documents rewritten outside the cache are served uncompressed.
+
 ```yaml
 metadata_rewrite_cache_size: "256MB"   # default; "0" rewrites on every request
 ```
