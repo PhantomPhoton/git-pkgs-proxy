@@ -758,8 +758,8 @@ func TestMavenHandler_MetadataProxied(t *testing.T) {
 
 	paths := []string{
 		"/com/google/guava/guava/maven-metadata.xml",
-		"/com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.jar.sha1",
-		"/com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.jar.md5",
+		"/com/google/guava/guava/maven-metadata.xml.sha1",
+		"/com/google/guava/guava/1.0-SNAPSHOT/maven-metadata.xml",
 	}
 
 	for _, path := range paths {
@@ -826,6 +826,47 @@ func TestMavenHandler_ArtifactExtensions(t *testing.T) {
 
 		srv.Close()
 		upstream.Close()
+	}
+}
+
+func TestMavenHandler_ChecksumsCachedAsArtifacts(t *testing.T) {
+	proxy, _, _, fetcher := setupTestProxy(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("checksum %s proxied as metadata", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	h := NewMavenHandler(proxy, "http://localhost", "", "")
+	h.upstreamURL = upstream.URL
+	proxy.HTTPClient = upstream.Client()
+
+	srv := httptest.NewServer(h.Routes())
+	defer srv.Close()
+
+	for _, name := range []string{"lib-1.0.jar.sha1", "lib-1.0.pom.md5", "lib-1.0.jar.asc", "lib-1.0-bin.tar.gz.sha512"} {
+		path := "/com/example/lib/1.0/" + name
+		for i := range 2 {
+			fetcher.artifact = &fetch.Artifact{
+				Body:        io.NopCloser(strings.NewReader("checksum")),
+				ContentType: "text/plain",
+			}
+			fetcher.fetchCalled = false
+
+			resp, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", path, err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK || string(body) != "checksum" {
+				t.Errorf("GET %s: status %d body %q", path, resp.StatusCode, body)
+			}
+			if fetcher.fetchCalled != (i == 0) {
+				t.Errorf("GET %s request %d: fetched = %v, want %v", path, i+1, fetcher.fetchCalled, i == 0)
+			}
+		}
 	}
 }
 
@@ -929,10 +970,8 @@ func TestMavenHandler_GradlePluginMarkerFallbackAndCache(t *testing.T) {
 
 func TestMavenHandler_GradlePluginMarkerMetadataFallback(t *testing.T) {
 	paths := map[string]string{
-		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/8.4.0/com.diffplug.spotless.gradle.plugin-8.4.0.pom.sha1":   "sha1",
-		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/8.4.0/com.diffplug.spotless.gradle.plugin-8.4.0.pom.sha256": "sha256",
-		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/8.4.0/com.diffplug.spotless.gradle.plugin-8.4.0.pom.md5":    "md5",
-		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/maven-metadata.xml":                                         "<metadata/>",
+		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/maven-metadata.xml":      "<metadata/>",
+		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/maven-metadata.xml.sha1": "sha1",
 	}
 
 	primaryHits := map[string]int{}
@@ -990,63 +1029,40 @@ func TestMavenHandler_GradlePluginMarkerMetadataFallback(t *testing.T) {
 	}
 }
 
-func TestMavenHandler_GradlePluginImplementationMetadataFallback(t *testing.T) {
-	paths := map[string]string{
-		"/com/diffplug/spotless/spotless-plugin-gradle/8.4.0/spotless-plugin-gradle-8.4.0.jar.sha1":   "impl-sha1",
-		"/com/diffplug/spotless/spotless-plugin-gradle/8.4.0/spotless-plugin-gradle-8.4.0.jar.sha256": "impl-sha256",
+func TestMavenHandler_GradlePluginChecksumFallbackToPluginPortal(t *testing.T) {
+	primaryUpstream := "https://repo1.maven.org/maven2"
+	pluginPortalUpstream := "https://plugins.gradle.org/m2"
+	paths := []string{
+		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/8.4.0/com.diffplug.spotless.gradle.plugin-8.4.0.pom.sha1",
+		"/com/diffplug/spotless/com.diffplug.spotless.gradle.plugin/8.4.0/com.diffplug.spotless.gradle.plugin-8.4.0.pom.md5",
+		"/com/diffplug/spotless/spotless-plugin-gradle/8.4.0/spotless-plugin-gradle-8.4.0.jar.sha1",
+		"/com/diffplug/spotless/spotless-plugin-gradle/8.4.0/spotless-plugin-gradle-8.4.0.jar.sha256",
 	}
 
-	primaryHits := map[string]int{}
-	pluginHits := map[string]int{}
-
-	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		primaryHits[r.URL.Path]++
-		if _, ok := paths[r.URL.Path]; ok {
-			http.NotFound(w, r)
-			return
+	for _, reqPath := range paths {
+		proxy, _, _, fetcher := setupTestProxy(t)
+		fetcher.fetchErrByURL = map[string]error{primaryUpstream + reqPath: ErrUpstreamNotFound}
+		fetcher.artifact = &fetch.Artifact{
+			Body:        io.NopCloser(strings.NewReader("checksum")),
+			ContentType: "text/plain",
 		}
-		t.Fatalf("unexpected path to primary upstream: %s", r.URL.Path)
-	}))
-	defer primary.Close()
 
-	pluginPortal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pluginHits[r.URL.Path]++
-		body, ok := paths[r.URL.Path]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = io.WriteString(w, body)
-	}))
-	defer pluginPortal.Close()
+		h := NewMavenHandler(proxy, "http://localhost", primaryUpstream, pluginPortalUpstream)
+		srv := httptest.NewServer(h.Routes())
 
-	proxy, _, _, _ := setupTestProxy(t)
-	proxy.HTTPClient = primary.Client()
-
-	h := NewMavenHandler(proxy, "http://localhost", primary.URL, pluginPortal.URL)
-	srv := httptest.NewServer(h.Routes())
-	defer srv.Close()
-
-	for reqPath, wantBody := range paths {
 		resp, err := http.Get(srv.URL + reqPath)
 		if err != nil {
 			t.Fatalf("GET %s failed: %v", reqPath, err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		srv.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("GET %s: status = %d, want %d", reqPath, resp.StatusCode, http.StatusOK)
+		if resp.StatusCode != http.StatusOK || string(body) != "checksum" {
+			t.Fatalf("GET %s: status %d body %q", reqPath, resp.StatusCode, body)
 		}
-		if string(body) != wantBody {
-			t.Fatalf("GET %s: body = %q, want %q", reqPath, body, wantBody)
-		}
-
-		if primaryHits[reqPath] == 0 {
-			t.Fatalf("GET %s did not hit primary upstream", reqPath)
-		}
-		if pluginHits[reqPath] == 0 {
-			t.Fatalf("GET %s did not hit plugin portal fallback", reqPath)
+		if want := pluginPortalUpstream + reqPath; fetcher.fetchedURL != want {
+			t.Fatalf("GET %s: fetched URL = %q, want %q", reqPath, fetcher.fetchedURL, want)
 		}
 	}
 }

@@ -79,21 +79,19 @@ func (h *MavenHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is an artifact file or metadata
 	filename := path.Base(urlPath)
 
-	if h.isMetadataFile(filename) {
+	if h.isVersionListingFile(filename) {
 		h.handleMetadata(w, r, urlPath)
 		return
 	}
 
-	if h.isArtifactFile(filename) {
-		// Cache artifact files
+	if h.isArtifactFile(filename) || h.isChecksumFile(filename) {
 		h.handleDownload(w, r, urlPath)
 		return
 	}
 
-	// Proxy everything else (directory listings, checksums, etc.)
+	// Proxy everything else (directory listings etc.)
 	h.proxyUpstream(w, r)
 }
 
@@ -192,14 +190,23 @@ func (h *MavenHandler) isArtifactFile(filename string) bool {
 	return false
 }
 
-// isMetadataFile returns true if the filename is Maven metadata.
-func (h *MavenHandler) isMetadataFile(filename string) bool {
-	return filename == "maven-metadata.xml" ||
-		strings.HasSuffix(filename, ".sha1") ||
-		strings.HasSuffix(filename, ".sha256") ||
-		strings.HasSuffix(filename, ".sha512") ||
-		strings.HasSuffix(filename, ".md5") ||
-		strings.HasSuffix(filename, ".asc")
+// isVersionListingFile matches maven-metadata.xml and its checksums. The
+// listing changes with every release, so it is cached for the metadata TTL
+// rather than kept like an artifact.
+func (h *MavenHandler) isVersionListingFile(filename string) bool {
+	return strings.HasPrefix(filename, "maven-metadata.xml")
+}
+
+// isChecksumFile matches the checksum and signature files published beside
+// an artifact. They are as immutable as the artifact, so they are cached
+// with it rather than refetched on every request.
+func (h *MavenHandler) isChecksumFile(filename string) bool {
+	for _, ext := range []string{".sha1", ".sha256", ".sha512", ".md5", ".asc"} {
+		if strings.HasSuffix(filename, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // proxyUpstream forwards a request to Maven Central without caching.
