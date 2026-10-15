@@ -36,6 +36,12 @@ func TestServerKeepsFetchAfterClientHangsUp(t *testing.T) {
 	}
 }
 
+// slowRunnerBudget bounds the steps that only need to finish eventually: the
+// upstream fetch starting, and the follow-up request being answered. What the
+// test checks is the outcome, not the speed, and on a slow CI runner a
+// shorter budget made it fail with nothing wrong.
+const slowRunnerBudget = 30 * time.Second
+
 func testServerKeepsFetchAfterClientHangsUp(t *testing.T) {
 	const pkgPath = "/core/os/x86_64/big-1.0-1-x86_64.pkg.tar.zst"
 	release := make(chan struct{})
@@ -93,7 +99,7 @@ func testServerKeepsFetchAfterClientHangsUp(t *testing.T) {
 
 	// The client gives up while the upstream is still sending nothing.
 	impatient := &http.Client{Timeout: 300 * time.Millisecond}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(slowRunnerBudget)
 	for hits.Load() == 0 {
 		if _, err := impatient.Get(target); err == nil {
 			t.Fatal("request succeeded while the upstream was held")
@@ -106,7 +112,7 @@ func testServerKeepsFetchAfterClientHangsUp(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	releaseOnce.Do(func() { close(release) })
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: slowRunnerBudget}
 	resp, err := client.Get(target)
 	if err != nil {
 		t.Fatalf("follow-up request: %v", err)

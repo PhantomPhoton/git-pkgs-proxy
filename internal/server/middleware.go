@@ -139,3 +139,19 @@ func rejectQueryInPath(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// sandboxUpstreamContent keeps package-route responses from running as pages
+// on the proxy's origin, which also serves /ui. Their bodies, and usually
+// their Content-Type, come from upstreams or from whoever pushed a hosted
+// package, so an artifact served as text/html or image/svg+xml could otherwise
+// run scripts with access to the UI. nosniff stops browsers from guessing a
+// renderable type, and a sandbox policy runs anything that does render with
+// scripts disabled and an opaque origin. Package managers ignore both
+// headers. Archive files browsed from /ui get the same headers in browse.go.
+func sandboxUpstreamContent(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "sandbox")
+		next.ServeHTTP(w, r)
+	})
+}
