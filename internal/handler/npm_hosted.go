@@ -105,6 +105,9 @@ func (h *NPMHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.Reque
 	case errors.Is(upstream.err, ErrUpstreamNotFound):
 		out, err = localNPMPackument(packageName, local)
 	case upstream.err != nil:
+		if writeUpstreamHeld(w, upstream.err) {
+			return
+		}
 		h.proxy.Logger.Error("failed to fetch npm metadata", "error", upstream.err)
 		JSONError(w, http.StatusBadGateway, "failed to fetch from upstream")
 		return

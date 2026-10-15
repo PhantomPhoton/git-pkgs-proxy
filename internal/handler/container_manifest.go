@@ -150,6 +150,9 @@ func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *h
 		h.containerError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", "manifest unknown")
 		return
 	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
 	h.proxy.Logger.Error("failed to fetch manifest", "error", err)
 	h.containerError(w, http.StatusBadGateway, "INTERNAL_ERROR", "failed to fetch from upstream")
 }

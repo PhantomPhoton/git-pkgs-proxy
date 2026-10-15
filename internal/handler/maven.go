@@ -113,6 +113,9 @@ func (h *MavenHandler) handleMetadata(w http.ResponseWriter, r *http.Request, ur
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("metadata fetch failed", "error", err)
 		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 		return

@@ -117,6 +117,9 @@ func (h *ContainerHandler) serveStaleTagsOrError(w http.ResponseWriter, r *http.
 		h.writeContainerTags(w, r, registryURL, cached, true)
 		return
 	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
 	h.proxy.Logger.Error("failed to fetch container tag list", "error", err)
 	h.containerError(w, http.StatusBadGateway, "INTERNAL_ERROR", "failed to fetch from upstream")
 }

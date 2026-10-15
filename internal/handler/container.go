@@ -450,6 +450,9 @@ func (h *ContainerHandler) handleBlobDownload(w http.ResponseWriter, r *http.Req
 			h.containerError(w, http.StatusBadGateway, "DIGEST_INVALID", "blob digest verification failed")
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("failed to fetch blob", "error", err)
 		h.containerError(w, http.StatusBadGateway, "INTERNAL_ERROR", "failed to fetch blob")
 		return
@@ -520,6 +523,9 @@ func (h *ContainerHandler) proxyBlobHead(w http.ResponseWriter, r *http.Request,
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.containerError(w, http.StatusBadGateway, "INTERNAL_ERROR", "failed to fetch from upstream")
 		return
 	}

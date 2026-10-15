@@ -439,6 +439,9 @@ func (h *SwiftHandler) proxySwiftResource(w http.ResponseWriter, r *http.Request
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		writeSwiftProblem(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
@@ -613,6 +616,9 @@ func (h *SwiftHandler) writeMetadataError(w http.ResponseWriter, err error) {
 		writeSwiftProblem(w, http.StatusNotFound, "not found")
 		return
 	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
 	h.proxy.Logger.Error("Swift metadata request failed", "error", err)
 	writeSwiftProblem(w, http.StatusBadGateway, "upstream request failed")
 }
@@ -620,6 +626,9 @@ func (h *SwiftHandler) writeMetadataError(w http.ResponseWriter, err error) {
 func (h *SwiftHandler) writeArtifactError(w http.ResponseWriter, err error) {
 	if errors.Is(err, ErrUpstreamNotFound) {
 		writeSwiftProblem(w, http.StatusNotFound, "release not found")
+		return
+	}
+	if writeUpstreamHeld(w, err) {
 		return
 	}
 	h.proxy.Logger.Error("Swift archive request failed", "error", err)

@@ -477,6 +477,9 @@ func (h *ArchHandler) writeMetadata(w http.ResponseWriter, r *http.Request, cach
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		if writeUpstreamHeld(w, res.err) {
+			return
+		}
 		h.proxy.Logger.Error("metadata fetch failed", "error", res.err)
 		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 		return

@@ -20,6 +20,7 @@ import (
 	"github.com/git-pkgs/cooldown"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
+	"github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"github.com/git-pkgs/proxy/internal/packageurl"
 	"github.com/git-pkgs/proxy/internal/scanner"
@@ -174,6 +175,10 @@ type Proxy struct {
 	// storage at an internal one.
 	DirectServeBaseURL string
 	HTTPClient         *http.Client
+
+	// RateLimits is the gate under the upstream clients. Artifact fetches
+	// check it before calling Fetcher, so held hosts never reach its breaker.
+	RateLimits *httpclient.RateLimitGate
 
 	// HostedNPMScopes and HostedComposerVendors name namespaces served from
 	// pushed packages alone, without asking the upstream.
@@ -510,6 +515,9 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 		}
 	}
 
+	if err := p.RateLimits.Held(info.URL); err != nil {
+		return artifacts.Artifact{}, "", err
+	}
 	p.Logger.Info("fetching from upstream",
 		"ecosystem", ecosystem, "name", name, "version", version, "url", info.URL)
 
@@ -1121,6 +1129,9 @@ func (p *Proxy) ProxyUpstream(w http.ResponseWriter, r *http.Request, upstreamUR
 
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		p.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
@@ -1140,6 +1151,9 @@ func (p *Proxy) ProxyFile(w http.ResponseWriter, r *http.Request, upstreamURL st
 
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 		return
 	}
@@ -1205,6 +1219,9 @@ func (p *Proxy) serveArtifactError(w http.ResponseWriter, err error, clientMsg s
 	if errors.Is(err, ErrHostedArtifactUnavailable) {
 		p.Logger.Error("failed to read pushed artifact", "error", err)
 		http.Error(w, "pushed package is temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if writeUpstreamHeld(w, err) {
 		return
 	}
 	p.Logger.Error("failed to get artifact", "error", err)
@@ -1684,6 +1701,9 @@ func (p *Proxy) proxyCachedWithEncoding(w http.ResponseWriter, r *http.Request, 
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		p.Logger.Error("metadata fetch failed", "error", err)
 		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 		return
@@ -1770,6 +1790,9 @@ func (p *Proxy) proxyMetadataStream(w http.ResponseWriter, r *http.Request, upst
 
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 		return
 	}
@@ -1903,6 +1926,9 @@ func (p *Proxy) discardStaleArtifact(pkgPURL, versionPURL, filename, upstreamHas
 }
 
 func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (artifacts.Artifact, string, error) {
+	if err := p.RateLimits.Held(downloadURL); err != nil {
+		return artifacts.Artifact{}, "", err
+	}
 	p.Logger.Info("fetching from upstream",
 		"ecosystem", ecosystem, "name", name, "version", version, "url", downloadURL)
 
@@ -1930,6 +1956,9 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 // after the bytes have been sent, and an unterminated chunked response is the
 // only way left to make the client reject them (see serveArtifact).
 func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, error)) (*CacheResult, error) {
+	if err := p.RateLimits.Held(upstreamURL); err != nil {
+		return nil, err
+	}
 	p.Logger.Info("streaming from upstream",
 		"ecosystem", ecosystem, "name", name, "version", version, "url", upstreamURL)
 

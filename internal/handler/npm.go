@@ -164,6 +164,9 @@ func (h *NPMHandler) handleSecurity(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("npm audit request failed", "path", r.URL.Path, "error", err)
 		JSONError(w, http.StatusBadGateway, "failed to reach upstream registry")
 		return
@@ -241,6 +244,9 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 			}
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("failed to fetch npm metadata", "error", err)
 		JSONError(w, http.StatusBadGateway, "failed to fetch from upstream")
 		return
@@ -284,6 +290,9 @@ func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *
 	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
+			return
+		}
+		if writeUpstreamHeld(w, err) {
 			return
 		}
 		h.proxy.Logger.Error("failed to fetch npm metadata", "error", err)
@@ -850,6 +859,9 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrArtifactBlocked), errors.Is(err, ErrVersionDenied):
 			JSONError(w, http.StatusForbidden, err.Error())
 		default:
+			if writeUpstreamHeld(w, err) {
+				return
+			}
 			h.proxy.Logger.Error("failed to get artifact", "error", err)
 			JSONError(w, http.StatusBadGateway, "failed to fetch package")
 		}

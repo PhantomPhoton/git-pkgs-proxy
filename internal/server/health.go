@@ -38,6 +38,22 @@ type HealthResponse struct {
 	// the upstream, but says nothing about this proxy's own health, so it does
 	// not change Status.
 	CircuitBreakers map[string]string `json:"circuit_breakers,omitempty"`
+	// UpstreamHolds lists upstream hosts that rate limited the proxy and
+	// the RFC 3339 time until which it sends them nothing. A held host
+	// fails cache misses without contacting it and does not change Status.
+	UpstreamHolds map[string]string `json:"upstream_holds,omitempty"`
+}
+
+// formatHolds renders hold deadlines for the health report; nil when none.
+func formatHolds(holds map[string]time.Time) map[string]string {
+	if len(holds) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(holds))
+	for host, until := range holds {
+		out[host] = until.UTC().Format(time.RFC3339)
+	}
+	return out
 }
 
 // HealthCheck reports the status of a single subsystem check.

@@ -111,6 +111,9 @@ func (h *PubHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
