@@ -7,7 +7,7 @@ require (
 	github.com/CycloneDX/cyclonedx-go v0.12.0
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.7
-	github.com/aws/aws-sdk-go-v2/service/ecr v1.66.1
+	github.com/aws/aws-sdk-go-v2/service/ecr v1.66.2
 	github.com/git-pkgs/archives v0.8.1
 	github.com/git-pkgs/artifacts v0.2.1
 	github.com/git-pkgs/cooldown v0.2.0
