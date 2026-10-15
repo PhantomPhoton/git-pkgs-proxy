@@ -85,6 +85,9 @@ func (h *ComposerHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.
 	case errors.Is(upstream.err, ErrUpstreamNotFound):
 		out, err = localComposerDocument(packageName, local)
 	case upstream.err != nil:
+		if writeUpstreamHeld(w, upstream.err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", upstream.err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return

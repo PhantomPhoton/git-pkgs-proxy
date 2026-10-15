@@ -96,6 +96,9 @@ func (h *NuGetHandler) handleServiceIndex(w http.ResponseWriter, r *http.Request
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
@@ -234,6 +237,9 @@ func (h *NuGetHandler) proxyUpstream(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return

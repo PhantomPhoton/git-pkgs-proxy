@@ -175,6 +175,9 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
@@ -652,6 +655,9 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	for _, metaURL := range metaURLs {
 		found, err := h.findDownloadURLFromMetadata(r.Context(), metaURL, packageName, version)
 		if err != nil {
+			if writeUpstreamHeld(w, err) {
+				return
+			}
 			h.proxy.Logger.Error("failed to fetch metadata", "error", err, "url", metaURL)
 			http.Error(w, "failed to fetch metadata", http.StatusBadGateway)
 			return
@@ -890,6 +896,9 @@ func (h *ComposerHandler) proxyUpstream(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return

@@ -109,6 +109,56 @@ func TestRateLimitGate_ReleasesWhenHoldExpiresAndUpstreamServes(t *testing.T) {
 	}
 }
 
+func TestRateLimitGate_LateSuccessKeepsHold(t *testing.T) {
+	h := newGateHarness()
+	// The slow request is in flight when the limited one starts the hold,
+	// and its 200 arrives afterwards.
+	h.respond = func(req *http.Request) (int, string) {
+		if req.URL.Path == "/limited" {
+			return http.StatusTooManyRequests, "120"
+		}
+		_, _ = h.get(t, "https://repo1.maven.org/limited")
+		return http.StatusOK, ""
+	}
+
+	resp, err := h.get(t, "https://repo1.maven.org/slow")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("slow request: resp=%v err=%v, want its 200", resp, err)
+	}
+	if until, ok := h.gate.Holds()["repo1.maven.org"]; !ok || !until.Equal(h.now.Add(120*time.Second)) {
+		t.Fatalf("Holds() = %v after a late 200, want repo1.maven.org until now+120s", h.gate.Holds())
+	}
+	if _, err := h.get(t, "https://repo1.maven.org/x"); !errors.Is(err, ErrUpstreamHeld) {
+		t.Errorf("next request err = %v, want held", err)
+	}
+}
+
+func TestRateLimitGate_Held(t *testing.T) {
+	var nilGate *RateLimitGate
+	if err := nilGate.Held("https://repo1.maven.org/x"); err != nil {
+		t.Errorf("nil gate Held() = %v, want nil", err)
+	}
+
+	h := newGateHarness()
+	if err := h.gate.Held("https://repo1.maven.org/x"); err != nil {
+		t.Errorf("before any limit: Held() = %v, want nil", err)
+	}
+	h.respond = func(*http.Request) (int, string) { return http.StatusTooManyRequests, "45" }
+	_, _ = h.get(t, "https://repo1.maven.org/x")
+
+	var held *HeldError
+	if err := h.gate.Held("https://REPO1.maven.org/a/b.jar"); !errors.As(err, &held) || held.RetryAfter != 45*time.Second {
+		t.Errorf("Held() = %v, want *HeldError for 45s", err)
+	}
+	if err := h.gate.Held("https://plugins.gradle.org/m2/x.pom"); err != nil {
+		t.Errorf("other host: Held() = %v, want nil", err)
+	}
+	h.now = h.now.Add(45 * time.Second)
+	if err := h.gate.Held("https://repo1.maven.org/x"); err != nil {
+		t.Errorf("after the hold: Held() = %v, want nil", err)
+	}
+}
+
 func TestRateLimitGate_DefaultHoldDoublesWithoutHeader(t *testing.T) {
 	h := newGateHarness()
 	h.respond = func(*http.Request) (int, string) { return http.StatusTooManyRequests, "" }
@@ -172,13 +222,13 @@ func TestRateLimitGate_ReportsHoldsAndNilSafe(t *testing.T) {
 
 	h := newGateHarness()
 	var reported []string
-	h.gate.OnHold = func(host string, retryAfter time.Duration) {
-		reported = append(reported, host+"="+retryAfter.String())
+	h.gate.OnHold = func(host string) {
+		reported = append(reported, host)
 	}
 	h.respond = func(*http.Request) (int, string) { return http.StatusTooManyRequests, "10" }
 	_, _ = h.get(t, "https://repo1.maven.org/x")
-	if len(reported) != 1 || reported[0] != "repo1.maven.org=10s" {
-		t.Errorf("OnHold reported %v, want [repo1.maven.org=10s]", reported)
+	if len(reported) != 1 || reported[0] != "repo1.maven.org" {
+		t.Errorf("OnHold reported %v, want [repo1.maven.org]", reported)
 	}
 }
 

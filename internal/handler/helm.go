@@ -186,6 +186,9 @@ func (h *HelmHandler) serveIndexError(w http.ResponseWriter, err error) {
 		http.Error(w, "Helm repository not found", http.StatusNotFound)
 		return
 	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
 	h.proxy.Logger.Error("failed to fetch Helm index", "error", err)
 	http.Error(w, "failed to fetch Helm repository index", http.StatusBadGateway)
 }

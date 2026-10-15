@@ -49,12 +49,12 @@ type hostHold struct {
 // with a *HeldError instead. Clients and fetchers above it see an error
 // rather than a slow upstream, so they fall back to cache or fail fast
 // without adding to the traffic the upstream is already refusing. The first
-// non-limited response from the host releases it.
+// non-limited response after the hold ends releases it.
 type RateLimitGate struct {
 	base   http.RoundTripper
 	Logger *slog.Logger
-	// OnHold is called with the host and hold length each time a hold starts.
-	OnHold func(host string, retryAfter time.Duration)
+	// OnHold is called with the host each time a hold starts.
+	OnHold func(host string)
 	now    func() time.Time
 
 	mu    sync.Mutex
@@ -77,8 +77,7 @@ func NewRateLimitGate(base http.RoundTripper) *RateLimitGate {
 func (g *RateLimitGate) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := hostKey(req.URL)
 	if until, held := g.heldUntil(host); held {
-		now := g.now()
-		return nil, &HeldError{Host: host, Until: until, RetryAfter: until.Sub(now)}
+		return nil, &HeldError{Host: host, Until: until, RetryAfter: until.Sub(g.now())}
 	}
 
 	resp, err := g.base.RoundTrip(req)
@@ -95,6 +94,24 @@ func (g *RateLimitGate) RoundTrip(req *http.Request) (*http.Response, error) {
 		g.release(host)
 	}
 	return resp, nil
+}
+
+// Held returns a *HeldError when requests to rawURL's host are being held,
+// and nil otherwise. It is safe to call on a nil gate.
+func (g *RateLimitGate) Held(rawURL string) error {
+	if g == nil {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	host := hostKey(u)
+	until, held := g.heldUntil(host)
+	if !held {
+		return nil
+	}
+	return &HeldError{Host: host, Until: until, RetryAfter: until.Sub(g.now())}
 }
 
 // Holds returns the hosts currently held and when each hold ends. It is
@@ -161,13 +178,20 @@ func (g *RateLimitGate) hold(host, header string) {
 			"until", until.UTC().Format(time.RFC3339))
 	}
 	if g.OnHold != nil {
-		g.OnHold(host, d)
+		g.OnHold(host)
 	}
 }
 
+// release drops host's hold once it has ended. Nothing is sent during a
+// hold, so a success arriving while one is active was sent before it began.
 func (g *RateLimitGate) release(host string) {
+	now := g.now()
 	g.mu.Lock()
-	_, had := g.holds[host]
+	h, had := g.holds[host]
+	if had && now.Before(h.until) {
+		g.mu.Unlock()
+		return
+	}
 	delete(g.holds, host)
 	g.mu.Unlock()
 	if had && g.Logger != nil {

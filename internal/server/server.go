@@ -238,6 +238,7 @@ func (s *Server) serve(listener net.Listener) error {
 	}
 	proxy := handler.NewProxy(s.db, s.storage, handler.LimitArtifactSize(fetcher, s.cfg.ParseArtifactMaxSize()), resolver, s.logger)
 	proxy.HTTPClient = metadataClient
+	proxy.RateLimits = s.rateLimits
 	cooldownPolicy, err := cooldownpolicy.New(cd, s.cfg.Cooldown.PackagePatterns)
 	if err != nil {
 		return fmt.Errorf("configuring cooldown policy: %w", err)
@@ -519,6 +520,7 @@ func NewMirrorProxy(cfg *config.Config, db *database.DB, store storage.Storage, 
 	fetcher := handler.LimitArtifactSize(fetch.NewFetcher(fetch.WithHTTPClient(artifactClient)), cfg.ParseArtifactMaxSize())
 	proxy := handler.NewProxy(db, store, fetcher, fetch.NewResolver(), logger)
 	proxy.HTTPClient = metadataClient
+	proxy.RateLimits = s.rateLimits
 	return proxy, s.newContainerHandler(proxy)
 }
 

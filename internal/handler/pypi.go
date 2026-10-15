@@ -118,6 +118,9 @@ func (h *PyPIHandler) handleSimplePackage(w http.ResponseWriter, r *http.Request
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
@@ -416,6 +419,9 @@ func (h *PyPIHandler) proxyAndRewriteJSON(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if writeUpstreamHeld(w, err) {
 			return
 		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
@@ -821,6 +827,9 @@ func (h *PyPIHandler) proxySimple(w http.ResponseWriter, r *http.Request, path s
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return

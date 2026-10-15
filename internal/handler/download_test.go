@@ -1306,3 +1306,84 @@ func TestMavenHandler_UpstreamHeldReturns503(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
+func TestMavenHandler_HeldArtifactMissesSkipCircuitBreaker(t *testing.T) {
+	proxy, _, _, _ := setupTestProxy(t)
+	upstreamCalls := 0
+	gate := httpclient.NewRateLimitGate(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"600"}},
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	}))
+	req, _ := http.NewRequest(http.MethodGet, "https://repo1.maven.org/maven2/x", nil)
+	if resp, err := gate.RoundTrip(req); err == nil {
+		_ = resp.Body.Close()
+	}
+	breaker := fetch.NewCircuitBreakerFetcher(fetch.NewFetcher(fetch.WithHTTPClient(&http.Client{Transport: gate})))
+	proxy.Fetcher = breaker
+	proxy.RateLimits = gate
+
+	h := NewMavenHandler(proxy, "http://localhost", "", "")
+	srv := httptest.NewServer(h.Routes())
+	defer srv.Close()
+
+	for i := range 8 {
+		resp, err := http.Get(fmt.Sprintf("%s/com/example/lib/1.%d/lib-1.%d.jar", srv.URL, i, i))
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("request %d: status %d Retry-After %q, want 503 with Retry-After", i, resp.StatusCode, resp.Header.Get("Retry-After"))
+		}
+	}
+	if upstreamCalls != 1 {
+		t.Errorf("upstream calls = %d, want only the one that started the hold", upstreamCalls)
+	}
+	if state := breaker.GetBreakerState()["repo1.maven.org"]; state == "open" {
+		t.Errorf("breaker for repo1.maven.org is open after held misses, want closed")
+	}
+}
+
+func TestHandlers_UpstreamHeldMetadataReturns503(t *testing.T) {
+	held := &httpclient.HeldError{Host: "upstream.example", Until: time.Now().Add(42 * time.Second), RetryAfter: 42 * time.Second}
+	tests := []struct {
+		name    string
+		handler func(*Proxy) http.Handler
+		path    string
+	}{
+		{"npm metadata", func(p *Proxy) http.Handler { return NewNPMHandler(p, "http://localhost", "").Routes() }, "/lodash"},
+		{"pypi simple", func(p *Proxy) http.Handler { return NewPyPIHandler(p, "http://localhost").Routes() }, "/simple/requests/"},
+		{"pypi json", func(p *Proxy) http.Handler { return NewPyPIHandler(p, "http://localhost").Routes() }, "/pypi/requests/json"},
+		{"cargo index", func(p *Proxy) http.Handler {
+			return NewCargoHandler(p, "http://localhost", "", "").Routes()
+		}, "/se/rd/serde"},
+		{"pub metadata", func(p *Proxy) http.Handler { return NewPubHandler(p, "http://localhost").Routes() }, "/api/packages/http"},
+		{"nuget service index", func(p *Proxy) http.Handler { return NewNuGetHandler(p, "http://localhost").Routes() }, "/v3/index.json"},
+		{"nuget search", func(p *Proxy) http.Handler { return NewNuGetHandler(p, "http://localhost").Routes() }, "/query?q=json"},
+		{"conda repodata", func(p *Proxy) http.Handler { return NewCondaHandler(p, "http://localhost").Routes() }, "/conda-forge/noarch/repodata.json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, _, _, _ := setupTestProxy(t)
+			proxy.HTTPClient = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, held
+			})}
+			srv := httptest.NewServer(tt.handler(proxy))
+			defer srv.Close()
+
+			resp, err := http.Get(srv.URL + tt.path)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "42" {
+				t.Errorf("status %d Retry-After %q, want 503 with Retry-After 42", resp.StatusCode, resp.Header.Get("Retry-After"))
+			}
+		})
+	}
+}

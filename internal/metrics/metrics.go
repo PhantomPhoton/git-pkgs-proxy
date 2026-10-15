@@ -492,7 +492,7 @@ func RecordCircuitBreakerTrip(registry string) {
 }
 
 // RecordUpstreamRateLimitHold counts a hold placed on host.
-func RecordUpstreamRateLimitHold(host string, _ time.Duration) {
+func RecordUpstreamRateLimitHold(host string) {
 	UpstreamRateLimitHolds.WithLabelValues(host).Inc()
 }
 

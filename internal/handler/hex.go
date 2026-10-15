@@ -118,6 +118,9 @@ func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 
 	protoResp, filteredVersions, err := h.fetchPackageAndVersions(r, name)
 	if err != nil {
+		if writeUpstreamHeld(w, err) {
+			return
+		}
 		h.proxy.Logger.Error("upstream request failed", "error", err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return

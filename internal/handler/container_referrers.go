@@ -160,6 +160,9 @@ func (h *ContainerHandler) serveStaleReferrersOrError(w http.ResponseWriter, r *
 		h.writeContainerReferrers(w, r, registryURL, cached, true)
 		return
 	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
 	h.proxy.Logger.Error("failed to fetch container referrers", "error", err)
 	h.containerError(w, http.StatusBadGateway, "INTERNAL_ERROR", "failed to fetch from upstream")
 }
