@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 const (
@@ -88,7 +90,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	challenge, ok := parseBearerChallenge(resp.Header.Values("WWW-Authenticate"))
-	if !ok || !canReplay(req) {
+	if !ok || !canReplay(req) || !t.trustedWithToken(req.URL, challenge) {
 		return resp, nil
 	}
 
@@ -106,6 +108,44 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.applyConfiguredAuthentication(retry)
 	retry.Header.Set("Authorization", "Bearer "+token)
 	return t.base.RoundTrip(retry)
+}
+
+// trustedWithToken reports whether a token from challenge's realm may be
+// fetched for, and sent to, the registry at requestURL. The challenge comes
+// from that registry, which can be any host the proxy fetches from, such as
+// one named in a Composer dist URL or a Helm index. Credentials configured for
+// the realm would otherwise be turned into a token handed to that host. A
+// registry is trusted with such a token when it has configured credentials of
+// its own, or is on the same site as the realm, as Docker Hub's
+// registry-1.docker.io is with auth.docker.io. A token from a realm with no
+// configured credentials is anonymous, and any registry may have it.
+func (t *Transport) trustedWithToken(requestURL *url.URL, challenge bearerChallenge) bool {
+	if t.authForURL == nil {
+		return true
+	}
+	if name, value := t.authForURL(challenge.realm); name == "" || value == "" {
+		return true
+	}
+	if name, value := t.authForURL(requestURL.String()); name != "" && value != "" {
+		return true
+	}
+	realm, err := url.Parse(challenge.realm)
+	return err == nil && sameSite(requestURL, realm)
+}
+
+// sameSite reports whether two URLs are on the same site: the same registrable
+// domain (public suffix plus one label), or, for IP addresses and names
+// without one, such as localhost, the same host and port.
+func sameSite(a, b *url.URL) bool {
+	hostA, hostB := strings.ToLower(a.Hostname()), strings.ToLower(b.Hostname())
+	if net.ParseIP(hostA) == nil && net.ParseIP(hostB) == nil {
+		siteA, errA := publicsuffix.EffectiveTLDPlusOne(hostA)
+		siteB, errB := publicsuffix.EffectiveTLDPlusOne(hostB)
+		if errA == nil && errB == nil {
+			return siteA == siteB
+		}
+	}
+	return strings.EqualFold(a.Host, b.Host)
 }
 
 func (t *Transport) applyAuthentication(req *http.Request, hasExplicitAuthorization bool) {
