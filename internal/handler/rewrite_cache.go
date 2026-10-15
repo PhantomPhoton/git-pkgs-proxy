@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"bytes"
+	"compress/gzip"
 	"container/list"
 	"context"
 	"crypto/rand"
@@ -11,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +39,10 @@ import (
 // copy without the output being hashed again on every request. Dates are not
 // the cache's to give: they must agree across replicas, so the database holds
 // them (see metadataDate).
+//
+// Each entry also keeps its output gzip-compressed, when that is smaller, so
+// clients accepting gzip get it without the document being compressed again
+// on every request, by the proxy or by a reverse proxy in front of it.
 type rewriteCache struct {
 	maxBytes int64
 
@@ -47,18 +54,21 @@ type rewriteCache struct {
 }
 
 type rewriteEntry struct {
-	key  string
-	out  []byte
-	etag string
+	key string
+	rewrittenMetadata
 }
 
-// inflightRewrite is one rewrite that concurrent callers share. out, etag
-// and err are written before done closes and read only after, so the close is
-// the handoff.
+// size is how much of the cache's room the entry takes.
+func (e *rewriteEntry) size() int64 {
+	return int64(len(e.body) + len(e.gzipped))
+}
+
+// inflightRewrite is one rewrite that concurrent callers share. m and err are
+// written before done closes and read only after, so the close is the
+// handoff.
 type inflightRewrite struct {
 	done chan struct{}
-	out  []byte
-	etag string
+	m    rewrittenMetadata
 	err  error
 }
 
@@ -70,9 +80,12 @@ type metadataValidators struct {
 }
 
 // rewrittenMetadata is a rewritten metadata document with its validators.
+// gzipped is the document gzip-compressed, or nil when there is no
+// compressed copy to serve.
 type rewrittenMetadata struct {
 	body []byte
 	metadataValidators
+	gzipped []byte
 }
 
 // metadataETag returns the strong ETag of a rewritten document.
@@ -139,28 +152,27 @@ func rewriteCacheKeyForDigest(ecosystem, proxyURL, name, digest string) string {
 	return strings.Join([]string{ecosystem, proxyURL, name, digest}, "\x00")
 }
 
-// get returns the cached rewrite for key and its ETag, if there is one.
-func (c *rewriteCache) get(key string) ([]byte, metadataValidators, bool) {
+// get returns the cached rewrite for key, if there is one.
+func (c *rewriteCache) get(key string) (rewrittenMetadata, bool) {
 	if c == nil {
-		return nil, metadataValidators{}, false
+		return rewrittenMetadata{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.entries[key]
 	if !ok {
-		return nil, metadataValidators{}, false
+		return rewrittenMetadata{}, false
 	}
 	c.order.MoveToFront(el)
-	e := el.Value.(*rewriteEntry)
-	return e.out, metadataValidators{etag: e.etag}, true
+	return el.Value.(*rewriteEntry).rewrittenMetadata, true
 }
 
-// rewrite returns rewrite(in) and its ETag, from the cache when it can.
-// Callers must treat the returned bytes as read-only: a cached result is
-// shared. A caller waiting on another's rewrite leaves when ctx ends; the
-// rewrite itself always runs to completion, so the result is cached for the
-// next request.
-func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewrite func([]byte) ([]byte, error)) (out []byte, v metadataValidators, err error) {
+// rewrite returns rewrite(in) with its ETag and gzip copy, from the cache
+// when it can. Callers must treat the returned bytes as read-only: a cached
+// result is shared. A caller waiting on another's rewrite leaves when ctx
+// ends; the rewrite itself always runs to completion, so the result is cached
+// for the next request.
+func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewrite func([]byte) ([]byte, error)) (rewrittenMetadata, error) {
 	if c == nil {
 		return rewriteWithETag(in, rewrite)
 	}
@@ -168,17 +180,16 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 	c.mu.Lock()
 	if el, ok := c.entries[key]; ok {
 		c.order.MoveToFront(el)
-		e := el.Value.(*rewriteEntry)
 		c.mu.Unlock()
-		return e.out, metadataValidators{etag: e.etag}, nil
+		return el.Value.(*rewriteEntry).rewrittenMetadata, nil
 	}
 	if f, ok := c.inFlight[key]; ok {
 		c.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, metadataValidators{}, ctx.Err()
+			return rewrittenMetadata{}, ctx.Err()
 		case <-f.done:
-			return f.out, metadataValidators{etag: f.etag}, f.err
+			return f.m, f.err
 		}
 	}
 	f := &inflightRewrite{done: make(chan struct{}), err: errSharedRewriteAbandoned}
@@ -189,31 +200,46 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 		c.mu.Lock()
 		delete(c.inFlight, key)
 		if f.err == nil {
-			c.add(&rewriteEntry{key: key, out: f.out, etag: f.etag})
+			c.add(&rewriteEntry{key: key, rewrittenMetadata: f.m})
 		}
 		c.mu.Unlock()
 		close(f.done)
 	}()
-	var fv metadataValidators
-	f.out, fv, f.err = rewriteWithETag(in, rewrite)
-	f.etag = fv.etag
-	return f.out, fv, f.err
+	f.m, f.err = rewriteWithETag(in, rewrite)
+	if f.err == nil {
+		f.m.gzipped = gzipIfSmaller(f.m.body)
+	}
+	return f.m, f.err
 }
 
 // rewriteWithETag runs rewrite and computes the ETag of what it returns.
-func rewriteWithETag(in []byte, rewrite func([]byte) ([]byte, error)) ([]byte, metadataValidators, error) {
+func rewriteWithETag(in []byte, rewrite func([]byte) ([]byte, error)) (rewrittenMetadata, error) {
 	out, err := rewrite(in)
 	if err != nil {
-		return nil, metadataValidators{}, err
+		return rewrittenMetadata{}, err
 	}
-	return out, metadataValidators{etag: metadataETag(out)}, nil
+	return rewrittenMetadata{body: out, metadataValidators: metadataValidators{etag: metadataETag(out)}}, nil
+}
+
+// gzipIfSmaller returns body gzip-compressed, or nil when compressing does
+// not make it smaller.
+func gzipIfSmaller(body []byte) []byte {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(body); err != nil {
+		return nil
+	}
+	if err := zw.Close(); err != nil || buf.Len() >= len(body) {
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // add stores e and evicts least recently used entries until the cache is
-// back under its limit. Output larger than the whole cache is not stored.
+// back under its limit. An entry larger than the whole cache is not stored.
 // Called with mu held.
 func (c *rewriteCache) add(e *rewriteEntry) {
-	n := int64(len(e.out))
+	n := e.size()
 	if n > c.maxBytes {
 		return
 	}
@@ -224,7 +250,7 @@ func (c *rewriteCache) add(e *rewriteEntry) {
 		e := oldest.Value.(*rewriteEntry)
 		c.order.Remove(oldest)
 		delete(c.entries, e.key)
-		c.size -= int64(len(e.out))
+		c.size -= e.size()
 	}
 }
 
@@ -252,24 +278,23 @@ func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name str
 		if err != nil {
 			return rewrittenMetadata{}, err
 		}
-		return rewrittenMetadata{out, metadataValidators{etag: keptVersionsETag(digest, proxyURL, name, kept)}}, nil
+		return rewrittenMetadata{body: out, metadataValidators: metadataValidators{etag: keptVersionsETag(digest, proxyURL, name, kept)}}, nil
 	}
 	rewriteOnly := func(b []byte) ([]byte, error) {
 		out, _, err := rewrite(b)
 		return out, err
 	}
-	var out []byte
-	var v metadataValidators
+	var m rewrittenMetadata
 	var err error
 	if p.rewrites == nil || p.cooldownEnabled() {
-		out, v, err = rewriteWithETag(in, rewriteOnly)
+		m, err = rewriteWithETag(in, rewriteOnly)
 	} else {
-		out, v, err = p.rewrites.rewrite(ctx, rewriteCacheKey(ecosystem, proxyURL, name, in), in, rewriteOnly)
+		m, err = p.rewrites.rewrite(ctx, rewriteCacheKey(ecosystem, proxyURL, name, in), in, rewriteOnly)
 	}
 	if err == nil && !p.cooldownEnabled() {
-		v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
+		m.lastModified = p.metadataDate(ecosystem, proxyURL, name, m.etag)
 	}
-	return rewrittenMetadata{out, v}, err
+	return m, err
 }
 
 // uncachedRewrite gives a rewrite made outside the cache its validators: an
@@ -280,7 +305,7 @@ func (p *Proxy) uncachedRewrite(ecosystem, proxyURL, name string, out []byte) re
 	if !p.cooldownEnabled() {
 		v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
 	}
-	return rewrittenMetadata{out, v}
+	return rewrittenMetadata{body: out, metadataValidators: v}
 }
 
 func (p *Proxy) cooldownEnabled() bool {
@@ -307,29 +332,78 @@ func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) (rewri
 	if !entry.FetchedAt.Valid || time.Since(entry.FetchedAt.Time) >= p.MetadataTTL {
 		return rewrittenMetadata{}, false
 	}
-	out, v, ok := p.rewrites.get(rewriteCacheKeyForDigest(ecosystem, proxyURL, name, entry.ContentDigest.String))
+	m, ok := p.rewrites.get(rewriteCacheKeyForDigest(ecosystem, proxyURL, name, entry.ContentDigest.String))
 	if !ok {
 		return rewrittenMetadata{}, false
 	}
-	v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
+	m.lastModified = p.metadataDate(ecosystem, proxyURL, name, m.etag)
 	metrics.RecordCacheHit(ecosystem)
-	return rewrittenMetadata{out, v}, true
+	return m, true
 }
 
 // serveRewrittenMetadata writes rewritten metadata with its validators, or
-// 304 Not Modified when they show the client's copy is current.
+// 304 Not Modified when they show the client's copy is current. A client
+// accepting gzip gets the compressed copy when there is one. Being another
+// representation, it has an ETag of its own.
 func serveRewrittenMetadata(w http.ResponseWriter, r *http.Request, m rewrittenMetadata) {
-	w.Header().Set(headerETag, m.etag)
+	body, etag := m.body, m.etag
+	compressed := m.gzipped != nil && acceptsGzip(r)
+	if compressed {
+		body, etag = m.gzipped, gzipETag(m.etag)
+	}
+	w.Header().Set("Vary", headerAcceptEncoding)
+	w.Header().Set(headerETag, etag)
 	if !m.lastModified.IsZero() {
 		w.Header().Set(headerLastModified, m.lastModified.UTC().Format(http.TimeFormat))
 	}
-	if notModified(r, m.etag, m.lastModified) {
+	if notModified(r, etag, m.lastModified) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	w.Header().Set(headerContentType, contentTypeJSON)
+	if compressed {
+		w.Header().Set(headerContentEncoding, "gzip")
+	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(m.body)
+	_, _ = w.Write(body)
+}
+
+// gzipETag returns the ETag of the gzip representation of the document
+// whose ETag is etag.
+func gzipETag(etag string) string {
+	return strings.TrimSuffix(etag, `"`) + `-gzip"`
+}
+
+// acceptsGzip reports whether the request's Accept-Encoding allows a gzip
+// response: gzip or x-gzip, or else "*", with a quality above zero.
+func acceptsGzip(r *http.Request) bool {
+	wildcard := false
+	for _, value := range r.Header.Values(headerAcceptEncoding) {
+		for coding := range strings.SplitSeq(value, ",") {
+			name, params, _ := strings.Cut(coding, ";")
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "gzip", "x-gzip":
+				return codingQualityPositive(params)
+			case "*":
+				wildcard = codingQualityPositive(params)
+			}
+		}
+	}
+	return wildcard
+}
+
+// codingQualityPositive reports whether an Accept-Encoding entry's
+// parameters give it a quality above zero. No q parameter means 1.
+func codingQualityPositive(params string) bool {
+	for param := range strings.SplitSeq(params, ";") {
+		key, value, _ := strings.Cut(param, "=")
+		if strings.TrimSpace(key) != "q" {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		return err == nil && q > 0
+	}
+	return true
 }
 
 // notModified reports whether a conditional request's validators match.

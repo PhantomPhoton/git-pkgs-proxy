@@ -19,8 +19,8 @@ base_url: "http://localhost:8080"
 # artifact_max_size: ""
 
 # Memory for rewritten npm and Composer metadata, so each upstream document is
-# rewritten once rather than on every request. Set to "0" to rewrite on every
-# request. Default: "256MB".
+# rewritten and gzip-compressed once rather than on every request. Set to "0"
+# to rewrite on every request. Default: "256MB".
 # metadata_rewrite_cache_size: "256MB"
 
 # Public URL where the web UI is reached. Defaults to base_url when unset.
