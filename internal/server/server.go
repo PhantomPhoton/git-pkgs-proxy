@@ -13,6 +13,7 @@
 //   - /nuget/*    - NuGet V3 API protocol
 //   - /composer/* - Composer/Packagist protocol
 //   - /conan/*    - Conan C/C++ protocol
+//   - /chef/*     - Chef Supermarket protocol
 //   - /conda/*    - Conda/Anaconda protocol
 //   - /cran/*     - CRAN (R) protocol
 //   - /julia/*    - Julia Pkg server protocol
@@ -442,6 +443,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 		s.cfg.Upstream.ComposerRepository,
 	).WithPackageRoutes(s.cfg.Upstream.ComposerRoutes)
 	conanHandler := handler.NewConanHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Conan)
+	chefHandler := handler.NewChefHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.Chef)
 	condaHandler := handler.NewCondaHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Conda)
 	cranHandler := handler.NewCRANHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.CRAN)
 	juliaHandler := handler.NewJuliaHandlerWithUpstream(proxy, s.cfg.Upstream.Julia)
@@ -474,6 +476,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	r.Mount("/nuget", http.StripPrefix("/nuget", nugetHandler.Routes()))
 	r.Mount("/composer", http.StripPrefix("/composer", composerHandler.Routes()))
 	r.Mount("/conan", http.StripPrefix("/conan", conanHandler.Routes()))
+	r.Mount("/chef", http.StripPrefix("/chef", chefHandler.Routes()))
 	r.Mount("/conda", http.StripPrefix("/conda", condaHandler.Routes()))
 	r.Mount("/cran", http.StripPrefix("/cran", cranHandler.Routes()))
 	r.Mount("/julia", http.StripPrefix("/julia", juliaHandler.Routes()))

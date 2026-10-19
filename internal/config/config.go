@@ -660,6 +660,11 @@ type UpstreamConfig struct {
 	// Default: https://center.conan.io
 	Conan string `json:"conan" yaml:"conan"`
 
+	// Chef is the upstream Chef Supermarket URL, served at /chef/. Point it
+	// at a private Supermarket to proxy that instead of the public one.
+	// Default: https://supermarket.chef.io
+	Chef string `json:"chef" yaml:"chef"`
+
 	// Conda is the upstream Conda channel base URL.
 	// Default: https://conda.anaconda.org
 	Conda string `json:"conda" yaml:"conda"`
@@ -1059,6 +1064,7 @@ func Default() *Config {
 			Composer:           "https://packagist.org",
 			ComposerRepository: "https://repo.packagist.org",
 			Conan:              "https://center.conan.io",
+			Chef:               "https://supermarket.chef.io",
 			Conda:              "https://conda.anaconda.org",
 			CRAN:               "https://cloud.r-project.org",
 			Julia:              "https://pkg.julialang.org",
@@ -1224,6 +1230,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.Upstream.Composer, "PROXY_UPSTREAM_COMPOSER")
 	setEnvString(&c.Upstream.ComposerRepository, "PROXY_UPSTREAM_COMPOSER_REPOSITORY")
 	setEnvString(&c.Upstream.Conan, "PROXY_UPSTREAM_CONAN")
+	setEnvString(&c.Upstream.Chef, "PROXY_UPSTREAM_CHEF")
 	setEnvString(&c.Upstream.Conda, "PROXY_UPSTREAM_CONDA")
 	setEnvString(&c.Upstream.CRAN, "PROXY_UPSTREAM_CRAN")
 	setEnvString(&c.Upstream.Julia, "PROXY_UPSTREAM_JULIA")

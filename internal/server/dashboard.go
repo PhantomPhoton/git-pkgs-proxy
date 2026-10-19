@@ -136,6 +136,7 @@ func supportedEcosystems() []string {
 		"alpine",
 		"arch",
 		"cargo",
+		"chef",
 		"composer",
 		"conan",
 		"conda",
@@ -189,6 +190,8 @@ func ecosystemColorClasses(ecosystem string) string {
 		return "bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300"
 	case "conan":
 		return "bg-teal-100 text-teal-700 dark:bg-teal-900/50 dark:text-teal-300"
+	case "chef":
+		return "bg-rose-100 text-rose-700 dark:bg-rose-900/50 dark:text-rose-300"
 	case "conda":
 		return "bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-300"
 	case "cran":
@@ -412,6 +415,16 @@ composer config -g repositories.proxy composer ` + baseURL + `/composer</code></
 			Instructions: template.HTML(`<p class="config-note">Configure Conan to use the proxy:</p>
 <pre><code>conan remote add proxy ` + baseURL + `/conan
 conan remote disable conancenter</code></pre>`),
+		},
+		{
+			ID:       "chef",
+			Name:     "Chef Supermarket",
+			Language: "Chef",
+			Endpoint: "/chef/",
+			Instructions: template.HTML(`<p class="config-note">Point Berkshelf at the proxy in your <code>Berksfile</code>:</p>
+<pre><code>source "` + baseURL + `/chef"</code></pre>
+<p class="config-note">Or in a Policyfile:</p>
+<pre><code>default_source :supermarket, "` + baseURL + `/chef"</code></pre>`),
 		},
 		{
 			ID:       "conda",

@@ -250,6 +250,7 @@ func runServe() {
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_COMPOSER             Packagist API upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_COMPOSER_REPOSITORY  Packagist repository upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_CONAN                Conan registry upstream URL\n")
+		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_CHEF                 Chef Supermarket upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_CONDA                Conda channel upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_CRAN                 CRAN mirror upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_JULIA                Julia package server upstream URL\n")

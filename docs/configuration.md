@@ -250,6 +250,7 @@ Each upstream used by a built-in package route can be set in YAML or JSON under 
 | `upstream.composer` | `PROXY_UPSTREAM_COMPOSER` | `https://packagist.org` |
 | `upstream.composer_repository` | `PROXY_UPSTREAM_COMPOSER_REPOSITORY` | `https://repo.packagist.org` |
 | `upstream.conan` | `PROXY_UPSTREAM_CONAN` | `https://center.conan.io` |
+| `upstream.chef` | `PROXY_UPSTREAM_CHEF` | `https://supermarket.chef.io` |
 | `upstream.conda` | `PROXY_UPSTREAM_CONDA` | `https://conda.anaconda.org` |
 | `upstream.cran` | `PROXY_UPSTREAM_CRAN` | `https://cloud.r-project.org` |
 | `upstream.julia` | `PROXY_UPSTREAM_JULIA` | `https://pkg.julialang.org` |
@@ -283,6 +284,17 @@ upstream:
 ```
 
 `upstream.hex_api` is used for cooldown timestamps and must expose Hex's `/api/packages/{name}` JSON endpoint.
+
+`upstream.chef` is the Supermarket served at `/chef/`, for Berkshelf (`source "https://proxy.example.com/chef"`) and Policyfiles (`default_source :supermarket, "https://proxy.example.com/chef"`). The upstream has to serve the Supermarket API: `/universe`, `/api/v1/cookbooks/{name}`, its versions and their downloads. A private Supermarket that needs credentials takes them from `upstream.auth`, scoped to its URL. A download redirect to another host, such as the storage bucket behind Supermarket, does not receive them:
+
+```yaml
+upstream:
+  chef: "https://supermarket.example.com"
+  auth:
+    "https://supermarket.example.com":
+      type: bearer
+      token: "${SUPERMARKET_TOKEN}"
+```
 
 ### Private package routes
 

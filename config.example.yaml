@@ -225,6 +225,10 @@ upstream:
   # Conan registry URL
   conan: "https://center.conan.io"
 
+  # Chef Supermarket URL (used by /chef/). Point it at a private
+  # Supermarket to proxy that instead.
+  chef: "https://supermarket.chef.io"
+
   # Conda channel base URL
   conda: "https://conda.anaconda.org"
 

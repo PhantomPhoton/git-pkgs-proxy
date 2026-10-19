@@ -33,6 +33,7 @@ func upstreamConfigValues(upstream UpstreamConfig) map[string]string {
 		"composer":             upstream.Composer,
 		"composer_repository":  upstream.ComposerRepository,
 		"conan":                upstream.Conan,
+		"chef":                 upstream.Chef,
 		"conda":                upstream.Conda,
 		"cran":                 upstream.CRAN,
 		"julia":                upstream.Julia,
@@ -64,6 +65,7 @@ func defaultUpstreamValues() map[string]string {
 		"composer":             "https://packagist.org",
 		"composer_repository":  "https://repo.packagist.org",
 		"conan":                "https://center.conan.io",
+		"chef":                 "https://supermarket.chef.io",
 		"conda":                "https://conda.anaconda.org",
 		"cran":                 "https://cloud.r-project.org",
 		"julia":                "https://pkg.julialang.org",
@@ -95,6 +97,7 @@ func upstreamEnvironmentVariables() map[string]string {
 		"composer":             "PROXY_UPSTREAM_COMPOSER",
 		"composer_repository":  "PROXY_UPSTREAM_COMPOSER_REPOSITORY",
 		"conan":                "PROXY_UPSTREAM_CONAN",
+		"chef":                 "PROXY_UPSTREAM_CHEF",
 		"conda":                "PROXY_UPSTREAM_CONDA",
 		"cran":                 "PROXY_UPSTREAM_CRAN",
 		"julia":                "PROXY_UPSTREAM_JULIA",
@@ -388,6 +391,7 @@ upstream:
   composer: "https://upstream.example.com/composer"
   composer_repository: "https://upstream.example.com/composer_repository"
   conan: "https://upstream.example.com/conan"
+  chef: "https://upstream.example.com/chef"
   conda: "https://upstream.example.com/conda"
   cran: "https://upstream.example.com/cran"
   julia: "https://upstream.example.com/julia"
