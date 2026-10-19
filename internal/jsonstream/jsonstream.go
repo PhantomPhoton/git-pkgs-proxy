@@ -20,7 +20,7 @@ var (
 )
 
 // Member is one member of an object being copied. Its value must be consumed
-// exactly once, with Raw, Skip or Object.
+// exactly once, with Raw, Copy or Object.
 type Member struct {
 	Key      string
 	dec      *json.Decoder
@@ -61,12 +61,6 @@ func (m *Member) Copy() error {
 		return err
 	}
 	return m.Write(raw)
-}
-
-// Skip reads the member's value and leaves the member out.
-func (m *Member) Skip() error {
-	_, err := m.Raw()
-	return err
 }
 
 // Object writes the member and copies its value, which must be an object,

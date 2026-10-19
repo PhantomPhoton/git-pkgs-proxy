@@ -662,14 +662,8 @@ func (h *NPMHandler) writeNPMVersion(out *bytes.Buffer, packageName, version str
 		"old", oldTarball, "new", newTarball)
 }
 
-// writeFilteredJSONObject writes the object obj holds, keeping the members
-// whose decoded key keep accepts.
-func writeFilteredJSONObject(out *bytes.Buffer, obj []byte, keep func(string) bool) error {
-	return writeFilteredJSONObjectWith(out, obj, keep, nil)
-}
-
-// writeFilteredJSONObjectWith is writeFilteredJSONObject followed by extra
-// string members.
+// writeFilteredJSONObjectWith keeps members whose decoded keys match keep,
+// then appends extra string members.
 func writeFilteredJSONObjectWith(out *bytes.Buffer, obj []byte, keep func(string) bool, extra [][2]string) error {
 	out.WriteByte('{')
 	first := true

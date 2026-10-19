@@ -14,7 +14,6 @@ import (
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/proxy/internal/metrics"
-	"github.com/git-pkgs/proxy/internal/storage"
 	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries/fetch"
 )
@@ -44,7 +43,7 @@ func seedPackageWithPURL(t *testing.T, db *database.DB, store *mockStorage, ecos
 		t.Fatalf("failed to upsert version: %v", err)
 	}
 
-	storagePath := storage.ArtifactPath(ecosystem, "", name, version, filename)
+	storagePath := ecosystem + "/" + name + "/" + version + "/" + filename
 	store.files[storagePath] = []byte(content)
 	sharedArtifact := testArtifact(content, versionPURL, filename, "application/octet-stream")
 
@@ -1373,8 +1372,12 @@ func TestHandlers_UpstreamHeldMetadataReturns503(t *testing.T) {
 		path    string
 	}{
 		{"npm metadata", func(p *Proxy) http.Handler { return NewNPMHandler(p, "http://localhost", "").Routes() }, "/lodash"},
-		{"pypi simple", func(p *Proxy) http.Handler { return NewPyPIHandler(p, "http://localhost").Routes() }, "/simple/requests/"},
-		{"pypi json", func(p *Proxy) http.Handler { return NewPyPIHandler(p, "http://localhost").Routes() }, "/pypi/requests/json"},
+		{"pypi simple", func(p *Proxy) http.Handler {
+			return NewPyPIHandlerWithUpstreams(p, "http://localhost", "", "").Routes()
+		}, "/simple/requests/"},
+		{"pypi json", func(p *Proxy) http.Handler {
+			return NewPyPIHandlerWithUpstreams(p, "http://localhost", "", "").Routes()
+		}, "/pypi/requests/json"},
 		{"cargo index", func(p *Proxy) http.Handler {
 			return NewCargoHandler(p, "http://localhost", "", "").Routes()
 		}, "/se/rd/serde"},

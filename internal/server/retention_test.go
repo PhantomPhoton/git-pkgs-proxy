@@ -42,7 +42,7 @@ func seedAgedArtifact(t *testing.T, db *database.DB, store storage.Storage, dbEc
 	if err := db.UpsertVersion(&database.Version{PURL: versionPURL, PackagePURL: pkgPURL}); err != nil {
 		t.Fatalf("UpsertVersion: %v", err)
 	}
-	path := storage.ArtifactPath(dbEcosystem, "", name, "1.0.0", filename)
+	path := dbEcosystem + "/" + name + "/1.0.0/" + filename
 	size, hash, err := store.Store(context.Background(), path, strings.NewReader("artifact"))
 	if err != nil {
 		t.Fatalf("Store: %v", err)

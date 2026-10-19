@@ -197,22 +197,8 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 	serveRewrittenMetadata(w, r, rewritten)
 }
 
-// rewriteMetadata rewrites dist URLs in Composer metadata to point at this proxy.
-// If cooldown is enabled, versions published too recently are filtered out.
-//
-// The document is never decoded as a whole. Packagist serves large packages
-// as minified lists of thousands of versions, and expanding them into generic
-// maps took many times the document's size for every rewrite. Instead each
-// version list is walked in place and the response is assembled from slices
-// of the original bytes: only dist values are written fresh, and minified
-// metadata stays minified.
-func (h *ComposerHandler) rewriteMetadata(body []byte) ([]byte, error) {
-	out, _, err := h.rewriteMetadataKeeping(body)
-	return out, err
-}
-
-// rewriteMetadataKeeping is rewriteMetadata that also reports the versions
-// it kept, each as its package name and version.
+// rewriteMetadataKeeping rewrites dist URLs and filters versions in cooldown.
+// It returns the kept package names and versions without expanding minified lists.
 func (h *ComposerHandler) rewriteMetadataKeeping(body []byte) ([]byte, []string, error) {
 	return h.rewriteMetadataWithLocal(body, "", nil)
 }

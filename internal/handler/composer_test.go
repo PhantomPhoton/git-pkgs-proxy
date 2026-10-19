@@ -38,7 +38,7 @@ func TestComposerRewriteMetadata(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestComposerRewriteMetadataMinifiedInheritance(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestComposerRewriteMetadataMinifiedDevReset(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestComposerRewriteMetadataUnset(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestComposerRewriteMetadataCooldownPreservesNames(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestComposerRewriteMetadataGitHubZipballFilenames(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestComposerExpandMinifiedSharedDistReferences(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -959,7 +959,7 @@ func TestComposerRewriteMetadataCooldown(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata([]byte(input))
+	output, _, err := h.rewriteMetadataKeeping([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}

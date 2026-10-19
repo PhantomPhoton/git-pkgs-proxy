@@ -58,7 +58,8 @@ func TestCopyObjectSkipReplaceAndEmpty(t *testing.T) {
 	got, err := copyString(t, `{"first":1,"secret":"x","n":2,"empty":{}}`, func(m *Member) error {
 		switch m.Key {
 		case "first", "secret":
-			return m.Skip()
+			_, err := m.Raw()
+			return err
 		case "n":
 			if _, err := m.Raw(); err != nil {
 				return err
@@ -93,13 +94,14 @@ func TestMemberMisuse(t *testing.T) {
 		t.Errorf("Write before Raw: err = %v", err)
 	}
 	_, err = copyString(t, `{"a":1}`, func(m *Member) error {
-		if err := m.Skip(); err != nil {
+		if _, err := m.Raw(); err != nil {
 			return err
 		}
-		return m.Skip()
+		_, err := m.Raw()
+		return err
 	})
 	if !errors.Is(err, errConsumed) {
-		t.Errorf("second Skip: err = %v", err)
+		t.Errorf("second Raw: err = %v", err)
 	}
 }
 
