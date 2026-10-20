@@ -71,13 +71,9 @@ type hostedEcosystem struct {
 
 	// filename is the name clients request the archive by, derived from the
 	// package name and version. When nil, the filename is the last segment of
-	// the push path, and the package name must be a single segment so the
-	// path is unambiguous.
+	// the push path, the package name must be a single segment so the path is
+	// unambiguous, and a version can hold several files (see multiFile).
 	filename func(name, version string) string
-
-	// multiFile is set when a version can hold several files. Such versions
-	// get no version-level integrity, which could only describe one of them.
-	multiFile bool
 
 	// readManifest reads the package manifest out of a pushed archive and
 	// checks that it describes target. When nil, pushes carry no manifest.
@@ -115,8 +111,14 @@ var hostedEcosystems = map[string]hostedEcosystem{
 	// come from an upstream.
 	genericEcosystem: {
 		validName: func(segments []string) bool { return len(segments) == 1 },
-		multiFile: true,
 	},
+}
+
+// multiFile reports whether a version can hold several files: those named in
+// the push path. Such versions get no version-level integrity, which could
+// only describe one of them.
+func (e hostedEcosystem) multiFile() bool {
+	return e.filename == nil
 }
 
 // HostedSupported reports whether packages can be pushed for ecosystem.
@@ -130,7 +132,7 @@ func HostedSupported(ecosystem string) bool {
 // version.
 func HostedFileInPath(ecosystem string) bool {
 	eco, ok := hostedEcosystems[ecosystem]
-	return ok && eco.filename == nil
+	return ok && eco.multiFile()
 }
 
 func lastSegment(name string) string {
@@ -141,29 +143,44 @@ func lastSegment(name string) string {
 // where it is stored. filename is required for ecosystems whose pushes name
 // the file (see HostedFileInPath) and must be empty for the others.
 func HostedTargetFor(ecosystem, name, version, filename string) (HostedTarget, error) {
+	if err := ValidateHostedPath(ecosystem, name, version, filename); err != nil {
+		return HostedTarget{}, err
+	}
+	eco := hostedEcosystems[ecosystem]
+	if eco.filename != nil {
+		filename = eco.filename(name, version)
+	} else if filename == "" {
+		return HostedTarget{}, ErrHostedInvalidName
+	}
+	return HostedTarget{Name: name, Version: version, Filename: filename}, nil
+}
+
+// ValidateHostedPath checks the parts of a hosted API path: a supported
+// ecosystem, one of its package names, and path segments that are safe to
+// store. filename may be empty, as in a delete of a whole version, but is
+// only allowed for ecosystems whose pushes name the file.
+func ValidateHostedPath(ecosystem, name, version, filename string) error {
 	eco, ok := hostedEcosystems[ecosystem]
 	if !ok {
-		return HostedTarget{}, fmt.Errorf("%w: %s", ErrHostedUnsupported, ecosystem)
+		return fmt.Errorf("%w: %s", ErrHostedUnsupported, ecosystem)
 	}
 	segments := strings.Split(name, "/")
 	if !eco.validName(segments) {
-		return HostedTarget{}, ErrHostedInvalidName
+		return ErrHostedInvalidName
 	}
 	checked := append(slices.Clone(segments), version)
-	if eco.filename == nil {
+	if filename != "" {
+		if !eco.multiFile() {
+			return ErrHostedInvalidName
+		}
 		checked = append(checked, filename)
-	} else if filename != "" {
-		return HostedTarget{}, ErrHostedInvalidName
 	}
 	for _, segment := range checked {
 		if !validHostedSegment(segment) {
-			return HostedTarget{}, ErrHostedInvalidName
+			return ErrHostedInvalidName
 		}
 	}
-	if eco.filename != nil {
-		filename = eco.filename(name, version)
-	}
-	return HostedTarget{Name: name, Version: version, Filename: filename}, nil
+	return nil
 }
 
 func validHostedSegment(s string) bool {
@@ -269,14 +286,16 @@ type storedPush struct {
 
 // checkPush reads the manifest of a stored push and runs the scanners on it.
 func (p *Proxy) checkPush(ctx context.Context, ecosystem string, target HostedTarget, versionPURL string, push *storedPush) error {
-	stored, err := p.Storage.Open(ctx, push.storagePath)
-	if err != nil {
-		return fmt.Errorf("reading pushed archive: %w", err)
-	}
-	push.manifest, err = readHostedManifest(ecosystem, stored, target)
-	_ = stored.Close()
-	if err != nil {
-		return err
+	if hostedEcosystems[ecosystem].readManifest != nil {
+		stored, err := p.Storage.Open(ctx, push.storagePath)
+		if err != nil {
+			return fmt.Errorf("reading pushed archive: %w", err)
+		}
+		push.manifest, err = readHostedManifest(ecosystem, stored, target)
+		_ = stored.Close()
+		if err != nil {
+			return err
+		}
 	}
 
 	if p.Scanners != nil && p.Scanners.Enabled() {
@@ -299,7 +318,7 @@ func (p *Proxy) discardStored(ctx context.Context, storagePath string) {
 // Multi-file versions can't have one integrity, so an existing version record
 // is left alone and each file is checked against its own sha256.
 func (p *Proxy) recordLocalArtifact(ecosystem string, target HostedTarget, pkgPURL, versionPURL string, push storedPush) error {
-	oneFilePerVersion := !hostedEcosystems[ecosystem].multiFile
+	oneFilePerVersion := !hostedEcosystems[ecosystem].multiFile()
 	err := p.DB.RecordLocalArtifact(
 		&database.Package{PURL: pkgPURL, Ecosystem: ecosystem, Name: target.Name},
 		&database.Version{

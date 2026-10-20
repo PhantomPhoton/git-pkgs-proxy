@@ -79,7 +79,7 @@ func TestUpsertArtifactSkipsRecordThatMoved(t *testing.T) {
 			UpstreamURL: "https://example.com/" + pendingFilename,
 			StoragePath: sql.NullString{String: "npm/pending/1.0.0/c/pending-1.0.0.tgz", Valid: true},
 		}
-		applied, err := db.upsertArtifactFrom(late, read)
+		applied, err := db.upsertArtifactFrom(db, late, read)
 		if err != nil {
 			t.Fatalf("upsertArtifactFrom: %v", err)
 		}
@@ -91,7 +91,7 @@ func TestUpsertArtifactSkipsRecordThatMoved(t *testing.T) {
 		}
 
 		missing := &Artifact{VersionPURL: "pkg:npm/pending@2.0.0", Filename: pendingFilename, UpstreamURL: "u"}
-		applied, err = db.upsertArtifactFrom(missing, sql.NullString{})
+		applied, err = db.upsertArtifactFrom(db, missing, sql.NullString{})
 		if err != nil || !applied {
 			t.Errorf("insert of a new record: applied=%v err=%v", applied, err)
 		}

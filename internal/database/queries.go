@@ -52,7 +52,17 @@ func (db *DB) GetPackageByEcosystemName(ecosystem, name string) (*Package, error
 	return &pkg, nil
 }
 
+// execer runs statements on the database or inside a transaction.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Get(dest any, query string, args ...any) error
+}
+
 func (db *DB) UpsertPackage(pkg *Package) error {
+	return db.upsertPackage(db, pkg)
+}
+
+func (db *DB) upsertPackage(exec execer, pkg *Package) error {
 	now := time.Now()
 	var query string
 
@@ -90,7 +100,7 @@ func (db *DB) UpsertPackage(pkg *Package) error {
 		`
 	}
 
-	_, err := db.Exec(query,
+	_, err := exec.Exec(query,
 		pkg.PURL, pkg.Ecosystem, pkg.Name, pkg.LatestVersion,
 		pkg.License, pkg.Description, pkg.Homepage, pkg.RepositoryURL,
 		pkg.RegistryURL, pkg.EnrichedAt, now, now,
@@ -136,6 +146,10 @@ func (db *DB) GetVersionsByPackagePURL(packagePURL string) ([]Version, error) {
 }
 
 func (db *DB) UpsertVersion(v *Version) error {
+	return db.upsertVersion(db, v)
+}
+
+func (db *DB) upsertVersion(exec execer, v *Version) error {
 	now := time.Now()
 	var query string
 
@@ -167,7 +181,7 @@ func (db *DB) UpsertVersion(v *Version) error {
 		`
 	}
 
-	_, err := db.Exec(query,
+	_, err := exec.Exec(query,
 		v.PURL, v.PackagePURL, v.License, v.Integrity,
 		v.PublishedAt, v.Yanked, v.EnrichedAt, now, now,
 	)
@@ -334,32 +348,87 @@ func inUTC(t sql.NullTime) sql.NullTime {
 }
 
 func (db *DB) UpsertArtifact(a *Artifact) error {
-	for range upsertArtifactAttempts {
-		var previous sql.NullString
-		query := db.Rebind(`SELECT storage_path FROM artifacts WHERE version_purl = ? AND filename = ?`)
-		if err := db.Get(&previous, query, a.VersionPURL, a.Filename); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("reading artifact: %w", err)
-		}
-		applied, err := db.upsertArtifactFrom(a, previous)
-		if err != nil {
-			return err
-		}
-		if !applied {
-			continue
-		}
-		if previous.Valid && previous.String != a.StoragePath.String {
-			if err := db.QueuePendingDelete(previous.String); err != nil {
-				return fmt.Errorf("queueing replaced artifact: %w", err)
-			}
-		}
-		return nil
-	}
-	return errors.New("upserting artifact: record kept changing")
+	return db.recordArtifact(a, nil, ErrLocalArtifactExists)
 }
 
-// upsertArtifactFrom writes a if the record is absent or still holds
-// previous, and reports whether it did.
-func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, error) {
+// ErrLocalArtifactExists is returned when an artifact would replace one that
+// was pushed to the proxy. Pushed artifacts are only removed by deleting them.
+var ErrLocalArtifactExists = errors.New("a pushed artifact already exists")
+
+// RecordCachedArtifact records an artifact fetched from an upstream together
+// with its package and version, in one transaction. If the artifact was
+// pushed in the meantime, nothing is written and ErrLocalArtifactExists is
+// returned, so the push's version integrity is kept as well.
+func (db *DB) RecordCachedArtifact(pkg *Package, v *Version, a *Artifact) error {
+	return db.recordArtifact(a, func(tx execer) error {
+		if err := db.upsertPackage(tx, pkg); err != nil {
+			return err
+		}
+		return db.upsertVersion(tx, v)
+	}, ErrLocalArtifactExists)
+}
+
+// artifactSlot is what an artifact record holds before it is replaced.
+type artifactSlot struct {
+	StoragePath sql.NullString `db:"storage_path"`
+	Source      sql.NullString `db:"source"`
+}
+
+// recordArtifact writes before's records and a in one transaction. A pushed
+// artifact is never replaced: the transaction is rolled back and localErr
+// returned. A storage path the record stops pointing at is queued for
+// deletion in the same transaction, since each fetch or push stores its own
+// object and nothing else would remove it. The write applies only if the
+// record still holds the path read before it, so commits racing on one
+// artifact each queue the path they replaced.
+func (db *DB) recordArtifact(a *Artifact, before func(tx execer) error, localErr error) error {
+	for range upsertArtifactAttempts {
+		done, err := db.tryRecordArtifact(a, before, localErr)
+		if err != nil || done {
+			return err
+		}
+	}
+	return errors.New("recording artifact: record kept changing")
+}
+
+func (db *DB) tryRecordArtifact(a *Artifact, before func(tx execer) error, localErr error) (bool, error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if before != nil {
+		if err := before(tx); err != nil {
+			return false, err
+		}
+	}
+
+	var current artifactSlot
+	query := db.Rebind(`SELECT storage_path, source FROM artifacts WHERE version_purl = ? AND filename = ?`)
+	if err := tx.Get(&current, query, a.VersionPURL, a.Filename); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("reading artifact: %w", err)
+	}
+	if current.Source.String == SourceLocal {
+		return false, localErr
+	}
+
+	applied, err := db.upsertArtifactFrom(tx, a, current.StoragePath)
+	if err != nil || !applied {
+		return false, err
+	}
+	previous := current.StoragePath
+	if previous.Valid && previous.String != a.StoragePath.String {
+		if _, err := tx.Exec(db.Rebind(queuePendingDeleteQuery), previous.String, time.Now().UTC()); err != nil {
+			return false, fmt.Errorf("queueing replaced artifact: %w", err)
+		}
+	}
+	return true, tx.Commit()
+}
+
+// upsertArtifactFrom writes a if the record is absent, or still holds
+// previous and wasn't pushed, and reports whether it did.
+func (db *DB) upsertArtifactFrom(exec execer, a *Artifact, previous sql.NullString) (bool, error) {
 	now := time.Now()
 	var query string
 
@@ -380,6 +449,7 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 				source = EXCLUDED.source,
 				manifest = EXCLUDED.manifest
 			WHERE artifacts.storage_path IS NOT DISTINCT FROM $15
+				AND (artifacts.source IS NULL OR artifacts.source <> 'local')
 		`
 	} else {
 		query = `
@@ -398,10 +468,11 @@ func (db *DB) upsertArtifactFrom(a *Artifact, previous sql.NullString) (bool, er
 				source = excluded.source,
 				manifest = excluded.manifest
 			WHERE artifacts.storage_path IS ?
+				AND (artifacts.source IS NULL OR artifacts.source <> 'local')
 		`
 	}
 
-	res, err := db.Exec(query,
+	res, err := exec.Exec(query,
 		a.VersionPURL, a.Filename, a.UpstreamURL, a.StoragePath, a.ContentHash,
 		a.Size, a.ContentType, inUTC(a.FetchedAt), a.HitCount, inUTC(a.LastAccessedAt), now, now,
 		a.sourceOrUpstream(), a.Manifest, previous,

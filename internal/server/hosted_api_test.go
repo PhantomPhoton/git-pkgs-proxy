@@ -506,3 +506,18 @@ func TestHostedRepushIsRefusedBeforeTheBodyIsRead(t *testing.T) {
 		t.Fatalf("second PUT status = %d, want 409, body %s", rec.Code, rec.Body)
 	}
 }
+
+func TestHostedDeleteRejectsMalformedPaths(t *testing.T) {
+	s := newHostedTestServer(t)
+	for _, target := range []string{
+		"/api/hosted/generic/tools/1.2.0/%2e%2e",
+		"/api/hosted/generic/tools/1.2.0/tool%0a",
+		"/api/hosted/npm/request/2.88.3/request-2.88.3.tgz/extra",
+		"/api/hosted/composer/monolog/3.5.0",
+		"/api/hosted/cargo/serde/1.0.200",
+	} {
+		if rec := s.do(t, http.MethodDelete, target, testHostedToken, ""); rec.Code != http.StatusBadRequest {
+			t.Errorf("DELETE %s status = %d, want 400, body %s", target, rec.Code, rec.Body)
+		}
+	}
+}

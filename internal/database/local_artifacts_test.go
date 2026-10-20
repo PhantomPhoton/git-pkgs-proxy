@@ -419,3 +419,38 @@ func TestRecordLocalArtifactConcurrentPushesHaveOneWinner(t *testing.T) {
 		}
 	})
 }
+
+func TestRecordCachedArtifactNeverReplacesAPush(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		pkg := &Package{PURL: "pkg:npm/request", Ecosystem: "npm", Name: "request"}
+		pushed := localPush("pkg:npm/request@1.0.0", "request-1.0.0.tgz", "npm/request/pushed")
+		if err := db.RecordLocalArtifact(pkg, &Version{PURL: "pkg:npm/request@1.0.0", PackagePURL: pkg.PURL,
+			Integrity: sql.NullString{String: "sha512-pushed", Valid: true}}, true, pushed); err != nil {
+			t.Fatalf("RecordLocalArtifact: %v", err)
+		}
+
+		fetched := &Artifact{
+			VersionPURL: "pkg:npm/request@1.0.0",
+			Filename:    "request-1.0.0.tgz",
+			UpstreamURL: "https://registry.example/request-1.0.0.tgz",
+			StoragePath: sql.NullString{String: "npm/request/fetched", Valid: true},
+		}
+		err := db.RecordCachedArtifact(pkg, &Version{PURL: "pkg:npm/request@1.0.0", PackagePURL: pkg.PURL,
+			Integrity: sql.NullString{String: "sha512-upstream", Valid: true}}, fetched)
+		if !errors.Is(err, ErrLocalArtifactExists) {
+			t.Fatalf("RecordCachedArtifact error = %v, want ErrLocalArtifactExists", err)
+		}
+		if err := db.UpsertArtifact(fetched); !errors.Is(err, ErrLocalArtifactExists) {
+			t.Errorf("UpsertArtifact error = %v, want ErrLocalArtifactExists", err)
+		}
+
+		art, err := db.GetArtifact("pkg:npm/request@1.0.0", "request-1.0.0.tgz")
+		if err != nil || art == nil || art.Source != SourceLocal || art.StoragePath.String != "npm/request/pushed" {
+			t.Errorf("artifact = %+v, %v, want the push", art, err)
+		}
+		v, err := db.GetVersionByPURL("pkg:npm/request@1.0.0")
+		if err != nil || v == nil || v.Integrity.String != "sha512-pushed" {
+			t.Errorf("version = %+v, %v, want the push's integrity", v, err)
+		}
+	})
+}

@@ -2,14 +2,13 @@ package server
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/git-pkgs/integrity"
 	"github.com/git-pkgs/proxy/internal/handler"
 	"github.com/go-chi/chi/v5"
 )
@@ -182,6 +181,10 @@ func (h *HostedAPIHandler) HandleDelete(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	if err := handler.ValidateHostedPath(path.ecosystem, path.name, path.version, path.filename); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
 	var err error
 	if path.filename != "" {
 		err = h.proxy.DeleteLocalFile(path.ecosystem, path.name, path.version, path.filename)
@@ -248,9 +251,6 @@ func hostedPath(w http.ResponseWriter, r *http.Request, requireFile bool) (hoste
 
 // validSHA256 reports whether s is a hex-encoded sha256 digest.
 func validSHA256(s string) bool {
-	if len(s) != sha256.Size*2 {
-		return false
-	}
-	_, err := hex.DecodeString(s)
+	_, err := integrity.ParseHex(integrity.SHA256, s)
 	return err == nil
 }

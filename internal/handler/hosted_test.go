@@ -489,3 +489,45 @@ func TestConcurrentPushesOfTheSameFileHaveOneWinner(t *testing.T) {
 		t.Errorf("served %q, want the winning push %q", served, fmt.Sprintf("build %d", winner))
 	}
 }
+
+// A fetch that started before a push and records after it must not replace
+// the pushed artifact or its version's integrity.
+func TestCacheFillAfterPushKeepsThePush(t *testing.T) {
+	proxy, _, store, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	pushRequest(t, proxy)
+
+	const fetchedPath = "npm/request/2.88.3/fetched/request-2.88.3.tgz"
+	if _, _, err := store.Store(context.Background(), fetchedPath, strings.NewReader("upstream bytes")); err != nil {
+		t.Fatalf("storing fetched copy: %v", err)
+	}
+	fetched := testArtifact("upstream bytes", "pkg:npm/request@2.88.3", "request-2.88.3.tgz", "application/gzip")
+	err := proxy.updateCacheDB("npm", "request", "pkg:npm/request", "https://registry.npmjs.org/request/-/request-2.88.3.tgz",
+		fetchedPath, fetched, "sha512-upstream")
+	if !errors.Is(err, database.ErrLocalArtifactExists) {
+		t.Fatalf("updateCacheDB over a push error = %v, want ErrLocalArtifactExists", err)
+	}
+
+	result, err := proxy.GetLocalArtifact(context.Background(), "npm", "request", "2.88.3", "request-2.88.3.tgz")
+	if err != nil || result == nil {
+		t.Fatalf("GetLocalArtifact = %v, %v, want the pushed copy", result, err)
+	}
+	served, err := io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if err != nil || string(served) != pushedTarball {
+		t.Errorf("served %d bytes, %v, want the pushed tarball, integrity intact", len(served), err)
+	}
+}
+
+func TestGenericPushDoesNotReadTheStoredFile(t *testing.T) {
+	proxy, _, store, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	target, err := HostedTargetFor("generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil {
+		t.Fatalf("HostedTargetFor: %v", err)
+	}
+	store.openErr = errors.New("storage opened")
+	if _, err := proxy.PushLocalArtifact(context.Background(), "generic", target, strings.NewReader("bytes"), "", ""); err != nil {
+		t.Fatalf("PushLocalArtifact: %v", err)
+	}
+}

@@ -2,7 +2,6 @@ package database
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 )
@@ -75,10 +74,6 @@ func (db *DB) DeleteLocalArtifacts(versionPURL, filename string) (int, error) {
 	return int(deleted), tx.Commit()
 }
 
-// ErrLocalArtifactExists is returned by RecordLocalArtifact when the file
-// was already pushed.
-var ErrLocalArtifactExists = errors.New("local artifact already exists")
-
 // RecordLocalArtifact records a pushed artifact in one transaction: the
 // package if it is missing, the version, and the artifact. An artifact cached
 // from an upstream under the same name is replaced and its stored object
@@ -89,72 +84,28 @@ var ErrLocalArtifactExists = errors.New("local artifact already exists")
 // When setIntegrity is false, an existing version record is left as it is.
 // Otherwise its integrity is set to v.Integrity.
 func (db *DB) RecordLocalArtifact(pkg *Package, v *Version, setIntegrity bool, a *Artifact) error {
-	tx, err := db.Beginx()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	now := time.Now()
-
-	if _, err := tx.Exec(db.Rebind(`
-		INSERT INTO packages (purl, ecosystem, name, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(purl) DO NOTHING
-	`), pkg.PURL, pkg.Ecosystem, pkg.Name, now, now); err != nil {
-		return fmt.Errorf("inserting package: %w", err)
-	}
-
-	versionConflict := `DO NOTHING`
-	if setIntegrity {
-		versionConflict = `DO UPDATE SET integrity = excluded.integrity, updated_at = excluded.updated_at`
-	}
-	if _, err := tx.Exec(db.Rebind(`
-		INSERT INTO versions (purl, package_purl, integrity, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(purl) `+versionConflict,
-	), v.PURL, v.PackagePURL, v.Integrity, now, now); err != nil {
-		return fmt.Errorf("recording version: %w", err)
-	}
-
-	var previous sql.NullString
-	if err := tx.Get(&previous, db.Rebind(`SELECT storage_path FROM artifacts WHERE version_purl = ? AND filename = ?`),
-		a.VersionPURL, a.Filename); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("reading artifact: %w", err)
-	}
-
-	res, err := tx.Exec(db.Rebind(`
-		INSERT INTO artifacts (version_purl, filename, upstream_url, storage_path, content_hash,
-		                       size, content_type, fetched_at, hit_count, created_at, updated_at,
-		                       source, manifest)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
-		ON CONFLICT(version_purl, filename) DO UPDATE SET
-			upstream_url = excluded.upstream_url,
-			storage_path = excluded.storage_path,
-			content_hash = excluded.content_hash,
-			size = excluded.size,
-			content_type = excluded.content_type,
-			fetched_at = excluded.fetched_at,
-			updated_at = excluded.updated_at,
-			source = excluded.source,
-			manifest = excluded.manifest
-		WHERE artifacts.source IS NULL OR artifacts.source <> 'local'
-	`), a.VersionPURL, a.Filename, a.UpstreamURL, a.StoragePath, a.ContentHash,
-		a.Size, a.ContentType, inUTC(a.FetchedAt), now, now, SourceLocal, a.Manifest)
-	if err != nil {
-		return fmt.Errorf("recording artifact: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("recording artifact: %w", err)
-	}
-	if n == 0 {
-		return ErrLocalArtifactExists
-	}
-
-	if previous.Valid && previous.String != a.StoragePath.String {
-		if _, err := tx.Exec(db.Rebind(queuePendingDeleteQuery), previous.String, now.UTC()); err != nil {
-			return fmt.Errorf("queueing replaced artifact: %w", err)
+	local := *a
+	local.Source = SourceLocal
+	return db.recordArtifact(&local, func(tx execer) error {
+		now := time.Now()
+		if _, err := tx.Exec(db.Rebind(`
+			INSERT INTO packages (purl, ecosystem, name, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(purl) DO NOTHING
+		`), pkg.PURL, pkg.Ecosystem, pkg.Name, now, now); err != nil {
+			return fmt.Errorf("inserting package: %w", err)
 		}
-	}
-	return tx.Commit()
+		versionConflict := `DO NOTHING`
+		if setIntegrity {
+			versionConflict = `DO UPDATE SET integrity = excluded.integrity, updated_at = excluded.updated_at`
+		}
+		if _, err := tx.Exec(db.Rebind(`
+			INSERT INTO versions (purl, package_purl, integrity, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(purl) `+versionConflict,
+		), v.PURL, v.PackagePURL, v.Integrity, now, now); err != nil {
+			return fmt.Errorf("recording version: %w", err)
+		}
+		return nil
+	}, ErrLocalArtifactExists)
 }
