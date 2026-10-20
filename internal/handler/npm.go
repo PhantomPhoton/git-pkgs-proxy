@@ -263,12 +263,14 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		}
 		// If rewriting fails, just proxy the original
 		h.proxy.Logger.Warn("failed to rewrite metadata, proxying original", "error", err)
+		markStale(w, upstream.stale)
 		w.Header().Set(headerContentType, contentTypeJSON)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(upstream.body)
 		return
 	}
 
+	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, rewritten)
 }
 

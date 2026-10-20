@@ -123,6 +123,7 @@ func (h *NPMHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.Reque
 		JSONError(w, http.StatusBadGateway, "failed to rewrite package metadata")
 		return
 	}
+	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, h.proxy.uncachedRewrite("npm", h.proxyURL, metadataCacheKey, out))
 }
 
