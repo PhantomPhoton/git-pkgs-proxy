@@ -327,7 +327,7 @@ func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) (rewri
 		return rewrittenMetadata{}, false
 	}
 	m.lastModified = p.metadataDate(ecosystem, proxyURL, name, m.etag)
-	metrics.RecordCacheHit(ecosystem)
+	metrics.RecordMetadataCacheHit(ecosystem, len(m.body))
 	p.recordMetadataRead(entry)
 	return m, true
 }
