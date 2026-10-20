@@ -312,6 +312,7 @@ func TestGenericHandler_RejectsUnknownUpstreamAndBadPaths(t *testing.T) {
 		{"traversal", http.MethodGet, "/github/../etc/passwd", http.StatusBadRequest},
 		{"encoded traversal", http.MethodGet, "/github/%2e%2e/etc/passwd", http.StatusBadRequest},
 		{"post", http.MethodPost, "/github/owner/repo/releases/download/v1/asset", http.StatusMethodNotAllowed},
+		{"hosted files with hosting off", http.MethodGet, "/hosted/tools/1.2.0/tool.tar.gz", http.StatusNotFound},
 	}
 
 	for _, tt := range tests {

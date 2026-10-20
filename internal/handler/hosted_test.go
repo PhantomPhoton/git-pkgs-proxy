@@ -15,6 +15,27 @@ import (
 	"github.com/git-pkgs/registries/fetch"
 )
 
+func TestHostedTargetForFileInPath(t *testing.T) {
+	got, err := HostedTargetFor("generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil || got != (HostedTarget{Name: "tools", Version: "1.2.0", Filename: "tool.tar.gz"}) {
+		t.Errorf("generic target = %+v, %v", got, err)
+	}
+	for _, tt := range []struct{ ecosystem, name, version, file string }{
+		{"generic", "tools", "1.2.0", ""},
+		{"generic", "tools", "1.2.0", ".."},
+		{"generic", "acme/tools", "1.2.0", "tool.tar.gz"},
+		{"npm", "request", "2.88.3", "request-2.88.3.tgz"},
+	} {
+		if _, err := HostedTargetFor(tt.ecosystem, tt.name, tt.version, tt.file); !errors.Is(err, ErrHostedInvalidName) {
+			t.Errorf("HostedTargetFor(%q, %q, %q, %q) error = %v, want ErrHostedInvalidName",
+				tt.ecosystem, tt.name, tt.version, tt.file, err)
+		}
+	}
+	if !HostedFileInPath("generic") || HostedFileInPath("npm") || HostedFileInPath("cargo") {
+		t.Error("HostedFileInPath should hold for generic only")
+	}
+}
+
 func TestHostedTargetFor(t *testing.T) {
 	tests := []struct {
 		name                    string
@@ -49,7 +70,7 @@ func TestHostedTargetFor(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version)
+			got, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version, "")
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("HostedTargetFor() error = %v, want %v", err, tt.wantErr)
@@ -114,11 +135,11 @@ var pushedTarball = string(npmTarball(requestManifest))
 
 func pushRequest(t *testing.T, proxy *Proxy) HostedArtifact {
 	t.Helper()
-	target, err := HostedTargetFor("npm", "request", "2.88.3")
+	target, err := HostedTargetFor("npm", "request", "2.88.3", "")
 	if err != nil {
 		t.Fatalf("HostedTargetFor: %v", err)
 	}
-	pushed, err := proxy.PushLocalArtifact(context.Background(), "npm", target, strings.NewReader(pushedTarball), "application/gzip")
+	pushed, err := proxy.PushLocalArtifact(context.Background(), "npm", target, strings.NewReader(pushedTarball), "application/gzip", "")
 	if err != nil {
 		t.Fatalf("PushLocalArtifact: %v", err)
 	}
@@ -290,11 +311,11 @@ func TestPushLocalArtifactChecksManifest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			proxy, _, store, _ := setupTestProxy(t)
-			target, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version)
+			target, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version, "")
 			if err != nil {
 				t.Fatalf("HostedTargetFor: %v", err)
 			}
-			_, err = proxy.PushLocalArtifact(context.Background(), tt.ecosystem, target, bytes.NewReader(tt.archive), "")
+			_, err = proxy.PushLocalArtifact(context.Background(), tt.ecosystem, target, bytes.NewReader(tt.archive), "", "")
 			if tt.wantErr == nil {
 				if err != nil {
 					t.Fatalf("PushLocalArtifact: %v", err)
@@ -401,7 +422,7 @@ func TestComposerManifestLookup(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			target, err := HostedTargetFor("composer", "monolog/monolog", "3.5.0")
+			target, err := HostedTargetFor("composer", "monolog/monolog", "3.5.0", "")
 			if err != nil {
 				t.Fatalf("HostedTargetFor: %v", err)
 			}

@@ -2,6 +2,8 @@ package server
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -50,32 +52,41 @@ func registerHostedRoutes(r chi.Router, h *HostedAPIHandler, token string) {
 	})
 }
 
-// HandlePush handles PUT /api/hosted/{ecosystem}/{name}/{version}
+// HandlePush handles PUT /api/hosted/{ecosystem}/{name}/{version}, and
+// PUT /api/hosted/generic/{name}/{version}/{file} for generic files.
 // @Summary Push a package archive
-// @Description Stores the request body as the archive for name@version. It is served in place of the upstream archive with the same version and is never evicted.
+// @Description Stores the request body as the archive for name@version. It is served in place of the upstream archive with the same version and is never evicted. Generic files are pushed to /api/hosted/generic/{name}/{version}/{file} and served at /generic/hosted/{name}/{version}/{file}. A file that was already pushed is refused with 409; delete it first to push it again.
 // @Tags hosted
 // @Accept octet-stream
 // @Produce json
 // @Security BearerAuth
-// @Param ecosystem path string true "Ecosystem (npm or composer)"
+// @Param ecosystem path string true "Ecosystem (npm, composer or generic)"
 // @Param name path string true "Package name, including an npm scope or the Composer vendor"
 // @Param version path string true "Version"
+// @Param sha256 query string false "Expected sha256 of the body, hex-encoded; a mismatch is refused"
 // @Success 201 {object} HostedPushResponse
 // @Failure 400 {object} ErrorResponse
 // @Failure 401 {object} ErrorResponse
 // @Failure 403 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
 // @Failure 413 {object} ErrorResponse
 // @Router /api/hosted/{ecosystem}/{name}/{version} [put]
 func (h *HostedAPIHandler) HandlePush(w http.ResponseWriter, r *http.Request) {
-	ecosystem, name, version, ok := hostedVersionPath(w, r)
+	path, ok := hostedPath(w, r, true)
 	if !ok {
 		return
 	}
-	target, err := handler.HostedTargetFor(ecosystem, name, version)
+	target, err := handler.HostedTargetFor(path.ecosystem, path.name, path.version, path.filename)
 	if err != nil {
 		badRequest(w, err.Error())
 		return
 	}
+	wantSHA256 := r.URL.Query().Get("sha256")
+	if wantSHA256 != "" && !validSHA256(wantSHA256) {
+		badRequest(w, "sha256 must be 64 hex characters")
+		return
+	}
+	ecosystem := path.ecosystem
 
 	body := bufio.NewReader(http.MaxBytesReader(w, r.Body, h.maxUploadBytes))
 	if _, err := body.Peek(1); errors.Is(err, io.EOF) {
@@ -83,7 +94,7 @@ func (h *HostedAPIHandler) HandlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pushed, err := h.proxy.PushLocalArtifact(r.Context(), ecosystem, target, body, r.Header.Get("Content-Type"))
+	pushed, err := h.proxy.PushLocalArtifact(r.Context(), ecosystem, target, body, r.Header.Get("Content-Type"), wantSHA256)
 	if err != nil {
 		h.pushError(w, err)
 		return
@@ -102,8 +113,11 @@ func (h *HostedAPIHandler) pushError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &tooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, ErrCodeBadRequest, "archive exceeds hosted.max_upload_size")
-	case errors.Is(err, handler.ErrHostedInvalidArchive), errors.Is(err, handler.ErrHostedManifestMismatch):
+	case errors.Is(err, handler.ErrHostedInvalidArchive), errors.Is(err, handler.ErrHostedManifestMismatch),
+		errors.Is(err, handler.ErrHostedChecksumMismatch):
 		badRequest(w, err.Error())
+	case errors.Is(err, handler.ErrHostedExists):
+		writeError(w, http.StatusConflict, ErrCodeConflict, err.Error())
 	case errors.Is(err, handler.ErrVersionDenied), errors.Is(err, handler.ErrArtifactBlocked):
 		writeError(w, http.StatusForbidden, ErrCodeBadRequest, err.Error())
 	default:
@@ -143,9 +157,10 @@ func (h *HostedAPIHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, HostedListResponse{Ecosystem: ecosystem, Name: name, Artifacts: listed})
 }
 
-// HandleDelete handles DELETE /api/hosted/{ecosystem}/{name}/{version}
+// HandleDelete handles DELETE /api/hosted/{ecosystem}/{name}/{version}, and
+// DELETE /api/hosted/generic/{name}/{version}/{file} for one generic file.
 // @Summary Delete a pushed version
-// @Description Removes the archives pushed for name@version. If the upstream has the version, clients get the upstream archive again.
+// @Description Removes the archives pushed for name@version. If the upstream has the version, clients get the upstream archive again. For generic files, /api/hosted/generic/{name}/{version}/{file} removes only that file.
 // @Tags hosted
 // @Security BearerAuth
 // @Param ecosystem path string true "Ecosystem"
@@ -156,19 +171,25 @@ func (h *HostedAPIHandler) HandleList(w http.ResponseWriter, r *http.Request) {
 // @Failure 404 {object} ErrorResponse
 // @Router /api/hosted/{ecosystem}/{name}/{version} [delete]
 func (h *HostedAPIHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
-	ecosystem, name, version, ok := hostedVersionPath(w, r)
+	path, ok := hostedPath(w, r, false)
 	if !ok {
 		return
 	}
-	err := h.proxy.DeleteLocalVersion(ecosystem, name, version)
+	var err error
+	if path.filename != "" {
+		err = h.proxy.DeleteLocalFile(path.ecosystem, path.name, path.version, path.filename)
+	} else {
+		err = h.proxy.DeleteLocalVersion(path.ecosystem, path.name, path.version)
+	}
 	switch {
-	case errors.Is(err, handler.ErrHostedVersionNotFound):
+	case errors.Is(err, handler.ErrHostedVersionNotFound), errors.Is(err, handler.ErrHostedFileNotFound):
 		notFound(w, err.Error())
 	case err != nil:
 		h.logger.Error("failed to delete pushed version", "error", err)
 		internalError(w, "failed to delete pushed version")
 	default:
-		h.logger.Info("deleted pushed version", "ecosystem", ecosystem, "name", name, "version", version)
+		h.logger.Info("deleted pushed version", "ecosystem", path.ecosystem, "name", path.name,
+			"version", path.version, "filename", path.filename)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -176,19 +197,53 @@ func (h *HostedAPIHandler) HandleDelete(w http.ResponseWriter, r *http.Request) 
 // minVersionPathSegments is one name segment plus the version.
 const minVersionPathSegments = 2
 
-// hostedVersionPath splits {name}/{version} from the wildcard. The version is
-// always the last segment; the name may span several (npm scopes, Composer
-// vendors).
-func hostedVersionPath(w http.ResponseWriter, r *http.Request) (ecosystem, name, version string, ok bool) {
+// hostedPushPath is a parsed /api/hosted/{ecosystem}/... path.
+type hostedPushPath struct {
+	ecosystem string
+	name      string
+	version   string
+	filename  string
+}
+
+// hostedPath splits the wildcard into name, version and, for ecosystems
+// whose pushes name the file, the filename. The version is the last segment
+// otherwise, and the name may span several (npm scopes, Composer vendors).
+// Ecosystems that name the file have single-segment names, so their path is
+// {name}/{version}/{file}; requireFile is false for deletes, where
+// {name}/{version} removes the whole version.
+func hostedPath(w http.ResponseWriter, r *http.Request, requireFile bool) (hostedPushPath, bool) {
 	segments, err := packagePathSegments(r)
 	if err != nil {
 		badRequest(w, err.Error())
-		return "", "", "", false
+		return hostedPushPath{}, false
+	}
+	path := hostedPushPath{ecosystem: chi.URLParam(r, "ecosystem")}
+	if handler.HostedFileInPath(path.ecosystem) {
+		switch {
+		case len(segments) == minVersionPathSegments+1:
+			path.name, path.version, path.filename = segments[0], segments[1], segments[2]
+		case len(segments) == minVersionPathSegments && !requireFile:
+			path.name, path.version = segments[0], segments[1]
+		default:
+			badRequest(w, "path must be /api/hosted/"+path.ecosystem+"/{name}/{version}/{file}")
+			return hostedPushPath{}, false
+		}
+		return path, true
 	}
 	if len(segments) < minVersionPathSegments {
 		badRequest(w, "path must be /api/hosted/{ecosystem}/{name}/{version}")
-		return "", "", "", false
+		return hostedPushPath{}, false
 	}
 	last := len(segments) - 1
-	return chi.URLParam(r, "ecosystem"), strings.Join(segments[:last], "/"), segments[last], true
+	path.name, path.version = strings.Join(segments[:last], "/"), segments[last]
+	return path, true
+}
+
+// validSHA256 reports whether s is a hex-encoded sha256 digest.
+func validSHA256(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }

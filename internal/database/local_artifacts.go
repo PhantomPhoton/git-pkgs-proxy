@@ -31,27 +31,32 @@ func (db *DB) GetLocalArtifacts(packagePURL string) ([]LocalArtifact, error) {
 	return artifacts, nil
 }
 
-// DeleteLocalArtifacts removes the pushed artifacts of a version and queues
-// their stored objects for deletion in the same transaction, so a failed
-// queue keeps the records instead of orphaning the objects. Artifacts cached
-// from an upstream are left alone. It returns how many records it removed.
-func (db *DB) DeleteLocalArtifacts(versionPURL string) (int, error) {
+// DeleteLocalArtifacts removes the pushed artifacts of a version, or only the
+// one named filename when it is set, and queues their stored objects for
+// deletion in the same transaction, so a failed queue keeps the records
+// instead of orphaning the objects. Artifacts cached from an upstream are left
+// alone. It returns how many records it removed.
+func (db *DB) DeleteLocalArtifacts(versionPURL, filename string) (int, error) {
 	tx, err := db.Beginx()
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	where := "version_purl = ? AND source = 'local'"
+	args := []any{versionPURL}
+	if filename != "" {
+		where += " AND filename = ?"
+		args = append(args, filename)
+	}
+
 	var paths []string
-	selectQuery := db.Rebind(`
-		SELECT storage_path FROM artifacts
-		WHERE version_purl = ? AND source = 'local' AND storage_path IS NOT NULL
-	`)
-	if err := tx.Select(&paths, selectQuery, versionPURL); err != nil {
+	selectQuery := db.Rebind(`SELECT storage_path FROM artifacts WHERE ` + where + ` AND storage_path IS NOT NULL`)
+	if err := tx.Select(&paths, selectQuery, args...); err != nil {
 		return 0, fmt.Errorf("reading local artifacts: %w", err)
 	}
 
-	res, err := tx.Exec(db.Rebind(`DELETE FROM artifacts WHERE version_purl = ? AND source = 'local'`), versionPURL)
+	res, err := tx.Exec(db.Rebind(`DELETE FROM artifacts WHERE `+where), args...)
 	if err != nil {
 		return 0, fmt.Errorf("deleting local artifacts: %w", err)
 	}

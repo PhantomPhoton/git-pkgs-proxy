@@ -1456,6 +1456,13 @@ func TestValidateNamedUpstreams(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "generic upstream name reserved for pushed files",
+			modify: func(cfg *Config) {
+				cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
+			},
+			wantErr: true,
+		},
+		{
 			name: "generic artifact patterns",
 			modify: func(cfg *Config) {
 				cfg.Upstream.Generic = map[string]string{"apache": "https://archive.apache.org"}

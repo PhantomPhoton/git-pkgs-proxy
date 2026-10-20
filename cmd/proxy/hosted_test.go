@@ -62,11 +62,28 @@ func TestRunPush(t *testing.T) {
 	if recorded.method != http.MethodPut || recorded.path != "/api/hosted/npm/@types/node/20.1.0" {
 		t.Errorf("request = %s %s", recorded.method, recorded.path)
 	}
-	if recorded.authorization != "Bearer tok" || recorded.body != "tarball" || recorded.query != "" {
+	// sha256 of "tarball", so the proxy can check the upload.
+	const tarballSHA256 = "db4b4d0d1cb480bf9aeea253771c00febe627f236765fa37d6a5614f079a3aa0"
+	if recorded.authorization != "Bearer tok" || recorded.body != "tarball" || recorded.query != "sha256="+tarballSHA256 {
 		t.Errorf("authorization/body/query = %q/%q/%q", recorded.authorization, recorded.body, recorded.query)
 	}
 	if out := stdout.String(); !strings.Contains(out, "node-20.1.0.tgz") || !strings.Contains(out, "abc123") {
 		t.Errorf("output = %q, want filename and sha256", out)
+	}
+}
+
+func TestRunPushGenericNamesTheFile(t *testing.T) {
+	srv, recorded := hostedTestServer(t, http.StatusCreated,
+		`{"ecosystem":"generic","name":"tools","version":"1.2.0","filename":"tool-linux-arm64.tar.gz","sha256":"abc123","size":7}`)
+	archive := writeArchive(t, "tool-linux-arm64.tar.gz", "tarball")
+
+	err := runPush([]string{"-url", srv.URL, "generic", "tools", "1.2.0", archive},
+		hostedEnv(map[string]string{"PROXY_HOSTED_TOKEN": "tok"}), io.Discard, srv.Client())
+	if err != nil {
+		t.Fatalf("runPush: %v", err)
+	}
+	if recorded.path != "/api/hosted/generic/tools/1.2.0/tool-linux-arm64.tar.gz" {
+		t.Errorf("path = %q, want the file name appended", recorded.path)
 	}
 }
 
@@ -138,6 +155,23 @@ func TestRunDelete(t *testing.T) {
 		hostedEnv(map[string]string{"PROXY_HOSTED_TOKEN": "tok"}), io.Discard, missing.Client())
 	if err == nil || !strings.Contains(err.Error(), "no pushed artifacts") {
 		t.Errorf("delete of a missing version error = %v", err)
+	}
+}
+
+func TestRunDeleteOneFile(t *testing.T) {
+	srv, recorded := hostedTestServer(t, http.StatusNoContent, "")
+	var stdout bytes.Buffer
+
+	err := runDelete([]string{"-url", srv.URL, "generic", "tools", "1.2.0", "tool-linux-arm64.tar.gz"},
+		hostedEnv(map[string]string{"PROXY_HOSTED_TOKEN": "tok"}), &stdout, srv.Client())
+	if err != nil {
+		t.Fatalf("runDelete: %v", err)
+	}
+	if recorded.path != "/api/hosted/generic/tools/1.2.0/tool-linux-arm64.tar.gz" {
+		t.Errorf("path = %q", recorded.path)
+	}
+	if out := stdout.String(); out != "deleted generic tools@1.2.0 tool-linux-arm64.tar.gz\n" {
+		t.Errorf("output = %q", out)
 	}
 }
 

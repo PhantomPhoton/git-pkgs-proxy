@@ -183,7 +183,7 @@ func TestDeleteLocalArtifacts(t *testing.T) {
 		seedSourcedArtifact(t, db, "express", SourceUpstream, 100, time.Now())
 		const pushedPath = "npm/request/1.0.0/request-1.0.0.tgz"
 
-		deleted, err := db.DeleteLocalArtifacts("pkg:npm/request@1.0.0")
+		deleted, err := db.DeleteLocalArtifacts("pkg:npm/request@1.0.0", "")
 		if err != nil || deleted != 1 {
 			t.Fatalf("DeleteLocalArtifacts(request) = %d, %v, want 1, nil", deleted, err)
 		}
@@ -196,7 +196,7 @@ func TestDeleteLocalArtifacts(t *testing.T) {
 			t.Errorf("queued deletes for %s = %d, %v, want 1", pushedPath, queued, err)
 		}
 
-		deleted, err = db.DeleteLocalArtifacts("pkg:npm/express@1.0.0")
+		deleted, err = db.DeleteLocalArtifacts("pkg:npm/express@1.0.0", "")
 		if err != nil || deleted != 0 {
 			t.Errorf("DeleteLocalArtifacts(upstream) = %d, %v, want 0, nil", deleted, err)
 		}

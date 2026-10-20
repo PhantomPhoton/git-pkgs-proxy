@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,9 +11,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/handler"
 )
 
 const (
@@ -21,7 +26,7 @@ const (
 
 	pushArgCount   = 4 // ecosystem, name, version, file
 	listArgCount   = 2 // ecosystem, name
-	deleteArgCount = 3 // ecosystem, name, version
+	deleteArgCount = 3 // ecosystem, name, version[, file]
 	tablePadding   = 2
 )
 
@@ -69,15 +74,17 @@ func newHostedCommand(name, usage, summary string, getenv func(string) string) h
 	return cmd
 }
 
-// parse parses flags and checks for exactly want positional arguments.
-func (c hostedCommand) parse(args []string, want int) ([]string, error) {
+// parse parses flags and checks for exactly want positional arguments, or
+// one more when optional is set.
+func (c hostedCommand) parse(args []string, want int, optional ...bool) ([]string, error) {
 	if err := c.flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			c.flags.Usage()
 		}
 		return nil, fmt.Errorf("%w\nusage: %s", err, c.usage)
 	}
-	if c.flags.NArg() != want {
+	n := c.flags.NArg()
+	if n != want && (len(optional) == 0 || !optional[0] || n != want+1) {
 		return nil, fmt.Errorf("usage: %s", c.usage)
 	}
 	return c.flags.Args(), nil
@@ -121,7 +128,22 @@ func runPush(args []string, getenv func(string) string, stdout io.Writer, client
 	}
 	defer func() { _ = file.Close() }()
 
-	req, err := http.NewRequest(http.MethodPut, cmd.endpoint(ecosystem, name, version), file)
+	// The proxy checks the upload against this, so a truncated or corrupted
+	// transfer is refused rather than stored.
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	segments := []string{version}
+	if handler.HostedFileInPath(ecosystem) {
+		segments = append(segments, filepath.Base(path))
+	}
+	endpoint := cmd.endpoint(ecosystem, name, segments...) + "?sha256=" + hex.EncodeToString(digest.Sum(nil))
+	req, err := http.NewRequest(http.MethodPut, endpoint, file)
 	if err != nil {
 		return err
 	}
@@ -161,8 +183,9 @@ func runList(args []string, getenv func(string) string, stdout io.Writer, client
 }
 
 func runDelete(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
-	cmd := newHostedCommand("delete", "proxy hosted delete [-url URL] <ecosystem> <name> <version>", "Delete a pushed version", getenv)
-	positional, err := cmd.parse(args, deleteArgCount)
+	cmd := newHostedCommand("delete", "proxy hosted delete [-url URL] <ecosystem> <name> <version> [file]",
+		"Delete a pushed version, or one generic file of it", getenv)
+	positional, err := cmd.parse(args, deleteArgCount, true)
 	if err != nil {
 		return err
 	}
@@ -170,7 +193,7 @@ func runDelete(args []string, getenv func(string) string, stdout io.Writer, clie
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodDelete, cmd.endpoint(positional[0], positional[1], positional[2]), nil)
+	req, err := http.NewRequest(http.MethodDelete, cmd.endpoint(positional[0], positional[1], positional[2:]...), nil)
 	if err != nil {
 		return err
 	}
@@ -179,7 +202,11 @@ func runDelete(args []string, getenv func(string) string, stdout io.Writer, clie
 	if err := doHosted(client, req, http.StatusNoContent, nil); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "deleted %s %s@%s\n", positional[0], positional[1], positional[2])
+	deleted := positional[1] + "@" + positional[2]
+	if len(positional) > deleteArgCount {
+		deleted += " " + positional[deleteArgCount]
+	}
+	_, err = fmt.Fprintf(stdout, "deleted %s %s\n", positional[0], deleted)
 	return err
 }
 
@@ -210,7 +237,7 @@ func doHosted(client *http.Client, req *http.Request, wantStatus int, out any) e
 const hostedUsage = "usage: proxy hosted <push|list|delete> [flags] ...\n\n" +
 	"  push     Push a package archive to the proxy\n" +
 	"  list     List pushed package archives\n" +
-	"  delete   Delete a pushed version"
+	"  delete   Delete a pushed version, or one generic file of it"
 
 type hostedSubcommand func([]string, func(string) string, io.Writer, *http.Client) error
 
