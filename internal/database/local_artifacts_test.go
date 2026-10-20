@@ -3,7 +3,9 @@ package database
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -381,6 +383,39 @@ func TestRecordLocalArtifactCanKeepTheVersionRecord(t *testing.T) {
 		v, err := db.GetVersionByPURL("pkg:generic/tools@1.2.0")
 		if err != nil || v == nil || v.Integrity.String != "sha256-upstream" || v.License.String != "MIT" {
 			t.Errorf("version after push = %+v, %v, want it unchanged", v, err)
+		}
+	})
+}
+
+func TestRecordLocalArtifactConcurrentPushesHaveOneWinner(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		pkg := &Package{PURL: "pkg:generic/tools", Ecosystem: "generic", Name: "tools"}
+		const pushes = 8
+		start := make(chan struct{})
+		errs := make([]error, pushes)
+		var wg sync.WaitGroup
+		for i := range pushes {
+			wg.Go(func() {
+				<-start
+				v := &Version{PURL: "pkg:generic/tools@1.2.0", PackagePURL: pkg.PURL}
+				a := localPush("pkg:generic/tools@1.2.0", "tool.tar.gz", fmt.Sprintf("generic/tools/push-%d", i))
+				errs[i] = db.RecordLocalArtifact(pkg, v, false, a)
+			})
+		}
+		close(start)
+		wg.Wait()
+
+		winners := 0
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				winners++
+			case !errors.Is(err, ErrLocalArtifactExists):
+				t.Errorf("push %d error = %v, want ErrLocalArtifactExists", i, err)
+			}
+		}
+		if winners != 1 {
+			t.Errorf("%d pushes succeeded, want exactly 1", winners)
 		}
 	})
 }
