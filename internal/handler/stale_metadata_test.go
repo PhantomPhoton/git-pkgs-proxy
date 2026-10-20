@@ -112,3 +112,55 @@ func TestProxyCachedPassesDefiniteAnswersThrough(t *testing.T) {
 		})
 	}
 }
+
+const staleComposerDocument = `{"packages":{"acme/widget":[{"name":"acme/widget","version":"1.0.0",` +
+	`"dist":{"type":"zip","url":"https://repo.packagist.org/files/acme/widget/1.0.0/widget.zip"}}]},"minified":"composer/2.0"}`
+
+func TestComposerMetadataAfterUpstreamAnswer(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		wantStatus int
+		wantStale  bool
+	}{
+		{name: "upstream error", status: http.StatusBadGateway, wantStatus: http.StatusOK, wantStale: true},
+		{name: "removed", status: http.StatusNotFound, wantStatus: http.StatusNotFound},
+		{name: "credentials rejected", status: http.StatusUnauthorized, wantStatus: http.StatusBadGateway},
+		{name: "access forbidden", status: http.StatusForbidden, wantStatus: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if requests.Add(1) == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(staleComposerDocument))
+					return
+				}
+				w.WriteHeader(tt.status)
+			}))
+			t.Cleanup(upstream.Close)
+			proxy, _, _, _ := setupTestProxy(t)
+			proxy.CacheMetadata = true
+			proxy.MetadataTTL = time.Millisecond
+			proxy.HTTPClient = upstream.Client()
+			h := NewComposerHandlerWithUpstreams(proxy, "http://proxy.test", upstream.URL, upstream.URL).Routes()
+
+			first := httptest.NewRecorder()
+			h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/p2/acme/widget.json", nil))
+			if first.Code != http.StatusOK {
+				t.Fatalf("first request: status = %d, body %s", first.Code, first.Body)
+			}
+			time.Sleep(5 * time.Millisecond)
+
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/p2/acme/widget.json", nil))
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d, body %s", w.Code, tt.wantStatus, w.Body)
+			}
+			if stale := w.Header().Get("Warning") == staleWarning; stale != tt.wantStale {
+				t.Errorf("Warning = %q, want stale %v", w.Header().Get("Warning"), tt.wantStale)
+			}
+		})
+	}
+}
