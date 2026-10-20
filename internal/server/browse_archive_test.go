@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -332,6 +333,39 @@ func TestBrowseFileContents(t *testing.T) {
 	}
 }
 
+func TestBrowseFileDirectoryNotFound(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		for _, explicit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/explicit=%t", format, explicit), func(t *testing.T) {
+				ts := newTestServer(t)
+				defer ts.close()
+				var logs bytes.Buffer
+				ts.server.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError}))
+
+				entries := []archiveEntry{{name: "pkg/src/main.go", body: "package main\n"}}
+				if explicit {
+					entries = append([]archiveEntry{{name: "pkg/src/", dir: true}}, entries...)
+				}
+				data := buildTarGz(t, entries)
+				if format == "zip" {
+					data = buildZip(t, entries)
+				}
+				cacheBrowseArtifact(t, ts, "cargo", "demo", "demo."+format, data)
+
+				for _, dir := range []string{"src", "src/"} {
+					response := browseGet(ts, browseFileURL("cargo", "demo", dir))
+					if response.Code != http.StatusNotFound {
+						t.Errorf("directory %q returned %d, want 404: %s", dir, response.Code, response.Body.String())
+					}
+				}
+				if logs.Len() != 0 {
+					t.Errorf("directory request logged an error: %s", logs.String())
+				}
+			})
+		}
+	}
+}
+
 func TestBrowseFileFirstDuplicateWins(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.close()
@@ -344,6 +378,39 @@ func TestBrowseFileFirstDuplicateWins(t *testing.T) {
 	w := browseGet(ts, browseFileURL("npm", "dup", "index.js"))
 	if w.Code != http.StatusOK || w.Body.String() != "first" {
 		t.Fatalf("got %d %q, want 200 \"first\"", w.Code, w.Body.String())
+	}
+}
+
+func TestBrowseSingleRootFile(t *testing.T) {
+	for _, format := range []string{"tar.gz", "zip"} {
+		t.Run(format, func(t *testing.T) {
+			ts := newTestServer(t)
+			defer ts.close()
+			entries := []archiveEntry{{name: "README.md", body: "single file\n"}}
+			data := buildTarGz(t, entries)
+			if format == "zip" {
+				data = buildZip(t, entries)
+			}
+			filename := "single." + format
+			cacheBrowseArtifact(t, ts, "cargo", "single", filename, data)
+			paths := listingPaths(decodeListing(t, browseGet(ts, browseListURL("cargo", "single", ""))))
+			if len(paths) != 1 || paths[0] != "README.md" {
+				t.Fatalf("listing = %v, want README.md", paths)
+			}
+			response := browseGet(ts, browseFileURL("cargo", "single", "README.md"))
+			if response.Code != http.StatusOK || response.Body.String() != "single file\n" {
+				t.Fatalf("file = %d %q", response.Code, response.Body.String())
+			}
+			r, err := openArchive(filename, bytes.NewReader(data), "cargo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = r.Close() }()
+			files, err := r.List()
+			if err != nil || len(files) != 1 || files[0].Path != "README.md" {
+				t.Fatalf("diff reader listing = %+v, %v", files, err)
+			}
+		})
 	}
 }
 
