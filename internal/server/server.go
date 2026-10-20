@@ -385,6 +385,7 @@ func (s *Server) serve(listener net.Listener) error {
 		s.logger.Warn(warning)
 	}
 	go s.updateCacheStatsMetrics()
+	go backfillMetadataAccess(bgCtx, s.db, s.logger, metadataBackfillBatch)
 	go s.startEvictionLoop(bgCtx)
 	go s.startRetentionLoop(bgCtx)
 	go s.startReclaimLoop(bgCtx)

@@ -526,13 +526,16 @@ const queuePendingDeleteQuery = `
 	ON CONFLICT(path) DO UPDATE SET queued_at = excluded.queued_at`
 
 // GetDuePendingDeletes returns up to limit paths queued before cutoff, oldest
-// first. A path a record points at again is skipped.
+// first. A path a record points at again is skipped: a metadata document is
+// stored at a path fixed by its key, so one fetched again after eviction
+// reuses the path queued for it.
 func (db *DB) GetDuePendingDeletes(cutoff time.Time, limit int) ([]string, error) {
 	var paths []string
 	query := db.Rebind(`
 		SELECT path FROM pending_deletes
 		WHERE queued_at < ?
 		  AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.storage_path = pending_deletes.path)
+		  AND NOT EXISTS (SELECT 1 FROM metadata_cache WHERE metadata_cache.storage_path = pending_deletes.path)
 		ORDER BY queued_at
 		LIMIT ?
 	`)
@@ -1127,7 +1130,7 @@ func (db *DB) GetMetadataCache(ecosystem, name string) (*MetadataCacheEntry, err
 	var entry MetadataCacheEntry
 	query := db.Rebind(`
 		SELECT id, ecosystem, name, storage_path, etag, link, content_type, content_encoding,
-		       content_digest, size, last_modified, fetched_at, created_at, updated_at
+		       content_digest, size, last_modified, fetched_at, last_accessed_at, created_at, updated_at
 		FROM metadata_cache WHERE ecosystem = ? AND name = ?
 	`)
 	err := db.Get(&entry, query, ecosystem, name)
@@ -1156,6 +1159,8 @@ func (db *DB) RefreshMetadataCache(ecosystem, name, digest string, fetchedAt tim
 	return n > 0, err
 }
 
+// UpsertMetadataCache writes entry and marks it accessed now, since a
+// document is stored because a request asked for it.
 func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 	now := time.Now()
 	// fetched_at is a TIMESTAMP without zone on Postgres, and lib/pq reads it
@@ -1170,8 +1175,8 @@ func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 	if db.dialect == DialectPostgres {
 		query = `
 			INSERT INTO metadata_cache (ecosystem, name, storage_path, etag, link, content_type, content_encoding,
-			                            content_digest, size, last_modified, fetched_at, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			                            content_digest, size, last_modified, fetched_at, last_accessed_at, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT(ecosystem, name) DO UPDATE SET
 				storage_path = EXCLUDED.storage_path,
 				etag = EXCLUDED.etag,
@@ -1182,13 +1187,14 @@ func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 				size = EXCLUDED.size,
 				last_modified = EXCLUDED.last_modified,
 				fetched_at = EXCLUDED.fetched_at,
+				last_accessed_at = EXCLUDED.last_accessed_at,
 				updated_at = EXCLUDED.updated_at
 		`
 	} else {
 		query = `
 			INSERT INTO metadata_cache (ecosystem, name, storage_path, etag, link, content_type, content_encoding,
-			                            content_digest, size, last_modified, fetched_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			                            content_digest, size, last_modified, fetched_at, last_accessed_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ecosystem, name) DO UPDATE SET
 				storage_path = excluded.storage_path,
 				etag = excluded.etag,
@@ -1199,13 +1205,14 @@ func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 				size = excluded.size,
 				last_modified = excluded.last_modified,
 				fetched_at = excluded.fetched_at,
+				last_accessed_at = excluded.last_accessed_at,
 				updated_at = excluded.updated_at
 		`
 	}
 
 	_, err := db.Exec(query,
 		entry.Ecosystem, entry.Name, entry.StoragePath, entry.ETag, entry.Link,
-		entry.ContentType, entry.ContentEncoding, entry.ContentDigest, entry.Size, entry.LastModified, fetchedAt, now, now,
+		entry.ContentType, entry.ContentEncoding, entry.ContentDigest, entry.Size, entry.LastModified, fetchedAt, now.UTC(), now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("upserting metadata cache: %w", err)

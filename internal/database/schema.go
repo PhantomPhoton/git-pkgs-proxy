@@ -116,10 +116,14 @@ CREATE TABLE IF NOT EXISTS metadata_cache (
 	size INTEGER,
 	last_modified DATETIME,
 	fetched_at DATETIME,
+	last_accessed_at DATETIME,
 	created_at DATETIME,
 	updated_at DATETIME
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_eco_name ON metadata_cache(ecosystem, name);
+CREATE INDEX IF NOT EXISTS idx_metadata_storage_path ON metadata_cache(storage_path);
+CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache(COALESCE(last_accessed_at, updated_at));
+CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts(COALESCE(last_accessed_at, fetched_at));
 
 CREATE TABLE IF NOT EXISTS metadata_dates (
 	ecosystem TEXT NOT NULL,
@@ -236,10 +240,14 @@ CREATE TABLE IF NOT EXISTS metadata_cache (
 	size BIGINT,
 	last_modified TIMESTAMP,
 	fetched_at TIMESTAMP,
+	last_accessed_at TIMESTAMP,
 	created_at TIMESTAMP,
 	updated_at TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_eco_name ON metadata_cache(ecosystem, name);
+CREATE INDEX IF NOT EXISTS idx_metadata_storage_path ON metadata_cache(storage_path);
+CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache((COALESCE(last_accessed_at, updated_at)) NULLS FIRST);
+CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts((COALESCE(last_accessed_at, fetched_at)) NULLS FIRST);
 
 CREATE TABLE IF NOT EXISTS metadata_dates (
 	ecosystem TEXT NOT NULL,
@@ -411,6 +419,7 @@ var migrations = []migration{
 	{"011_add_metadata_dates", migrateAddMetadataDates},
 	{"012_add_artifact_source", migrateAddArtifactSource},
 	{"013_add_artifact_manifest", migrateAddArtifactManifest},
+	{"014_add_metadata_last_accessed", migrateAddMetadataLastAccessed},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -817,6 +826,40 @@ func migrateAddArtifactManifest(db *DB) error {
 	}
 	if _, err := db.Exec(`ALTER TABLE artifacts ADD COLUMN manifest TEXT`); err != nil {
 		return fmt.Errorf("adding column manifest to artifacts: %w", err)
+	}
+	return nil
+}
+
+// migrateAddMetadataLastAccessed records when cached metadata was last served,
+// for size eviction. Existing rows are backfilled in the background
+// (BackfillMetadataLastAccessed), so startup does not wait for them.
+func migrateAddMetadataLastAccessed(db *DB) error {
+	hasCol, err := db.HasColumn("metadata_cache", "last_accessed_at")
+	if err != nil {
+		return fmt.Errorf("checking column last_accessed_at: %w", err)
+	}
+	if !hasCol {
+		ts := sqliteDatetime
+		if db.dialect == DialectPostgres {
+			ts = postgresTimestamp
+		}
+		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE metadata_cache ADD COLUMN last_accessed_at %s", ts)); err != nil {
+			return fmt.Errorf("adding column last_accessed_at to metadata_cache: %w", err)
+		}
+	}
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_metadata_storage_path ON metadata_cache(storage_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache(COALESCE(last_accessed_at, updated_at))`,
+		`CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts(COALESCE(last_accessed_at, fetched_at))`,
+	}
+	if db.dialect == DialectPostgres {
+		indexes[1] = `CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache((COALESCE(last_accessed_at, updated_at)) NULLS FIRST)`
+		indexes[2] = `CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts((COALESCE(last_accessed_at, fetched_at)) NULLS FIRST)`
+	}
+	for _, q := range indexes {
+		if _, err := db.Exec(q); err != nil {
+			return fmt.Errorf("indexing metadata_cache: %w", err)
+		}
 	}
 	return nil
 }
