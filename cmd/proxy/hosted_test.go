@@ -12,7 +12,8 @@ import (
 )
 
 type recordedRequest struct {
-	method, path, query, authorization, body string
+	method, path, query, authorization, body, expect string
+	contentLength                                    int64
 }
 
 func hostedTestServer(t *testing.T, status int, response string) (*httptest.Server, *recordedRequest) {
@@ -26,6 +27,8 @@ func hostedTestServer(t *testing.T, status int, response string) (*httptest.Serv
 			query:         r.URL.RawQuery,
 			authorization: r.Header.Get("Authorization"),
 			body:          string(body),
+			expect:        r.Header.Get("Expect"),
+			contentLength: r.ContentLength,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -66,6 +69,9 @@ func TestRunPush(t *testing.T) {
 	const tarballSHA256 = "db4b4d0d1cb480bf9aeea253771c00febe627f236765fa37d6a5614f079a3aa0"
 	if recorded.authorization != "Bearer tok" || recorded.body != "tarball" || recorded.query != "sha256="+tarballSHA256 {
 		t.Errorf("authorization/body/query = %q/%q/%q", recorded.authorization, recorded.body, recorded.query)
+	}
+	if recorded.expect != "100-continue" || recorded.contentLength != int64(len("tarball")) {
+		t.Errorf("expect/content length = %q/%d, want 100-continue and the file size", recorded.expect, recorded.contentLength)
 	}
 	if out := stdout.String(); !strings.Contains(out, "node-20.1.0.tgz") || !strings.Contains(out, "abc123") {
 		t.Errorf("output = %q, want filename and sha256", out)
@@ -172,6 +178,19 @@ func TestRunDeleteOneFile(t *testing.T) {
 	}
 	if out := stdout.String(); out != "deleted generic tools@1.2.0 tool-linux-arm64.tar.gz\n" {
 		t.Errorf("output = %q", out)
+	}
+}
+
+func TestRunDeleteOneFileOnlyForGeneric(t *testing.T) {
+	srv, recorded := hostedTestServer(t, http.StatusNoContent, "")
+
+	err := runDelete([]string{"-url", srv.URL, "npm", "@acme", "widget", "1.0.0"},
+		hostedEnv(map[string]string{"PROXY_HOSTED_TOKEN": "tok"}), io.Discard, srv.Client())
+	if err == nil || !strings.Contains(err.Error(), "only generic files") {
+		t.Errorf("npm delete with a fourth argument error = %v, want a refusal", err)
+	}
+	if recorded.method != "" {
+		t.Errorf("refused delete sent %s %s", recorded.method, recorded.path)
 	}
 }
 

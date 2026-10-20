@@ -1123,7 +1123,7 @@ hosted:
 4. Check what is pushed: `proxy hosted list npm request` or `GET /api/hosted/npm/request`.
 5. Remove it again: `proxy hosted delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
 
-A pushed file is never replaced: pushing the same version again answers 409. Clients that pinned the file by its hash would otherwise get different bytes under the same version. To push it again, delete it first.
+A pushed file is never replaced: pushing the same version again answers 409, before the body is uploaded when the client sends `Expect: 100-continue` (as `proxy hosted push` does). Clients that pinned the file by its hash would otherwise get different bytes under the same version. To push it again, delete it first.
 
 ### Supported ecosystems
 
@@ -1180,7 +1180,7 @@ They are downloaded without a token from `/generic/hosted/{name}/{version}/{file
 curl -O https://proxy.example.com/generic/hosted/tools/1.2.0/tool-linux-arm64.tar.gz
 ```
 
-Generic files never come from an upstream: anything not pushed answers 404, and `hosted` can't be used as an `upstream.generic` name. `proxy hosted list generic tools` lists all versions and files. `proxy hosted delete generic tools 1.2.0` removes a version with all its files, and `proxy hosted delete generic tools 1.2.0 tool-linux-arm64.tar.gz` removes only that file.
+Generic files never come from an upstream: anything not pushed answers 404. While hosting is enabled, `hosted` can't be used as an `upstream.generic` name. `proxy hosted list generic tools` lists all versions and files. `proxy hosted delete generic tools 1.2.0` removes a version with all its files, and `proxy hosted delete generic tools 1.2.0 tool-linux-arm64.tar.gz` removes only that file.
 
 ### Storage and eviction
 

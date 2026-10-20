@@ -126,7 +126,7 @@ func (h *GenericHandler) Routes() http.Handler {
 		}
 
 		repository, rest, ok := strings.Cut(path, "/")
-		if repository == HostedGenericRepository {
+		if repository == HostedGenericRepository && h.proxy.HostedEnabled {
 			h.handleHosted(w, r, rest)
 			return
 		}
@@ -146,14 +146,14 @@ func (h *GenericHandler) Routes() http.Handler {
 }
 
 // HostedGenericRepository is the /generic/{name}/ path that serves pushed
-// generic files instead of an upstream. upstream.generic can't use the name.
+// generic files instead of an upstream while hosted packages are enabled.
 const HostedGenericRepository = config.HostedGenericRepository
 
 // handleHosted serves a pushed file at {name}/{version}/{file}. Pushed files
 // never come from an upstream, so anything not pushed is a 404.
 func (h *GenericHandler) handleHosted(w http.ResponseWriter, r *http.Request, path string) {
 	segments := strings.Split(path, "/")
-	if !h.proxy.HostedEnabled || len(segments) != hostedGenericPathSegments {
+	if len(segments) != hostedGenericPathSegments {
 		http.NotFound(w, r)
 		return
 	}

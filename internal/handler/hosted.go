@@ -75,6 +75,10 @@ type hostedEcosystem struct {
 	// path is unambiguous.
 	filename func(name, version string) string
 
+	// multiFile is set when a version can hold several files. Such versions
+	// get no version-level integrity, which could only describe one of them.
+	multiFile bool
+
 	// readManifest reads the package manifest out of a pushed archive and
 	// checks that it describes target. When nil, pushes carry no manifest.
 	readManifest func(archive io.Reader, target HostedTarget) (json.RawMessage, error)
@@ -111,6 +115,7 @@ var hostedEcosystems = map[string]hostedEcosystem{
 	// come from an upstream.
 	genericEcosystem: {
 		validName: func(segments []string) bool { return len(segments) == 1 },
+		multiFile: true,
 	},
 }
 
@@ -181,14 +186,11 @@ func validHostedSegment(s string) bool {
 // manifests, the archive's manifest must name target; it is kept so the
 // ecosystem's metadata can list the version with its dependencies.
 func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target HostedTarget, body io.Reader, contentType, wantSHA256 string) (HostedArtifact, error) {
-	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, target.Name, target.Version)
-	if err != nil {
+	if err := p.CheckPush(ecosystem, target); err != nil {
 		return HostedArtifact{}, err
 	}
-	if p.versionDenied(ecosystem, target.Name, target.Version) {
-		return HostedArtifact{}, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
-	}
-	if err := p.checkNotPushed(versionPURL, target.Filename); err != nil {
+	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, target.Name, target.Version)
+	if err != nil {
 		return HostedArtifact{}, err
 	}
 
@@ -217,13 +219,6 @@ func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target 
 		return HostedArtifact{}, err
 	}
 
-	// A concurrent push of the same file may have finished while this one
-	// was being stored and checked.
-	if err := p.checkNotPushed(versionPURL, target.Filename); err != nil {
-		p.discardStored(ctx, push.storagePath)
-		return HostedArtifact{}, err
-	}
-
 	push.pushedAt = time.Now()
 	if err := p.recordLocalArtifact(ecosystem, target, pkgPURL, versionPURL, push); err != nil {
 		p.discardStored(ctx, push.storagePath)
@@ -239,10 +234,19 @@ func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target 
 	}, nil
 }
 
-// checkNotPushed refuses a push of a file that was already pushed. A cached
-// upstream copy under the same name is fine to replace.
-func (p *Proxy) checkNotPushed(versionPURL, filename string) error {
-	record, err := p.DB.GetArtifact(versionPURL, filename)
+// CheckPush refuses a push of a denied version or of a file that was already
+// pushed, before any bytes are read, so a client can be told without
+// uploading the file. A cached upstream copy under the same name is fine to
+// replace. Recording the push checks again atomically, for concurrent pushes.
+func (p *Proxy) CheckPush(ecosystem string, target HostedTarget) error {
+	_, versionPURL, err := packagePURLStrings(ecosystem, target.Name, target.Version)
+	if err != nil {
+		return err
+	}
+	if p.versionDenied(ecosystem, target.Name, target.Version) {
+		return fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
+	}
+	record, err := p.DB.GetArtifact(versionPURL, target.Filename)
 	if err != nil {
 		return fmt.Errorf("checking existing artifact: %w", err)
 	}
@@ -287,45 +291,38 @@ func (p *Proxy) discardStored(ctx context.Context, storagePath string) {
 	}
 }
 
-// recordLocalArtifact writes the package, version and artifact records. The
-// version's integrity is set to the pushed bytes, so the cache's integrity
-// check verifies them rather than an upstream archive's digest. An existing
-// package record is kept as it is, since it may describe the upstream package.
+// recordLocalArtifact writes the package, version and artifact records in
+// one transaction. An existing package record is kept as it is, since it may
+// describe the upstream package. For ecosystems with one file per version,
+// the version's integrity is set to the pushed bytes, so the cache's
+// integrity check verifies them rather than an upstream archive's digest.
+// Multi-file versions can't have one integrity, so an existing version record
+// is left alone and each file is checked against its own sha256.
 func (p *Proxy) recordLocalArtifact(ecosystem string, target HostedTarget, pkgPURL, versionPURL string, push storedPush) error {
-	existing, err := p.DB.GetPackageByPURL(pkgPURL)
+	oneFilePerVersion := !hostedEcosystems[ecosystem].multiFile
+	err := p.DB.RecordLocalArtifact(
+		&database.Package{PURL: pkgPURL, Ecosystem: ecosystem, Name: target.Name},
+		&database.Version{
+			PURL:        versionPURL,
+			PackagePURL: pkgPURL,
+			Integrity:   sql.NullString{String: push.integrity, Valid: oneFilePerVersion},
+		},
+		oneFilePerVersion,
+		&database.Artifact{
+			VersionPURL: versionPURL,
+			Filename:    target.Filename,
+			StoragePath: sql.NullString{String: push.storagePath, Valid: true},
+			ContentHash: sql.NullString{String: push.sha256, Valid: true},
+			Size:        sql.NullInt64{Int64: push.size, Valid: true},
+			ContentType: sql.NullString{String: push.contentType, Valid: push.contentType != ""},
+			FetchedAt:   sql.NullTime{Time: push.pushedAt, Valid: true},
+			Manifest:    sql.NullString{String: string(push.manifest), Valid: push.manifest != nil},
+		})
+	if errors.Is(err, database.ErrLocalArtifactExists) {
+		return ErrHostedExists
+	}
 	if err != nil {
-		return fmt.Errorf("reading package: %w", err)
-	}
-	if existing == nil {
-		if err := p.DB.UpsertPackage(&database.Package{PURL: pkgPURL, Ecosystem: ecosystem, Name: target.Name}); err != nil {
-			return fmt.Errorf("upserting package: %w", err)
-		}
-	}
-
-	// Ecosystems that name the file in the push path hold several files per
-	// version, and the version's integrity can only describe one of them.
-	// Their files are checked against their own sha256 instead.
-	oneFilePerVersion := hostedEcosystems[ecosystem].filename != nil
-	if err := p.DB.UpsertVersion(&database.Version{
-		PURL:        versionPURL,
-		PackagePURL: pkgPURL,
-		Integrity:   sql.NullString{String: push.integrity, Valid: oneFilePerVersion},
-	}); err != nil {
-		return fmt.Errorf("upserting version: %w", err)
-	}
-
-	if err := p.DB.UpsertArtifact(&database.Artifact{
-		VersionPURL: versionPURL,
-		Filename:    target.Filename,
-		StoragePath: sql.NullString{String: push.storagePath, Valid: true},
-		ContentHash: sql.NullString{String: push.sha256, Valid: true},
-		Size:        sql.NullInt64{Int64: push.size, Valid: true},
-		ContentType: sql.NullString{String: push.contentType, Valid: push.contentType != ""},
-		FetchedAt:   sql.NullTime{Time: push.pushedAt, Valid: true},
-		Source:      database.SourceLocal,
-		Manifest:    sql.NullString{String: string(push.manifest), Valid: push.manifest != nil},
-	}); err != nil {
-		return fmt.Errorf("upserting artifact: %w", err)
+		return fmt.Errorf("recording pushed artifact: %w", err)
 	}
 	return nil
 }

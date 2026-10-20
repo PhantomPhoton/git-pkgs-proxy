@@ -88,6 +88,13 @@ func (h *HostedAPIHandler) HandlePush(w http.ResponseWriter, r *http.Request) {
 	}
 	ecosystem := path.ecosystem
 
+	// Refuse before reading the body, so a client sending
+	// "Expect: 100-continue" isn't made to upload a file that is refused.
+	if err := h.proxy.CheckPush(ecosystem, target); err != nil {
+		h.pushError(w, err)
+		return
+	}
+
 	body := bufio.NewReader(http.MaxBytesReader(w, r.Body, h.maxUploadBytes))
 	if _, err := body.Peek(1); errors.Is(err, io.EOF) {
 		badRequest(w, "request body is empty")

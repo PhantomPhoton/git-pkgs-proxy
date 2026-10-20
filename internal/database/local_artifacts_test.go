@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -292,6 +293,94 @@ func TestUpsertPackageKeepsSource(t *testing.T) {
 		}
 		if got.Source.String != "deps.dev" {
 			t.Errorf("source after upsert = %q, want deps.dev", got.Source.String)
+		}
+	})
+}
+
+func localPush(versionPURL, filename, storagePath string) *Artifact {
+	return &Artifact{
+		VersionPURL: versionPURL,
+		Filename:    filename,
+		StoragePath: sql.NullString{String: storagePath, Valid: true},
+		ContentHash: sql.NullString{String: storagePath, Valid: true},
+		Size:        sql.NullInt64{Int64: 1, Valid: true},
+		FetchedAt:   sql.NullTime{Time: time.Now(), Valid: true},
+	}
+}
+
+func TestRecordLocalArtifactNeverReplacesAPush(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		pkg := &Package{PURL: "pkg:npm/request", Ecosystem: "npm", Name: "request"}
+		version := func(integrity string) *Version {
+			return &Version{PURL: "pkg:npm/request@1.0.0", PackagePURL: pkg.PURL,
+				Integrity: sql.NullString{String: integrity, Valid: true}}
+		}
+
+		first := localPush("pkg:npm/request@1.0.0", "request-1.0.0.tgz", "npm/request/first")
+		if err := db.RecordLocalArtifact(pkg, version("sha512-first"), true, first); err != nil {
+			t.Fatalf("first RecordLocalArtifact: %v", err)
+		}
+		second := localPush("pkg:npm/request@1.0.0", "request-1.0.0.tgz", "npm/request/second")
+		if err := db.RecordLocalArtifact(pkg, version("sha512-second"), true, second); !errors.Is(err, ErrLocalArtifactExists) {
+			t.Fatalf("second RecordLocalArtifact error = %v, want ErrLocalArtifactExists", err)
+		}
+
+		art, err := db.GetArtifact("pkg:npm/request@1.0.0", "request-1.0.0.tgz")
+		if err != nil || art == nil || art.StoragePath.String != "npm/request/first" || art.Source != SourceLocal {
+			t.Fatalf("artifact after refused push = %+v, %v, want the first push", art, err)
+		}
+		v, err := db.GetVersionByPURL("pkg:npm/request@1.0.0")
+		if err != nil || v == nil || v.Integrity.String != "sha512-first" {
+			t.Errorf("version integrity after refused push = %+v, %v, want the first push's", v, err)
+		}
+		var queued int
+		if err := db.Get(&queued, db.Rebind(`SELECT COUNT(*) FROM pending_deletes`)); err != nil || queued != 0 {
+			t.Errorf("queued deletes = %d, %v, want none", queued, err)
+		}
+	})
+}
+
+func TestRecordLocalArtifactReplacesUpstreamCopy(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		seedSourcedArtifact(t, db, "request", SourceUpstream, 100, time.Now())
+		pkg := &Package{PURL: "pkg:npm/request", Ecosystem: "npm", Name: "request"}
+		v := &Version{PURL: "pkg:npm/request@1.0.0", PackagePURL: pkg.PURL}
+
+		pushed := localPush("pkg:npm/request@1.0.0", "request-1.0.0.tgz", "npm/request/pushed")
+		if err := db.RecordLocalArtifact(pkg, v, true, pushed); err != nil {
+			t.Fatalf("RecordLocalArtifact: %v", err)
+		}
+		art, err := db.GetArtifact("pkg:npm/request@1.0.0", "request-1.0.0.tgz")
+		if err != nil || art == nil || art.Source != SourceLocal || art.StoragePath.String != "npm/request/pushed" {
+			t.Fatalf("artifact = %+v, %v, want the push", art, err)
+		}
+		const upstreamPath = "npm/request/1.0.0/request-1.0.0.tgz"
+		var queued int
+		if err := db.Get(&queued, db.Rebind(`SELECT COUNT(*) FROM pending_deletes WHERE path = ?`), upstreamPath); err != nil || queued != 1 {
+			t.Errorf("queued deletes for the upstream copy = %d, %v, want 1", queued, err)
+		}
+	})
+}
+
+func TestRecordLocalArtifactCanKeepTheVersionRecord(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		pkg := &Package{PURL: "pkg:generic/tools", Ecosystem: "generic", Name: "tools"}
+		if err := db.UpsertPackage(pkg); err != nil {
+			t.Fatalf("UpsertPackage: %v", err)
+		}
+		if err := db.UpsertVersion(&Version{PURL: "pkg:generic/tools@1.2.0", PackagePURL: pkg.PURL,
+			License:   sql.NullString{String: "MIT", Valid: true},
+			Integrity: sql.NullString{String: "sha256-upstream", Valid: true}}); err != nil {
+			t.Fatalf("UpsertVersion: %v", err)
+		}
+
+		pushed := localPush("pkg:generic/tools@1.2.0", "tool.tar.gz", "generic/tools/pushed")
+		if err := db.RecordLocalArtifact(pkg, &Version{PURL: "pkg:generic/tools@1.2.0", PackagePURL: pkg.PURL}, false, pushed); err != nil {
+			t.Fatalf("RecordLocalArtifact: %v", err)
+		}
+		v, err := db.GetVersionByPURL("pkg:generic/tools@1.2.0")
+		if err != nil || v == nil || v.Integrity.String != "sha256-upstream" || v.License.String != "MIT" {
+			t.Errorf("version after push = %+v, %v, want it unchanged", v, err)
 		}
 	})
 }

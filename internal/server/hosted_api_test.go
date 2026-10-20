@@ -482,3 +482,27 @@ func TestHostedGenericFileIsServedByTheRunningServer(t *testing.T) {
 		t.Errorf("download status = %d, body %q", resp.StatusCode, body)
 	}
 }
+
+// unreadBody fails the test if the handler reads it.
+type unreadBody struct{ t *testing.T }
+
+func (b unreadBody) Read([]byte) (int, error) {
+	b.t.Error("body of a refused push was read")
+	return 0, io.EOF
+}
+
+func TestHostedRepushIsRefusedBeforeTheBodyIsRead(t *testing.T) {
+	s := newHostedTestServer(t)
+	const target = "/api/hosted/generic/tools/1.2.0/tool.tar.gz"
+	if rec := s.do(t, http.MethodPut, target, testHostedToken, "first"); rec.Code != http.StatusCreated {
+		t.Fatalf("first PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, target, unreadBody{t})
+	req.Header.Set("Authorization", "Bearer "+testHostedToken)
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second PUT status = %d, want 409, body %s", rec.Code, rec.Body)
+	}
+}

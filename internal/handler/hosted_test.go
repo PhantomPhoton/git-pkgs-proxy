@@ -7,8 +7,10 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/git-pkgs/proxy/internal/database"
@@ -434,5 +436,56 @@ func TestComposerManifestLookup(t *testing.T) {
 				t.Errorf("readHostedManifest error = %v, want %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestConcurrentPushesOfTheSameFileHaveOneWinner(t *testing.T) {
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	target, err := HostedTargetFor("generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil {
+		t.Fatalf("HostedTargetFor: %v", err)
+	}
+
+	const pushes = 8
+	start := make(chan struct{})
+	results := make([]error, pushes)
+	pushed := make([]HostedArtifact, pushes)
+	var wg sync.WaitGroup
+	for i := range pushes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			body := strings.NewReader(fmt.Sprintf("build %d", i))
+			pushed[i], results[i] = proxy.PushLocalArtifact(context.Background(), "generic", target, body, "", "")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	winner := -1
+	for i, err := range results {
+		switch {
+		case err == nil && winner >= 0:
+			t.Fatalf("pushes %d and %d both succeeded", winner, i)
+		case err == nil:
+			winner = i
+		case !errors.Is(err, ErrHostedExists):
+			t.Fatalf("push %d error = %v, want ErrHostedExists", i, err)
+		}
+	}
+	if winner < 0 {
+		t.Fatal("no push succeeded")
+	}
+
+	result, err := proxy.GetLocalArtifact(context.Background(), "generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil || result == nil {
+		t.Fatalf("GetLocalArtifact = %v, %v", result, err)
+	}
+	served, _ := io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if string(served) != fmt.Sprintf("build %d", winner) {
+		t.Errorf("served %q, want the winning push %q", served, fmt.Sprintf("build %d", winner))
 	}
 }

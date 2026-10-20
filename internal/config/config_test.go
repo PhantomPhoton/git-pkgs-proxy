@@ -1456,13 +1456,6 @@ func TestValidateNamedUpstreams(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "generic upstream name reserved for pushed files",
-			modify: func(cfg *Config) {
-				cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
-			},
-			wantErr: true,
-		},
-		{
 			name: "generic artifact patterns",
 			modify: func(cfg *Config) {
 				cfg.Upstream.Generic = map[string]string{"apache": "https://archive.apache.org"}
@@ -1890,5 +1883,21 @@ func TestMavenRepositoryNames(t *testing.T) {
 	cfg.Upstream.MavenRepositories = map[string]string{"grails": "not a url"}
 	if err := cfg.Validate(); err == nil {
 		t.Error("maven_repositories with an invalid URL: want an error")
+	}
+}
+
+func TestGenericUpstreamNamedHosted(t *testing.T) {
+	cfg := Default()
+	cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("upstream.generic named hosted with hosting off: %v, want it accepted", err)
+	}
+
+	cfg = Default()
+	cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
+	cfg.Hosted.Enabled = true
+	cfg.Hosted.Token = "secret"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("upstream.generic named hosted with hosting on: %v, want it refused", err)
 	}
 }
