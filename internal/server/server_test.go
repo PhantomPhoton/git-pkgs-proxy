@@ -764,6 +764,7 @@ func TestStaticFiles(t *testing.T) {
 		{"/ui/static/vendor/diff2html-ui.min.js", []string{"text/javascript", "application/javascript"}},
 		{"/ui/static/vendor/diff2html.min.css", []string{"text/css"}},
 		{"/ui/static/style.css", []string{"text/css"}},
+		{"/ui/static/cache-delete.js", []string{"text/javascript", "application/javascript"}},
 	}
 
 	for _, tc := range tests {
