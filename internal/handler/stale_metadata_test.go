@@ -91,6 +91,48 @@ func TestNPMMetadataAfterUpstreamAnswer(t *testing.T) {
 	}
 }
 
+// With a denylist entry for the package, version requests read the filtered
+// packument through handleFilteredNPMVersionMetadata.
+func TestNPMFilteredVersionMetadataAfterUpstreamAnswer(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		wantStatus int
+		wantStale  bool
+	}{
+		{name: "upstream error", status: http.StatusServiceUnavailable, wantStatus: http.StatusOK, wantStale: true},
+		{name: "unpublished", status: http.StatusNotFound, wantStatus: http.StatusNotFound},
+		{name: "credentials rejected", status: http.StatusUnauthorized, wantStatus: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := npmUpstreamThen(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(tt.status) })
+			proxy, _, _, _ := setupTestProxy(t)
+			proxy.CacheMetadata = true
+			proxy.MetadataTTL = time.Millisecond
+			proxy.HTTPClient = upstream.Client()
+			setTestDenylist(t, proxy, "pkg:npm/left-pad@2.0.0")
+			h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL+"/").Routes()
+
+			first := httptest.NewRecorder()
+			h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/left-pad", nil))
+			if first.Code != http.StatusOK {
+				t.Fatalf("first request: status = %d", first.Code)
+			}
+			time.Sleep(5 * time.Millisecond)
+
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/left-pad/1.0.0", nil))
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d, body %s", w.Code, tt.wantStatus, w.Body)
+			}
+			if stale := w.Header().Get("Warning") == staleWarning; stale != tt.wantStale {
+				t.Errorf("Warning = %q, want stale %v", w.Header().Get("Warning"), tt.wantStale)
+			}
+		})
+	}
+}
+
 func TestProxyCachedPassesDefiniteAnswersThrough(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
