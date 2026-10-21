@@ -212,6 +212,14 @@ Add PyPI registry support
 - Add tests for wheel and sdist downloads
 ```
 
+## Releases
+
+A patch release is cut on the 1st of each month by `.github/workflows/monthly-release.yml` when `main` is green and something has merged since the last tag. It is skipped if a pull request labelled `breaking` was merged since then: label pull requests that change behaviour users rely on, and release those as a new minor version by hand.
+
+Scheduled runs only report what they would release until the repository variable `MONTHLY_RELEASE` is set to `true`. The workflow can also be started by hand from the Actions tab, as a dry run by default.
+
+To release by hand, push a `v*` tag.
+
 ## Questions?
 
 Open an issue on GitHub if you have questions or need help getting started.

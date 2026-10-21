@@ -1,0 +1,109 @@
+name: Monthly patch release
+
+# Cuts a patch release on the 1st of each month when main is green and
+# something has merged since the last release. Scheduled runs only report
+# what they would do until the repository variable MONTHLY_RELEASE is "true".
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only report what would be released
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: monthly-release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      checks: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide whether to release
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          ENABLED: ${{ vars.MONTHLY_RELEASE }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            dry_run=$INPUT_DRY_RUN
+          elif [ "$ENABLED" = true ]; then
+            dry_run=false
+          else
+            dry_run=true
+          fi
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+
+          sha=$(git rev-parse HEAD)
+          last=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-*')
+          merged=$(git rev-list --count "$last..$sha")
+          if [ "$merged" -eq 0 ]; then
+            echo "Nothing merged since $last"
+            exit 0
+          fi
+
+          # Every check on main's HEAD must have finished green. This run
+          # shows up as a check on the same commit, so it is left out.
+          bad=$(gh api --paginate "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+            --jq ".check_runs[]
+                  | select(.html_url | contains(\"/actions/runs/$GITHUB_RUN_ID/\") | not)
+                  | select(.status != \"completed\"
+                           or (.conclusion | IN(\"success\", \"skipped\", \"neutral\") | not))
+                  | .name")
+          if [ -n "$bad" ]; then
+            echo "::warning::main ($sha) is not green, skipping: $(echo "$bad" | sort -u | paste -sd, -)"
+            exit 0
+          fi
+
+          since=$(git log -1 --format=%cI "$last")
+          breaking=$(gh pr list -R "$REPO" --state merged --base main \
+            --search "merged:>$since label:breaking" --json number --jq '.[].number')
+          if [ -n "$breaking" ]; then
+            echo "::warning::breaking changes merged since $last (#$(echo "$breaking" | paste -sd, - | sed 's/,/, #/g')), release a new minor version by hand"
+            exit 0
+          fi
+
+          IFS=. read -r major minor patch <<<"${last#v}"
+          tag="v$major.$minor.$((patch + 1))"
+          echo "$merged commits since $last, next release $tag at $sha"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # A tag pushed with GITHUB_TOKEN doesn't start other workflows, so the
+      # release workflows are dispatched on the new tag instead.
+      - name: Tag and start the release workflows
+        if: steps.plan.outputs.tag != ''
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ steps.plan.outputs.sha }}
+          DRY_RUN: ${{ steps.plan.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = true ]; then
+            echo "Dry run: would tag $TAG at $SHA and start release.yml and publish.yml"
+            exit 0
+          fi
+          gh api "repos/$REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" >/dev/null
+          gh workflow run release.yml -R "$REPO" --ref "$TAG"
+          gh workflow run publish.yml -R "$REPO" --ref "$TAG"
+          echo "Tagged $TAG at $SHA"
