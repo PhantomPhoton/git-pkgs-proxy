@@ -1123,7 +1123,7 @@ hosted:
 4. Check what is pushed: `proxy hosted list npm request` or `GET /api/hosted/npm/request`.
 5. Remove it again: `proxy hosted delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
 
-A pushed file is never replaced: pushing the same version again answers 409, before the body is uploaded when the client sends `Expect: 100-continue` (as `proxy hosted push` does). Clients that pinned the file by its hash would otherwise get different bytes under the same version. To push it again, delete it first.
+A pushed file is never replaced: pushing the same version again answers 409, also under a differently cased Composer name, before the body is uploaded when the client sends `Expect: 100-continue` (as `proxy hosted push` does). Clients that pinned the file by its hash would otherwise get different bytes under the same version. To push it again, delete it first.
 
 ### Supported ecosystems
 

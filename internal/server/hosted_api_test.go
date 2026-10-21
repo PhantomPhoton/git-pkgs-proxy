@@ -386,6 +386,22 @@ func TestHostedRepushIsRefused(t *testing.T) {
 	}
 }
 
+func TestHostedComposerRepushUnderAnotherCaseIsRefused(t *testing.T) {
+	s := newHostedTestServer(t)
+	original := composerZip(`{"name":"acme/private","description":"first"}`)
+	if rec := s.do(t, http.MethodPut, "/api/hosted/composer/acme/private/1.0.0", testHostedToken, original); rec.Code != http.StatusCreated {
+		t.Fatalf("first PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := s.do(t, http.MethodPut, "/api/hosted/composer/acme/Private/1.0.0", testHostedToken,
+		composerZip(`{"name":"acme/private","description":"second"}`)); rec.Code != http.StatusConflict {
+		t.Fatalf("PUT of acme/Private status = %d, want 409, body %s", rec.Code, rec.Body)
+	}
+	rec := s.do(t, http.MethodGet, "/composer/files/acme/private/1.0.0/private-1.0.0.zip", "", "")
+	if rec.Code != http.StatusOK || rec.Body.String() != original {
+		t.Fatalf("download status = %d, want 200 and the first archive", rec.Code)
+	}
+}
+
 func TestHostedPushWithMatchingSHA256(t *testing.T) {
 	s := newHostedTestServer(t)
 	digest := sha256.Sum256([]byte(requestTarball))

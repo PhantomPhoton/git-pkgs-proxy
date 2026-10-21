@@ -420,6 +420,57 @@ func TestRecordLocalArtifactConcurrentPushesHaveOneWinner(t *testing.T) {
 	})
 }
 
+// Aliases of one name, such as Composer names differing in case, share the
+// version record and its integrity, so only one of them may be pushed.
+func TestRecordLocalArtifactOneFilePerVersionRefusesAliases(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		pkg := &Package{PURL: "pkg:composer/acme/private", Ecosystem: "composer", Name: "acme/private"}
+		const pushes = 8
+		start := make(chan struct{})
+		errs := make([]error, pushes)
+		var wg sync.WaitGroup
+		for i := range pushes {
+			wg.Go(func() {
+				<-start
+				v := &Version{PURL: "pkg:composer/acme/private@1.0.0", PackagePURL: pkg.PURL,
+					Integrity: sql.NullString{String: fmt.Sprintf("sha512-push-%d", i), Valid: true}}
+				a := localPush("pkg:composer/acme/private@1.0.0", fmt.Sprintf("alias-%d-1.0.0.zip", i),
+					fmt.Sprintf("composer/acme/private/push-%d", i))
+				errs[i] = db.RecordLocalArtifact(pkg, v, true, a)
+			})
+		}
+		close(start)
+		wg.Wait()
+
+		winner := -1
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				if winner >= 0 {
+					t.Errorf("pushes %d and %d both succeeded, want exactly 1", winner, i)
+				}
+				winner = i
+			case !errors.Is(err, ErrLocalArtifactExists):
+				t.Errorf("push %d error = %v, want ErrLocalArtifactExists", i, err)
+			}
+		}
+		if winner < 0 {
+			t.Fatal("no push succeeded")
+		}
+		artifacts, err := db.GetArtifactsByVersionPURL("pkg:composer/acme/private@1.0.0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(artifacts) != 1 || artifacts[0].Filename != fmt.Sprintf("alias-%d-1.0.0.zip", winner) {
+			t.Errorf("artifacts = %+v, want only push %d", artifacts, winner)
+		}
+		v, err := db.GetVersionByPURL("pkg:composer/acme/private@1.0.0")
+		if err != nil || v == nil || v.Integrity.String != fmt.Sprintf("sha512-push-%d", winner) {
+			t.Errorf("version = %+v, %v, want the integrity of push %d", v, err, winner)
+		}
+	})
+}
+
 func TestRecordCachedArtifactNeverReplacesAPush(t *testing.T) {
 	runWithBothDatabases(t, func(t *testing.T, db *DB) {
 		pkg := &Package{PURL: "pkg:npm/request", Ecosystem: "npm", Name: "request"}

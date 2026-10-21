@@ -81,9 +81,13 @@ func (db *DB) DeleteLocalArtifacts(versionPURL, filename string) (int, error) {
 // is refused with ErrLocalArtifactExists, so of two concurrent pushes of the
 // same file exactly one wins.
 //
-// When setIntegrity is false, an existing version record is left as it is.
-// Otherwise its integrity is set to v.Integrity.
-func (db *DB) RecordLocalArtifact(pkg *Package, v *Version, setIntegrity bool, a *Artifact) error {
+// When oneFilePerVersion is false, an existing version record is left as it
+// is. Otherwise its integrity is set to v.Integrity, and the push is refused
+// if the version already holds a pushed artifact under any filename, since
+// aliases of one name (Composer's are case-insensitive) share the version
+// record and its integrity. The version upsert locks that record first, so
+// concurrent pushes of aliases see each other.
+func (db *DB) RecordLocalArtifact(pkg *Package, v *Version, oneFilePerVersion bool, a *Artifact) error {
 	local := *a
 	local.Source = SourceLocal
 	return db.recordArtifact(&local, func(tx execer) error {
@@ -96,7 +100,7 @@ func (db *DB) RecordLocalArtifact(pkg *Package, v *Version, setIntegrity bool, a
 			return fmt.Errorf("inserting package: %w", err)
 		}
 		versionConflict := `DO NOTHING`
-		if setIntegrity {
+		if oneFilePerVersion {
 			versionConflict = `DO UPDATE SET integrity = excluded.integrity, updated_at = excluded.updated_at`
 		}
 		if _, err := tx.Exec(db.Rebind(`
@@ -105,6 +109,17 @@ func (db *DB) RecordLocalArtifact(pkg *Package, v *Version, setIntegrity bool, a
 			ON CONFLICT(purl) `+versionConflict,
 		), v.PURL, v.PackagePURL, v.Integrity, now, now); err != nil {
 			return fmt.Errorf("recording version: %w", err)
+		}
+		if oneFilePerVersion {
+			var pushed int
+			if err := tx.Get(&pushed, db.Rebind(`
+				SELECT COUNT(*) FROM artifacts WHERE version_purl = ? AND source = ?
+			`), v.PURL, SourceLocal); err != nil {
+				return fmt.Errorf("checking pushed artifacts: %w", err)
+			}
+			if pushed > 0 {
+				return ErrLocalArtifactExists
+			}
 		}
 		return nil
 	}, ErrLocalArtifactExists)

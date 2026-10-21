@@ -253,8 +253,10 @@ func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target 
 
 // CheckPush refuses a push of a denied version or of a file that was already
 // pushed, before any bytes are read, so a client can be told without
-// uploading the file. A cached upstream copy under the same name is fine to
-// replace. Recording the push checks again atomically, for concurrent pushes.
+// uploading the file. For ecosystems with one file per version, any pushed
+// file of the version counts, so a differently cased alias of the name is
+// refused too. A cached upstream copy is fine to replace. Recording the push
+// checks again atomically, for concurrent pushes.
 func (p *Proxy) CheckPush(ecosystem string, target HostedTarget) error {
 	_, versionPURL, err := packagePURLStrings(ecosystem, target.Name, target.Version)
 	if err != nil {
@@ -263,12 +265,22 @@ func (p *Proxy) CheckPush(ecosystem string, target HostedTarget) error {
 	if p.versionDenied(ecosystem, target.Name, target.Version) {
 		return fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
 	}
-	record, err := p.DB.GetArtifact(versionPURL, target.Filename)
-	if err != nil {
-		return fmt.Errorf("checking existing artifact: %w", err)
+	var existing []database.Artifact
+	if hostedEcosystems[ecosystem].multiFile() {
+		record, err := p.DB.GetArtifact(versionPURL, target.Filename)
+		if err != nil {
+			return fmt.Errorf("checking existing artifact: %w", err)
+		}
+		if record != nil {
+			existing = append(existing, *record)
+		}
+	} else if existing, err = p.DB.GetArtifactsByVersionPURL(versionPURL); err != nil {
+		return fmt.Errorf("checking existing artifacts: %w", err)
 	}
-	if record != nil && record.Source == database.SourceLocal {
-		return ErrHostedExists
+	for _, a := range existing {
+		if a.Source == database.SourceLocal {
+			return ErrHostedExists
+		}
 	}
 	return nil
 }
