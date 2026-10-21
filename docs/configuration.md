@@ -623,6 +623,150 @@ those names unless the shadowing is intended.
 This field has no environment variable, as with the other named upstream maps.
 `PROXY_UPSTREAM_DEBIAN` still sets `upstream.debian`.
 
+### Git repositories
+
+Git servers configured under `upstream.git` are served read-only at
+`/git/{name}/{repo}` over Git's smart HTTP protocol, from bare repositories
+cached on local disk:
+
+```yaml
+upstream:
+  git:
+    github: "https://github.com"
+    wikimedia:
+      url: "https://gerrit.wikimedia.org/r"
+      repos: ["mediawiki/core", "mediawiki/extensions/**"]  # optional allowlist
+
+git:
+  cache_dir: /data/git   # local disk, used by this process only
+  max_size: 50GB         # evict least recently used repositories past this
+  max_repo_size: 5GB     # refuse a repository that grows past this
+  refresh_wait: 5s       # then serve the cached copy if the upstream check is slow
+  stale_max_age: 24h     # never serve a copy not checked for this long
+```
+
+Clients reach the proxy through Git's `insteadOf` setting, which rewrites the
+start of a URL before Git connects. After
+
+```bash
+git config --global url."http://localhost:8080/git/github/".insteadOf https://github.com/
+```
+
+`git clone https://github.com/git-pkgs/purl` fetches from
+`http://localhost:8080/git/github/git-pkgs/purl`, while the clone's remote
+stays `https://github.com/git-pkgs/purl`.
+
+In CI, the same setting can come from environment variables instead of a
+config file (Git 2.31 or newer), next to the variables that point package
+managers at the proxy. Each `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` pair is
+one `git config` setting, and `GIT_CONFIG_COUNT` says how many pairs there are.
+This sends both upstreams from the example above through the proxy:
+
+```bash
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=url.http://localhost:8080/git/github/.insteadOf
+export GIT_CONFIG_VALUE_0=https://github.com/
+export GIT_CONFIG_KEY_1=url.http://localhost:8080/git/wikimedia/.insteadOf
+export GIT_CONFIG_VALUE_1=https://gerrit.wikimedia.org/r/
+```
+
+Every process the job starts inherits these variables, so the rewrite also
+applies when a package manager runs `git` for a Git dependency, as pip,
+Bundler, Composer, SwiftPM, and Go for modules it fetches directly do. Those
+fetches are cached too. npm downloads GitHub dependencies as tarballs over
+HTTPS where it can, without `git`, so the rewrite does not reach them.
+
+`repos` patterns use `path.Match` syntax, where `*` does not cross a `/`; a
+pattern ending in `/**` also matches every repository nested below its
+prefix, so `mediawiki/**` matches `mediawiki/skins/Vector`. An upstream
+without `repos` serves every repository on it, and a repository outside
+`repos` answers 404. When `upstream.auth` has credentials for an upstream,
+`repos` is required: everyone who can reach the proxy can read every
+repository it serves, so list only those they may read. Per-client
+permissions are not supported. `upstream.auth` matches credentials by URL, so
+they are sent by every route to that host, not only `/git`. With a token for
+`https://github.com`, a `generic` upstream at the same URL, such as the one
+the mise setup in the README uses, sends it for any path and checks no
+`repos`, so `/generic/github/acme/private.git/info/refs?service=git-upload-pack`
+would list a private repository's refs to anyone.
+
+Every request for a repository's refs checks the upstream's branches and tags,
+and fetches only when they changed, so a clone right after a push sees the new
+commit. Requests that arrive while a check or fetch is running share it. Only
+branches and tags are cached and served; other refs, such as Gerrit's
+`refs/changes/*`, are left out, and protocol v2 lets the server filter them
+before sending.
+
+A commit a client asks for by object ID that is on no cached branch or tag,
+such as a pull request head fetched by `actions/checkout`, is fetched from the
+upstream when the client asks for it, and kept until a cached branch or tag
+includes it or for 7 days. A commit the upstream could not provide, or could
+not be reached for, is not asked for again for a minute, or for an hour when
+it is larger than what `max_repo_size` leaves. This is off for upstreams that `upstream.auth` has
+credentials for: GitHub serves a commit from any repository in a fork network
+through any other, so a fetch by ID could reach repositories outside `repos`.
+Any commit the cache holds can be fetched by ID, including one a force-push
+left behind, as from the upstream.
+
+If the upstream fails, or its check of branches and tags takes longer than
+`refresh_wait`, a repository checked successfully within `stale_max_age` is
+served from the cache while the refresh continues. Once the check finds new
+commits, the request waits for their fetch, so a clone right after a push gets
+them; if the fetch fails or stalls, the cached copy is served. A
+`stale_max_age` of `0` never serves a copy the upstream has not just
+confirmed. A repository the upstream reports missing (404), refuses (401, 403)
+or redirects is not served from the cache. Redirects are never followed, so
+point the upstream at a repository's current location.
+
+The proxy runs `git` 2.31 or newer, which must be installed (the Docker image includes it).
+The `git` processes never reach the network themselves: their fetches go
+through a loopback endpoint in the proxy that forwards them with the same
+upstream client as every other request, so the address checks
+(`allow_loopback`, `allow_private_hosts`), `upstream.auth` and the access log
+apply, and credentials are never passed to `git`.
+
+`max_repo_size` defaults to 5GB, and `max_size` to no limit. `max_size` also
+caps `max_repo_size`, since a repository larger than the whole cache would be
+evicted as soon as no request was reading it. A clone or fetch that would
+pass `max_repo_size` is stopped, and nothing of it is kept. A new repository
+is then refused for an hour. When a refresh of one already cached does not
+fit, it is served as it is and dropped once no request is reading it, so the
+next request clones it again with only its branches and tags; if that is
+still too large, it is refused for an hour. A commit fetched by ID that does
+not fit is refused, and the repository kept.
+
+`max_size` counts fetches in progress as well as cached repositories, so the
+cache stays within it however many fetches run at once. As a fetch receives
+data, the least recently used repositories are evicted to make room, never
+one a request is reading; those are evicted once released if the cache is
+still over. When evicting every idle repository would not make room, none is
+evicted for the fetch, and it is stopped and nothing of it is kept, but the
+repository is not refused: a clone answers 507, and a refresh serves the
+cached copy, as when the upstream fails. The count is of bytes received, so
+index files and garbage collection can take the cache a little past
+`max_size` until the fetch ends and the repository is measured.
+A transfer that receives nothing for 10 minutes is abandoned. Git's automatic
+garbage collection runs as part of fetches, and files over 8MB are kept
+without delta compression, so one large file does not take a fetch's memory.
+
+Packs for clients are built by at most two `upload-pack` processes per CPU
+the proxy may use, each with one delta-search thread and 64MB of delta
+window, and further clones wait for one to finish; listing refs does not
+wait. An `upload-pack` request is limited to 100MB, before and after gzip.
+
+Repositories are kept under `{cache_dir}/{name}-{hash of the URL}/`, so
+repointing an upstream starts a fresh cache, and the old URL's directory is
+removed at startup. Nothing else in `cache_dir` is touched, and the
+directories of upstreams no longer configured are only logged, so remove
+those yourself. The proxy locks `cache_dir` while it runs, through a
+`.gitcache-lock` file in it, so a second process given the same directory,
+such as another replica on a shared volume, fails to start; give each its own.
+
+Pushing, the dumb HTTP protocol and Git LFS are not supported. The settings
+under `git` can also be set with `PROXY_GIT_CACHE_DIR`, `PROXY_GIT_MAX_SIZE`,
+`PROXY_GIT_MAX_REPO_SIZE`, `PROXY_GIT_REFRESH_WAIT` and
+`PROXY_GIT_STALE_MAX_AGE`.
+
 ### Maven repositories
 
 ```yaml
