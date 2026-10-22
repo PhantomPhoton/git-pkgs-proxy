@@ -72,3 +72,10 @@ func (r packageRoutes) cacheFilename(packageName, filename string) string {
 	}
 	return filename
 }
+
+// RoutedPackageURL returns the upstream URL a route in routes sends
+// packageName to, as the npm and Composer handlers pick it.
+func RoutedPackageURL(routes map[string]string, packageName string) (string, bool) {
+	route, ok := newPackageRoutes(routes).match(packageName)
+	return route.url, ok
+}

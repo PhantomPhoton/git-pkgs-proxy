@@ -76,7 +76,7 @@ func (s *Scheduler) loop(ctx context.Context, index int, schedule Schedule) {
 
 func (s *Scheduler) run(ctx context.Context, index int, schedule Schedule) {
 	started := time.Now()
-	progress, err := s.mirror.Run(ctx, &PURLSource{PURLs: schedule.PURLs, Platforms: schedule.Platforms})
+	progress, err := s.mirror.Run(ctx, &PURLSource{PURLs: schedule.PURLs, Versions: s.mirror.Versions, Platforms: schedule.Platforms})
 	if ctx.Err() != nil {
 		return
 	}
