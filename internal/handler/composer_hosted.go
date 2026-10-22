@@ -99,6 +99,7 @@ func (h *ComposerHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.
 		http.Error(w, "failed to rewrite package metadata", http.StatusBadGateway)
 		return
 	}
+	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, h.proxy.uncachedRewrite("composer", h.proxyURL, cacheKey, out))
 }
 

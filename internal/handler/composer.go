@@ -189,11 +189,13 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 			return // the client left while waiting on a shared rewrite
 		}
 		h.proxy.Logger.Warn("failed to rewrite metadata, proxying original", "error", err)
+		markStale(w, upstream.stale)
 		w.Header().Set(headerContentType, "application/json")
 		_, _ = w.Write(upstream.body)
 		return
 	}
 
+	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, rewritten)
 }
 

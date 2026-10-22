@@ -1197,6 +1197,17 @@ func JSONError(w http.ResponseWriter, status int, message string) {
 	_, _ = fmt.Fprintf(w, `{"error":%q}`, message)
 }
 
+// staleWarning marks a response served from the metadata cache because the
+// upstream could not be reached.
+const staleWarning = `110 - "Response is Stale"`
+
+// markStale sets the stale warning on a metadata response when stale is set.
+func markStale(w http.ResponseWriter, stale bool) {
+	if stale {
+		w.Header().Set("Warning", staleWarning)
+	}
+}
+
 // ErrUpstreamNotFound indicates the upstream returned 404.
 var ErrUpstreamNotFound = fmt.Errorf("upstream: %w", fetch.ErrNotFound)
 
@@ -1816,9 +1827,7 @@ func (p *Proxy) writeMetadataCachedResponseWithEncoding(w http.ResponseWriter, r
 	if contentEncoding != "" {
 		w.Header().Set(headerContentEncoding, contentEncoding)
 	}
-	if cm.stale {
-		w.Header().Set("Warning", `110 - "Response is Stale"`)
-	}
+	markStale(w, cm.stale)
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(body)

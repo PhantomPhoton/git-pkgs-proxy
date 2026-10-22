@@ -162,6 +162,7 @@ func (h *ChefHandler) serveDocument(w http.ResponseWriter, r *http.Request, docu
 		http.Error(w, "invalid Chef Supermarket response", http.StatusBadGateway)
 		return
 	}
+	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, rewritten)
 }
 
