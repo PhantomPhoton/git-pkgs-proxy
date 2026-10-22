@@ -1385,6 +1385,8 @@ Pushed archives are not touched: a whole-version delete skips them, and naming o
 
 The `proxy mirror` command pre-populates the cache from various sources. It accepts the same storage and database flags as `serve`.
 
+Packages are downloaded from the configured upstreams: npm, cargo, gem, golang, hex, pub, maven and nuget from `upstream.npm`, `upstream.cargo_download`, `upstream.gem`, `upstream.go`, `upstream.hex`, `upstream.pub`, `upstream.maven` and `upstream.nuget`. npm packages in `upstream.npm_routes` come from their route and are cached under the route's keys, so clients get them from the cache as they would after an install. Mirror API jobs do the same.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |

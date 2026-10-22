@@ -234,13 +234,13 @@ func (s *Server) serve(listener net.Listener) error {
 	baseFetcher := fetch.NewFetcher(fetch.WithHTTPClient(artifactClient), fetch.WithMaxArtifactSize(s.cfg.ParseArtifactMaxSize()))
 	fetcher := fetch.NewCircuitBreakerFetcher(baseFetcher)
 	s.breakers = newBreakerMonitor(fetcher, s.logger)
-	resolver := fetch.NewResolver()
 	cd := &cooldown.Config{
 		Default:    s.cfg.Cooldown.Default,
 		Ecosystems: s.cfg.Cooldown.Ecosystems,
 		Packages:   s.cfg.Cooldown.NormalizedPackages(),
 	}
-	proxy := handler.NewProxy(s.db, s.storage, fetcher, resolver, s.logger)
+	proxy := handler.NewProxy(s.db, s.storage, fetcher, nil, s.logger)
+	configureMirrorResolvers(proxy, s.cfg.Upstream)
 	proxy.HTTPClient = metadataClient
 	proxy.RateLimits = s.rateLimits
 	cooldownPolicy, err := cooldown.NewPolicy(cd, s.cfg.Cooldown.PackagePatterns)
@@ -575,7 +575,8 @@ func NewMirrorProxy(cfg *config.Config, db *database.DB, store storage.Storage, 
 	s := &Server{cfg: cfg, db: db, storage: store, logger: logger, ecr: newECRTokens(logger)}
 	metadataClient, artifactClient := s.newUpstreamClients(0)
 	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(artifactClient), fetch.WithMaxArtifactSize(cfg.ParseArtifactMaxSize()))
-	proxy := handler.NewProxy(db, store, fetcher, fetch.NewResolver(), logger)
+	proxy := handler.NewProxy(db, store, fetcher, nil, logger)
+	configureMirrorResolvers(proxy, cfg.Upstream)
 	proxy.HTTPClient = metadataClient
 	proxy.RateLimits = s.rateLimits
 	return proxy, s.newContainerHandler(proxy)
