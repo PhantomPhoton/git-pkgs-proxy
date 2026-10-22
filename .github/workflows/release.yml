@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  # Started by monthly-release.yml on the tag it creates.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,6 +13,7 @@ permissions:
 
 jobs:
   release:
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
 
     steps:
