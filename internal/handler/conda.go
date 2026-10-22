@@ -113,8 +113,11 @@ func (h *CondaHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		"channel", channel, "arch", arch, "name", name, "version", version)
 
 	upstreamURL := h.upstreamURL + r.URL.Path
+	// The same filename can hold different bytes in each subdir, so the
+	// subdir is part of the cache key.
+	cacheFilename := arch + "/" + filename
 
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "conda", packageName, version, filename, upstreamURL)
+	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "conda", packageName, version, cacheFilename, upstreamURL)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return

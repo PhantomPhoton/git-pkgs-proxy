@@ -69,7 +69,7 @@ func condaGet(t *testing.T, url string) {
 	}
 }
 
-// condaArtifact returns the record of the package file named filename.
+// condaArtifact returns the record cached as filename, which is {subdir}/{file}.
 func condaArtifact(t *testing.T, db *database.DB, filename string) database.Artifact {
 	t.Helper()
 	var art database.Artifact
@@ -103,7 +103,7 @@ func TestCondaRegistersForRetention(t *testing.T) {
 func TestCondaRetentionEvictsAndRefetches(t *testing.T) {
 	upstream, downloads := condaRetentionUpstream(t)
 	srv, db := newCondaRetentionProxy(t, upstream)
-	const file = "requests-2.31.0-pyhd8ed1ab_0.conda"
+	const file = "noarch/requests-2.31.0-pyhd8ed1ab_0.conda"
 
 	condaGet(t, srv.URL+condaRequestsPath)
 	condaGet(t, srv.URL+condaRequestsPath)
@@ -162,7 +162,7 @@ func TestCondaRetentionRefusesKeysWithoutChannel(t *testing.T) {
 func TestCondaRetentionPackageRule(t *testing.T) {
 	upstream, _ := condaRetentionUpstream(t)
 	srv, db := newCondaRetentionProxy(t, upstream)
-	const forgeNumpy, anacondaNumpy, requests = "numpy-1.24.0-py311h64a7726_0.conda", "numpy-1.24.0-py311h08b1b3b_0.conda", "requests-2.31.0-pyhd8ed1ab_0.conda"
+	const forgeNumpy, anacondaNumpy, requests = "linux-64/numpy-1.24.0-py311h64a7726_0.conda", "linux-64/numpy-1.24.0-py311h08b1b3b_0.conda", "noarch/requests-2.31.0-pyhd8ed1ab_0.conda"
 	condaGet(t, srv.URL+condaForgeNumpyPath)
 	condaGet(t, srv.URL+condaAnacondaNumpy)
 	condaGet(t, srv.URL+condaRequestsPath)
