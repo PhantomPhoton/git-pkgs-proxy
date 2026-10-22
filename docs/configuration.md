@@ -1220,7 +1220,7 @@ Set to `"0"` to disable the timeout entirely (requests then rely only on the ser
 
 ## Hosted Packages
 
-Operators can push a package archive into the proxy under a name and version. The proxy serves it in place of the upstream archive with the same version, or in addition to the upstream's versions. Use it to ship a patched build of a dependency without running a separate registry.
+Operators can push a package archive into the proxy under a name and version. The proxy serves it in place of the upstream archive with the same version, or in addition to the upstream's versions. Use it to ship a patched build of a dependency without running a separate registry. Files that aren't packages, such as prebuilt binaries other builds download, can be pushed as [generic files](#generic-files).
 
 The `/api/hosted` endpoints are disabled by default. Because a pushed version replaces the upstream one for every client, enabling them requires a token:
 
@@ -1237,7 +1237,7 @@ hosted:
 |--------|-------------|-------------|
 | `hosted.enabled` | `PROXY_HOSTED_ENABLED` | Register the `/api/hosted` endpoints (default `false`) |
 | `hosted.token` | `PROXY_HOSTED_TOKEN` | Bearer token required to push and delete; required when enabled, supports `${VAR}` |
-| `hosted.max_upload_size` | `PROXY_HOSTED_MAX_UPLOAD_SIZE` | Maximum size of one pushed archive (default `100MB`) |
+| `hosted.max_upload_size` | `PROXY_HOSTED_MAX_UPLOAD_SIZE` | Maximum size of one pushed archive or file (default `100MB`) |
 | `hosted.npm_scopes` | `PROXY_HOSTED_NPM_SCOPES` | npm scopes served from pushed packages only (comma-separated in the environment) |
 | `hosted.composer_vendors` | `PROXY_HOSTED_COMPOSER_VENDORS` | Composer vendors served from pushed packages only |
 
@@ -1258,12 +1258,16 @@ hosted:
    ```bash
    curl -X PUT --data-binary @request-2.88.3.tgz \
      -H "Authorization: Bearer $PROXY_HOSTED_TOKEN" \
-     https://proxy.example.com/api/hosted/npm/request/2.88.3
+     "https://proxy.example.com/api/hosted/npm/request/2.88.3?sha256=$(sha256sum request-2.88.3.tgz | cut -d' ' -f1)"
    ```
+
+   The `sha256` query parameter is optional. When it is set, a push whose bytes don't match is refused with 400. `proxy hosted push` always sends it.
 
 3. Install it as usual, e.g. `npm install request@2.88.3`. The version is listed in the package metadata, so ranges like `^2.88.0` resolve to it too.
 4. Check what is pushed: `proxy hosted list npm request` or `GET /api/hosted/npm/request`.
 5. Remove it again: `proxy hosted delete npm request 2.88.3` or `DELETE /api/hosted/npm/request/2.88.3`. If the upstream has the version, clients get the upstream archive again.
+
+A pushed file is never replaced: pushing the same version again answers 409, also under a differently cased Composer name, before the body is uploaded when the client sends `Expect: 100-continue` (as `proxy hosted push` does). Clients that pinned the file by its hash would otherwise get different bytes under the same version. To push it again, delete it first.
 
 ### Supported ecosystems
 
@@ -1273,10 +1277,11 @@ Download handlers look archives up by the filename clients request, so a push is
 |-----------|------|----------|
 | `npm` | `{name}` or `@{scope}/{name}` | `{name}-{version}.tgz`, without the scope |
 | `composer` | `{vendor}/{package}` | `{package}-{version}.zip` |
+| `generic` | `{name}`, one path segment | named in the push path, see [Generic files](#generic-files) |
 
 Other ecosystems are not supported yet.
 
-The archive must contain the package manifest: `package.json` in the top directory of an npm tarball, or `composer.json` at the root or in the single top directory of a Composer zip. Its name, and its version when it has one, must match the push. Otherwise the push is refused with 400.
+npm and Composer archives must contain the package manifest: `package.json` in the top directory of an npm tarball, or `composer.json` at the root or in the single top directory of a Composer zip. Its name, and its version when it has one, must match the push. Otherwise the push is refused with 400.
 
 ### Package metadata
 
@@ -1300,6 +1305,26 @@ For private packages:
 2. List the namespace in `hosted.npm_scopes` or `hosted.composer_vendors`. Its packages are served from pushed versions alone: the upstream is never asked about them, and anything not pushed answers 404.
 
 Other packages, including ones in other scopes and vendors, are proxied as usual.
+
+### Generic files
+
+Files that aren't packages, such as a prebuilt binary that other builds download and check against a pinned sha256, are pushed to the `generic` ecosystem. They have no manifest; the name, version and filename come from the path, and a version can hold several files:
+
+```bash
+proxy hosted push generic tools 1.2.0 ./tool-linux-arm64.tar.gz
+# or
+curl -X PUT --data-binary @tool-linux-arm64.tar.gz \
+  -H "Authorization: Bearer $PROXY_HOSTED_TOKEN" \
+  https://proxy.example.com/api/hosted/generic/tools/1.2.0/tool-linux-arm64.tar.gz
+```
+
+They are downloaded without a token from `/generic/hosted/{name}/{version}/{file}`, with the file's sha256 as `ETag`:
+
+```bash
+curl -O https://proxy.example.com/generic/hosted/tools/1.2.0/tool-linux-arm64.tar.gz
+```
+
+Generic files never come from an upstream: anything not pushed answers 404. While hosting is enabled, `hosted` can't be used as an `upstream.generic` name. `proxy hosted list generic tools` lists all versions and files. `proxy hosted delete generic tools 1.2.0` removes a version with all its files, and `proxy hosted delete generic tools 1.2.0 tool-linux-arm64.tar.gz` removes only that file.
 
 ### Storage and eviction
 

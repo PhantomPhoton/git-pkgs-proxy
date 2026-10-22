@@ -31,27 +31,32 @@ func (db *DB) GetLocalArtifacts(packagePURL string) ([]LocalArtifact, error) {
 	return artifacts, nil
 }
 
-// DeleteLocalArtifacts removes the pushed artifacts of a version and queues
-// their stored objects for deletion in the same transaction, so a failed
-// queue keeps the records instead of orphaning the objects. Artifacts cached
-// from an upstream are left alone. It returns how many records it removed.
-func (db *DB) DeleteLocalArtifacts(versionPURL string) (int, error) {
+// DeleteLocalArtifacts removes the pushed artifacts of a version, or only the
+// one named filename when it is set, and queues their stored objects for
+// deletion in the same transaction, so a failed queue keeps the records
+// instead of orphaning the objects. Artifacts cached from an upstream are left
+// alone. It returns how many records it removed.
+func (db *DB) DeleteLocalArtifacts(versionPURL, filename string) (int, error) {
 	tx, err := db.Beginx()
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	where := "version_purl = ? AND source = 'local'"
+	args := []any{versionPURL}
+	if filename != "" {
+		where += " AND filename = ?"
+		args = append(args, filename)
+	}
+
 	var paths []string
-	selectQuery := db.Rebind(`
-		SELECT storage_path FROM artifacts
-		WHERE version_purl = ? AND source = 'local' AND storage_path IS NOT NULL
-	`)
-	if err := tx.Select(&paths, selectQuery, versionPURL); err != nil {
+	selectQuery := db.Rebind(`SELECT storage_path FROM artifacts WHERE ` + where + ` AND storage_path IS NOT NULL`)
+	if err := tx.Select(&paths, selectQuery, args...); err != nil {
 		return 0, fmt.Errorf("reading local artifacts: %w", err)
 	}
 
-	res, err := tx.Exec(db.Rebind(`DELETE FROM artifacts WHERE version_purl = ? AND source = 'local'`), versionPURL)
+	res, err := tx.Exec(db.Rebind(`DELETE FROM artifacts WHERE `+where), args...)
 	if err != nil {
 		return 0, fmt.Errorf("deleting local artifacts: %w", err)
 	}
@@ -67,4 +72,55 @@ func (db *DB) DeleteLocalArtifacts(versionPURL string) (int, error) {
 		}
 	}
 	return int(deleted), tx.Commit()
+}
+
+// RecordLocalArtifact records a pushed artifact in one transaction: the
+// package if it is missing, the version, and the artifact. An artifact cached
+// from an upstream under the same name is replaced and its stored object
+// queued for deletion; a pushed one is never replaced, and the whole record
+// is refused with ErrLocalArtifactExists, so of two concurrent pushes of the
+// same file exactly one wins.
+//
+// When oneFilePerVersion is false, an existing version record is left as it
+// is. Otherwise its integrity is set to v.Integrity, and the push is refused
+// if the version already holds a pushed artifact under any filename, since
+// aliases of one name (Composer's are case-insensitive) share the version
+// record and its integrity. The version upsert locks that record first, so
+// concurrent pushes of aliases see each other.
+func (db *DB) RecordLocalArtifact(pkg *Package, v *Version, oneFilePerVersion bool, a *Artifact) error {
+	local := *a
+	local.Source = SourceLocal
+	return db.recordArtifact(&local, func(tx execer) error {
+		now := time.Now()
+		if _, err := tx.Exec(db.Rebind(`
+			INSERT INTO packages (purl, ecosystem, name, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(purl) DO NOTHING
+		`), pkg.PURL, pkg.Ecosystem, pkg.Name, now, now); err != nil {
+			return fmt.Errorf("inserting package: %w", err)
+		}
+		versionConflict := `DO NOTHING`
+		if oneFilePerVersion {
+			versionConflict = `DO UPDATE SET integrity = excluded.integrity, updated_at = excluded.updated_at`
+		}
+		if _, err := tx.Exec(db.Rebind(`
+			INSERT INTO versions (purl, package_purl, integrity, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(purl) `+versionConflict,
+		), v.PURL, v.PackagePURL, v.Integrity, now, now); err != nil {
+			return fmt.Errorf("recording version: %w", err)
+		}
+		if oneFilePerVersion {
+			var pushed int
+			if err := tx.Get(&pushed, db.Rebind(`
+				SELECT COUNT(*) FROM artifacts WHERE version_purl = ? AND source = ?
+			`), v.PURL, SourceLocal); err != nil {
+				return fmt.Errorf("checking pushed artifacts: %w", err)
+			}
+			if pushed > 0 {
+				return ErrLocalArtifactExists
+			}
+		}
+		return nil
+	}, ErrLocalArtifactExists)
 }

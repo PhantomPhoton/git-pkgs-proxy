@@ -60,11 +60,11 @@ func newNPMHostedFixture(t *testing.T, upstream map[string]string) npmHostedFixt
 
 func (f npmHostedFixture) push(t *testing.T, name, version, manifest string) HostedArtifact {
 	t.Helper()
-	target, err := HostedTargetFor("npm", name, version)
+	target, err := HostedTargetFor("npm", name, version, "")
 	if err != nil {
 		t.Fatalf("HostedTargetFor: %v", err)
 	}
-	pushed, err := f.proxy.PushLocalArtifact(context.Background(), "npm", target, bytes.NewReader(npmTarball(manifest)), "")
+	pushed, err := f.proxy.PushLocalArtifact(context.Background(), "npm", target, bytes.NewReader(npmTarball(manifest)), "", "")
 	if err != nil {
 		t.Fatalf("PushLocalArtifact: %v", err)
 	}

@@ -26,15 +26,16 @@ const maxManifestSize = 1 << 20
 // readHostedManifest reads the package manifest out of a pushed archive and
 // checks that it describes target. The manifest is what the ecosystem's
 // metadata lists the version with, so its dependencies reach the client.
+// Ecosystems without manifests return nil.
 func readHostedManifest(ecosystem string, archive io.Reader, target HostedTarget) (json.RawMessage, error) {
-	switch ecosystem {
-	case "npm":
-		return readNPMManifest(archive, target)
-	case "composer":
-		return readComposerManifest(archive, target)
-	default:
+	eco, ok := hostedEcosystems[ecosystem]
+	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrHostedUnsupported, ecosystem)
 	}
+	if eco.readManifest == nil {
+		return nil, nil
+	}
+	return eco.readManifest(archive, target)
 }
 
 // readNPMManifest reads package.json from the top directory of an npm

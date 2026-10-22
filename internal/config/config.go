@@ -905,6 +905,11 @@ func (c *Config) validateUpstream() error {
 	return nil
 }
 
+// HostedGenericRepository is the /generic/{name}/ path that serves files
+// pushed through /api/hosted/generic. While hosted packages are enabled, no
+// upstream.generic entry may use it.
+const HostedGenericRepository = "hosted"
+
 // CompileGenericArtifactPattern compiles an upstream.generic_artifacts pattern
 // so that it only matches a whole path, and checks it has the `version` and
 // `file` groups.
@@ -1519,6 +1524,10 @@ func (c *Config) validateComponents() error {
 
 	if err := c.Hosted.Validate(); err != nil {
 		return err
+	}
+	if _, reserved := c.Upstream.Generic[HostedGenericRepository]; reserved && c.Hosted.Enabled {
+		return fmt.Errorf("invalid upstream.generic name %q: reserved for pushed files at /generic/%s/ when hosted.enabled is set",
+			HostedGenericRepository, HostedGenericRepository)
 	}
 
 	if err := c.Mirror.Validate(); err != nil {

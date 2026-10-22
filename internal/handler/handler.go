@@ -642,7 +642,12 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 
 	// Update database
 	if err := p.updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath, sharedArtifact, declared); err != nil {
-		p.Logger.Warn("failed to update cache database", "error", err)
+		if errors.Is(err, database.ErrLocalArtifactExists) {
+			p.Logger.Info("artifact was pushed while it was fetched; keeping the pushed copy",
+				"purl", versionPURL, "filename", filename)
+		} else {
+			p.Logger.Warn("failed to update cache database", "error", err)
+		}
 		// Continue anyway - we have the file. Queue it for deletion in case
 		// no record points at it; the queue skips it while one does.
 		if qErr := p.DB.QueuePendingDelete(storagePath); qErr != nil {
@@ -903,10 +908,6 @@ func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath
 		RegistryURL: sql.NullString{String: upstreamURL, Valid: true},
 		EnrichedAt:  sql.NullTime{Time: now, Valid: true},
 	}
-	if err := p.DB.UpsertPackage(pkg); err != nil {
-		return fmt.Errorf("upserting package: %w", err)
-	}
-
 	// Upsert version
 	ver := &database.Version{
 		PURL:        artifact.PURL,
@@ -914,10 +915,6 @@ func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath
 		Integrity:   sql.NullString{String: declared, Valid: declared != ""},
 		EnrichedAt:  sql.NullTime{Time: now, Valid: true},
 	}
-	if err := p.DB.UpsertVersion(ver); err != nil {
-		return fmt.Errorf("upserting version: %w", err)
-	}
-
 	// Upsert artifact
 	art := &database.Artifact{
 		VersionPURL: artifact.PURL,
@@ -929,10 +926,11 @@ func (p *Proxy) updateCacheDB(ecosystem, name, pkgPURL, upstreamURL, storagePath
 		ContentType: sql.NullString{String: artifact.MediaType, Valid: true},
 		FetchedAt:   sql.NullTime{Time: now, Valid: true},
 	}
-	if err := p.DB.UpsertArtifact(art); err != nil {
-		return fmt.Errorf("upserting artifact: %w", err)
+	// One transaction, so a push that landed while this was fetched keeps
+	// both its artifact and its version's integrity.
+	if err := p.DB.RecordCachedArtifact(pkg, ver, art); err != nil {
+		return fmt.Errorf("recording artifact: %w", err)
 	}
-
 	return nil
 }
 

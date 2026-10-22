@@ -7,13 +7,36 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/registries/fetch"
 )
+
+func TestHostedTargetForFileInPath(t *testing.T) {
+	got, err := HostedTargetFor("generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil || got != (HostedTarget{Name: "tools", Version: "1.2.0", Filename: "tool.tar.gz"}) {
+		t.Errorf("generic target = %+v, %v", got, err)
+	}
+	for _, tt := range []struct{ ecosystem, name, version, file string }{
+		{"generic", "tools", "1.2.0", ""},
+		{"generic", "tools", "1.2.0", ".."},
+		{"generic", "acme/tools", "1.2.0", "tool.tar.gz"},
+		{"npm", "request", "2.88.3", "request-2.88.3.tgz"},
+	} {
+		if _, err := HostedTargetFor(tt.ecosystem, tt.name, tt.version, tt.file); !errors.Is(err, ErrHostedInvalidName) {
+			t.Errorf("HostedTargetFor(%q, %q, %q, %q) error = %v, want ErrHostedInvalidName",
+				tt.ecosystem, tt.name, tt.version, tt.file, err)
+		}
+	}
+	if !HostedFileInPath("generic") || HostedFileInPath("npm") || HostedFileInPath("cargo") {
+		t.Error("HostedFileInPath should hold for generic only")
+	}
+}
 
 func TestHostedTargetFor(t *testing.T) {
 	tests := []struct {
@@ -49,7 +72,7 @@ func TestHostedTargetFor(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version)
+			got, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version, "")
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("HostedTargetFor() error = %v, want %v", err, tt.wantErr)
@@ -114,11 +137,11 @@ var pushedTarball = string(npmTarball(requestManifest))
 
 func pushRequest(t *testing.T, proxy *Proxy) HostedArtifact {
 	t.Helper()
-	target, err := HostedTargetFor("npm", "request", "2.88.3")
+	target, err := HostedTargetFor("npm", "request", "2.88.3", "")
 	if err != nil {
 		t.Fatalf("HostedTargetFor: %v", err)
 	}
-	pushed, err := proxy.PushLocalArtifact(context.Background(), "npm", target, strings.NewReader(pushedTarball), "application/gzip")
+	pushed, err := proxy.PushLocalArtifact(context.Background(), "npm", target, strings.NewReader(pushedTarball), "application/gzip", "")
 	if err != nil {
 		t.Fatalf("PushLocalArtifact: %v", err)
 	}
@@ -290,11 +313,11 @@ func TestPushLocalArtifactChecksManifest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			proxy, _, store, _ := setupTestProxy(t)
-			target, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version)
+			target, err := HostedTargetFor(tt.ecosystem, tt.pkg, tt.version, "")
 			if err != nil {
 				t.Fatalf("HostedTargetFor: %v", err)
 			}
-			_, err = proxy.PushLocalArtifact(context.Background(), tt.ecosystem, target, bytes.NewReader(tt.archive), "")
+			_, err = proxy.PushLocalArtifact(context.Background(), tt.ecosystem, target, bytes.NewReader(tt.archive), "", "")
 			if tt.wantErr == nil {
 				if err != nil {
 					t.Fatalf("PushLocalArtifact: %v", err)
@@ -401,7 +424,7 @@ func TestComposerManifestLookup(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			target, err := HostedTargetFor("composer", "monolog/monolog", "3.5.0")
+			target, err := HostedTargetFor("composer", "monolog/monolog", "3.5.0", "")
 			if err != nil {
 				t.Fatalf("HostedTargetFor: %v", err)
 			}
@@ -413,5 +436,98 @@ func TestComposerManifestLookup(t *testing.T) {
 				t.Errorf("readHostedManifest error = %v, want %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestConcurrentPushesOfTheSameFileHaveOneWinner(t *testing.T) {
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	target, err := HostedTargetFor("generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil {
+		t.Fatalf("HostedTargetFor: %v", err)
+	}
+
+	const pushes = 8
+	start := make(chan struct{})
+	results := make([]error, pushes)
+	pushed := make([]HostedArtifact, pushes)
+	var wg sync.WaitGroup
+	for i := range pushes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			body := strings.NewReader(fmt.Sprintf("build %d", i))
+			pushed[i], results[i] = proxy.PushLocalArtifact(context.Background(), "generic", target, body, "", "")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	winner := -1
+	for i, err := range results {
+		switch {
+		case err == nil && winner >= 0:
+			t.Fatalf("pushes %d and %d both succeeded", winner, i)
+		case err == nil:
+			winner = i
+		case !errors.Is(err, ErrHostedExists):
+			t.Fatalf("push %d error = %v, want ErrHostedExists", i, err)
+		}
+	}
+	if winner < 0 {
+		t.Fatal("no push succeeded")
+	}
+
+	result, err := proxy.GetLocalArtifact(context.Background(), "generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil || result == nil {
+		t.Fatalf("GetLocalArtifact = %v, %v", result, err)
+	}
+	served, _ := io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if string(served) != fmt.Sprintf("build %d", winner) {
+		t.Errorf("served %q, want the winning push %q", served, fmt.Sprintf("build %d", winner))
+	}
+}
+
+// A fetch that started before a push and records after it must not replace
+// the pushed artifact or its version's integrity.
+func TestCacheFillAfterPushKeepsThePush(t *testing.T) {
+	proxy, _, store, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	pushRequest(t, proxy)
+
+	const fetchedPath = "npm/request/2.88.3/fetched/request-2.88.3.tgz"
+	if _, _, err := store.Store(context.Background(), fetchedPath, strings.NewReader("upstream bytes")); err != nil {
+		t.Fatalf("storing fetched copy: %v", err)
+	}
+	fetched := testArtifact("upstream bytes", "pkg:npm/request@2.88.3", "request-2.88.3.tgz", "application/gzip")
+	err := proxy.updateCacheDB("npm", "request", "pkg:npm/request", "https://registry.npmjs.org/request/-/request-2.88.3.tgz",
+		fetchedPath, fetched, "sha512-upstream")
+	if !errors.Is(err, database.ErrLocalArtifactExists) {
+		t.Fatalf("updateCacheDB over a push error = %v, want ErrLocalArtifactExists", err)
+	}
+
+	result, err := proxy.GetLocalArtifact(context.Background(), "npm", "request", "2.88.3", "request-2.88.3.tgz")
+	if err != nil || result == nil {
+		t.Fatalf("GetLocalArtifact = %v, %v, want the pushed copy", result, err)
+	}
+	served, err := io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if err != nil || string(served) != pushedTarball {
+		t.Errorf("served %d bytes, %v, want the pushed tarball, integrity intact", len(served), err)
+	}
+}
+
+func TestGenericPushDoesNotReadTheStoredFile(t *testing.T) {
+	proxy, _, store, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	target, err := HostedTargetFor("generic", "tools", "1.2.0", "tool.tar.gz")
+	if err != nil {
+		t.Fatalf("HostedTargetFor: %v", err)
+	}
+	store.openErr = errors.New("storage opened")
+	if _, err := proxy.PushLocalArtifact(context.Background(), "generic", target, strings.NewReader("bytes"), "", ""); err != nil {
+		t.Fatalf("PushLocalArtifact: %v", err)
 	}
 }

@@ -1885,3 +1885,19 @@ func TestMavenRepositoryNames(t *testing.T) {
 		t.Error("maven_repositories with an invalid URL: want an error")
 	}
 }
+
+func TestGenericUpstreamNamedHosted(t *testing.T) {
+	cfg := Default()
+	cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("upstream.generic named hosted with hosting off: %v, want it accepted", err)
+	}
+
+	cfg = Default()
+	cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
+	cfg.Hosted.Enabled = true
+	cfg.Hosted.Token = "secret"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("upstream.generic named hosted with hosting on: %v, want it refused", err)
+	}
+}

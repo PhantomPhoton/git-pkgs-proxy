@@ -23,6 +23,16 @@ var (
 	ErrHostedUnsupported     = errors.New("pushing packages is not supported for this ecosystem")
 	ErrHostedInvalidName     = errors.New("invalid package name or version")
 	ErrHostedVersionNotFound = errors.New("no pushed artifacts for this version")
+	ErrHostedFileNotFound    = errors.New("no pushed file of this name for this version")
+
+	// ErrHostedExists refuses a second push of the same file. Clients pin
+	// pushed files by version and often by hash, so a published file is never
+	// silently replaced; delete it first to push it again.
+	ErrHostedExists = errors.New("this file was already pushed; delete it first to push it again")
+
+	// ErrHostedChecksumMismatch reports a push whose bytes don't match the
+	// sha256 the client sent along.
+	ErrHostedChecksumMismatch = errors.New("pushed bytes don't match the expected sha256")
 
 	// ErrHostedArtifactUnavailable and ErrHostedArtifactMissing report a
 	// pushed artifact the cache can't serve. They stop the caller from
@@ -50,30 +60,79 @@ type HostedArtifact struct {
 	PushedAt time.Time `json:"pushed_at"`
 }
 
-// hostedNaming describes how an ecosystem names pushed archives: which
-// package names it has, split on "/", and the filename its clients request.
-type hostedNaming struct {
+// hostedEcosystem is what an ecosystem defines for pushed packages. Storing,
+// listing, deleting and the push rules are shared; adding an ecosystem means
+// adding an entry here and, if its clients read version lists, listing pushed
+// versions in its metadata.
+type hostedEcosystem struct {
+	// validName reports whether a package name, split on "/", is one of the
+	// ecosystem's.
 	validName func(segments []string) bool
-	filename  func(name, version string) string
+
+	// filename is the name clients request the archive by, derived from the
+	// package name and version. When nil, the filename is the last segment of
+	// the push path, the package name must be a single segment so the path is
+	// unambiguous, and a version can hold several files (see multiFile).
+	filename func(name, version string) string
+
+	// readManifest reads the package manifest out of a pushed archive and
+	// checks that it describes target. When nil, pushes carry no manifest.
+	readManifest func(archive io.Reader, target HostedTarget) (json.RawMessage, error)
+
+	// hostedOnly reports whether a namespace (an npm scope, a Composer
+	// vendor) is served from pushed packages alone. When nil, the ecosystem
+	// has no such namespaces.
+	hostedOnly func(p *Proxy, namespace string) bool
 }
 
-var hostedNamings = map[string]hostedNaming{
+var hostedEcosystems = map[string]hostedEcosystem{
 	"npm": {
 		validName: func(segments []string) bool {
 			return len(segments) == 1 || (len(segments) == 2 && strings.HasPrefix(segments[0], "@"))
 		},
-		filename: func(name, version string) string { return lastSegment(name) + "-" + version + ".tgz" },
+		filename:     func(name, version string) string { return lastSegment(name) + "-" + version + ".tgz" },
+		readManifest: readNPMManifest,
+		hostedOnly: func(p *Proxy, scope string) bool {
+			return slices.Contains(p.HostedNPMScopes, scope)
+		},
 	},
 	"composer": {
-		validName: func(segments []string) bool { return len(segments) == vendorPackageParts },
-		filename:  func(name, version string) string { return lastSegment(name) + "-" + version + ".zip" },
+		validName:    func(segments []string) bool { return len(segments) == vendorPackageParts },
+		filename:     func(name, version string) string { return lastSegment(name) + "-" + version + ".zip" },
+		readManifest: readComposerManifest,
+		hostedOnly: func(p *Proxy, vendor string) bool {
+			return slices.ContainsFunc(p.HostedComposerVendors, func(v string) bool {
+				return strings.EqualFold(v, vendor)
+			})
+		},
 	},
+	// generic holds files that aren't packages, such as prebuilt binaries.
+	// They are served at /generic/hosted/{name}/{version}/{file} and never
+	// come from an upstream.
+	genericEcosystem: {
+		validName: func(segments []string) bool { return len(segments) == 1 },
+	},
+}
+
+// multiFile reports whether a version can hold several files: those named in
+// the push path. Such versions get no version-level integrity, which could
+// only describe one of them.
+func (e hostedEcosystem) multiFile() bool {
+	return e.filename == nil
 }
 
 // HostedSupported reports whether packages can be pushed for ecosystem.
 func HostedSupported(ecosystem string) bool {
-	_, ok := hostedNamings[ecosystem]
+	_, ok := hostedEcosystems[ecosystem]
 	return ok
+}
+
+// HostedFileInPath reports whether pushes for ecosystem name the file in the
+// path, {name}/{version}/{file}, rather than deriving it from the name and
+// version.
+func HostedFileInPath(ecosystem string) bool {
+	eco, ok := hostedEcosystems[ecosystem]
+	return ok && eco.multiFile()
 }
 
 func lastSegment(name string) string {
@@ -81,22 +140,47 @@ func lastSegment(name string) string {
 }
 
 // HostedTargetFor validates a push of name@version to ecosystem and returns
-// where it is stored.
-func HostedTargetFor(ecosystem, name, version string) (HostedTarget, error) {
-	naming, ok := hostedNamings[ecosystem]
-	if !ok {
-		return HostedTarget{}, fmt.Errorf("%w: %s", ErrHostedUnsupported, ecosystem)
+// where it is stored. filename is required for ecosystems whose pushes name
+// the file (see HostedFileInPath) and must be empty for the others.
+func HostedTargetFor(ecosystem, name, version, filename string) (HostedTarget, error) {
+	if err := ValidateHostedPath(ecosystem, name, version, filename); err != nil {
+		return HostedTarget{}, err
 	}
-	segments := strings.Split(name, "/")
-	if !naming.validName(segments) {
+	eco := hostedEcosystems[ecosystem]
+	if eco.filename != nil {
+		filename = eco.filename(name, version)
+	} else if filename == "" {
 		return HostedTarget{}, ErrHostedInvalidName
 	}
-	for _, segment := range append(segments, version) {
+	return HostedTarget{Name: name, Version: version, Filename: filename}, nil
+}
+
+// ValidateHostedPath checks the parts of a hosted API path: a supported
+// ecosystem, one of its package names, and path segments that are safe to
+// store. filename may be empty, as in a delete of a whole version, but is
+// only allowed for ecosystems whose pushes name the file.
+func ValidateHostedPath(ecosystem, name, version, filename string) error {
+	eco, ok := hostedEcosystems[ecosystem]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrHostedUnsupported, ecosystem)
+	}
+	segments := strings.Split(name, "/")
+	if !eco.validName(segments) {
+		return ErrHostedInvalidName
+	}
+	checked := append(slices.Clone(segments), version)
+	if filename != "" {
+		if !eco.multiFile() {
+			return ErrHostedInvalidName
+		}
+		checked = append(checked, filename)
+	}
+	for _, segment := range checked {
 		if !validHostedSegment(segment) {
-			return HostedTarget{}, ErrHostedInvalidName
+			return ErrHostedInvalidName
 		}
 	}
-	return HostedTarget{Name: name, Version: version, Filename: naming.filename(name, version)}, nil
+	return nil
 }
 
 func validHostedSegment(s string) bool {
@@ -114,15 +198,17 @@ func validHostedSegment(s string) bool {
 // PushLocalArtifact stores body as the artifact for target and records it as
 // local, replacing any cached upstream copy. Download handlers serve it from
 // the cache without contacting the upstream, and eviction never removes it.
-// The archive's manifest must name target; it is kept so the ecosystem's
-// metadata can list the version with its dependencies.
-func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target HostedTarget, body io.Reader, contentType string) (HostedArtifact, error) {
+// A file that was already pushed is refused with ErrHostedExists. When
+// wantSHA256 is set, the pushed bytes must hash to it. If the ecosystem has
+// manifests, the archive's manifest must name target; it is kept so the
+// ecosystem's metadata can list the version with its dependencies.
+func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target HostedTarget, body io.Reader, contentType, wantSHA256 string) (HostedArtifact, error) {
+	if err := p.CheckPush(ecosystem, target); err != nil {
+		return HostedArtifact{}, err
+	}
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, target.Name, target.Version)
 	if err != nil {
 		return HostedArtifact{}, err
-	}
-	if p.versionDenied(ecosystem, target.Name, target.Version) {
-		return HostedArtifact{}, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
 	}
 
 	push := storedPush{
@@ -139,6 +225,11 @@ func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target 
 		return HostedArtifact{}, fmt.Errorf("storing artifact: %w", err)
 	}
 	push.integrity = "sha512-" + base64.StdEncoding.EncodeToString(sha512Hash.Sum(nil))
+
+	if wantSHA256 != "" && !strings.EqualFold(wantSHA256, push.sha256) {
+		p.discardStored(ctx, push.storagePath)
+		return HostedArtifact{}, fmt.Errorf("%w: got %s", ErrHostedChecksumMismatch, push.sha256)
+	}
 
 	if err := p.checkPush(ctx, ecosystem, target, versionPURL, &push); err != nil {
 		p.discardStored(ctx, push.storagePath)
@@ -160,6 +251,40 @@ func (p *Proxy) PushLocalArtifact(ctx context.Context, ecosystem string, target 
 	}, nil
 }
 
+// CheckPush refuses a push of a denied version or of a file that was already
+// pushed, before any bytes are read, so a client can be told without
+// uploading the file. For ecosystems with one file per version, any pushed
+// file of the version counts, so a differently cased alias of the name is
+// refused too. A cached upstream copy is fine to replace. Recording the push
+// checks again atomically, for concurrent pushes.
+func (p *Proxy) CheckPush(ecosystem string, target HostedTarget) error {
+	_, versionPURL, err := packagePURLStrings(ecosystem, target.Name, target.Version)
+	if err != nil {
+		return err
+	}
+	if p.versionDenied(ecosystem, target.Name, target.Version) {
+		return fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
+	}
+	var existing []database.Artifact
+	if hostedEcosystems[ecosystem].multiFile() {
+		record, err := p.DB.GetArtifact(versionPURL, target.Filename)
+		if err != nil {
+			return fmt.Errorf("checking existing artifact: %w", err)
+		}
+		if record != nil {
+			existing = append(existing, *record)
+		}
+	} else if existing, err = p.DB.GetArtifactsByVersionPURL(versionPURL); err != nil {
+		return fmt.Errorf("checking existing artifacts: %w", err)
+	}
+	for _, a := range existing {
+		if a.Source == database.SourceLocal {
+			return ErrHostedExists
+		}
+	}
+	return nil
+}
+
 // storedPush is a pushed archive once it is in storage.
 type storedPush struct {
 	storagePath string
@@ -173,14 +298,16 @@ type storedPush struct {
 
 // checkPush reads the manifest of a stored push and runs the scanners on it.
 func (p *Proxy) checkPush(ctx context.Context, ecosystem string, target HostedTarget, versionPURL string, push *storedPush) error {
-	stored, err := p.Storage.Open(ctx, push.storagePath)
-	if err != nil {
-		return fmt.Errorf("reading pushed archive: %w", err)
-	}
-	push.manifest, err = readHostedManifest(ecosystem, stored, target)
-	_ = stored.Close()
-	if err != nil {
-		return err
+	if hostedEcosystems[ecosystem].readManifest != nil {
+		stored, err := p.Storage.Open(ctx, push.storagePath)
+		if err != nil {
+			return fmt.Errorf("reading pushed archive: %w", err)
+		}
+		push.manifest, err = readHostedManifest(ecosystem, stored, target)
+		_ = stored.Close()
+		if err != nil {
+			return err
+		}
 	}
 
 	if p.Scanners != nil && p.Scanners.Enabled() {
@@ -195,41 +322,38 @@ func (p *Proxy) discardStored(ctx context.Context, storagePath string) {
 	}
 }
 
-// recordLocalArtifact writes the package, version and artifact records. The
-// version's integrity is set to the pushed bytes, so the cache's integrity
-// check verifies them rather than an upstream archive's digest. An existing
-// package record is kept as it is, since it may describe the upstream package.
+// recordLocalArtifact writes the package, version and artifact records in
+// one transaction. An existing package record is kept as it is, since it may
+// describe the upstream package. For ecosystems with one file per version,
+// the version's integrity is set to the pushed bytes, so the cache's
+// integrity check verifies them rather than an upstream archive's digest.
+// Multi-file versions can't have one integrity, so an existing version record
+// is left alone and each file is checked against its own sha256.
 func (p *Proxy) recordLocalArtifact(ecosystem string, target HostedTarget, pkgPURL, versionPURL string, push storedPush) error {
-	existing, err := p.DB.GetPackageByPURL(pkgPURL)
+	oneFilePerVersion := !hostedEcosystems[ecosystem].multiFile()
+	err := p.DB.RecordLocalArtifact(
+		&database.Package{PURL: pkgPURL, Ecosystem: ecosystem, Name: target.Name},
+		&database.Version{
+			PURL:        versionPURL,
+			PackagePURL: pkgPURL,
+			Integrity:   sql.NullString{String: push.integrity, Valid: oneFilePerVersion},
+		},
+		oneFilePerVersion,
+		&database.Artifact{
+			VersionPURL: versionPURL,
+			Filename:    target.Filename,
+			StoragePath: sql.NullString{String: push.storagePath, Valid: true},
+			ContentHash: sql.NullString{String: push.sha256, Valid: true},
+			Size:        sql.NullInt64{Int64: push.size, Valid: true},
+			ContentType: sql.NullString{String: push.contentType, Valid: push.contentType != ""},
+			FetchedAt:   sql.NullTime{Time: push.pushedAt, Valid: true},
+			Manifest:    sql.NullString{String: string(push.manifest), Valid: push.manifest != nil},
+		})
+	if errors.Is(err, database.ErrLocalArtifactExists) {
+		return ErrHostedExists
+	}
 	if err != nil {
-		return fmt.Errorf("reading package: %w", err)
-	}
-	if existing == nil {
-		if err := p.DB.UpsertPackage(&database.Package{PURL: pkgPURL, Ecosystem: ecosystem, Name: target.Name}); err != nil {
-			return fmt.Errorf("upserting package: %w", err)
-		}
-	}
-
-	if err := p.DB.UpsertVersion(&database.Version{
-		PURL:        versionPURL,
-		PackagePURL: pkgPURL,
-		Integrity:   sql.NullString{String: push.integrity, Valid: true},
-	}); err != nil {
-		return fmt.Errorf("upserting version: %w", err)
-	}
-
-	if err := p.DB.UpsertArtifact(&database.Artifact{
-		VersionPURL: versionPURL,
-		Filename:    target.Filename,
-		StoragePath: sql.NullString{String: push.storagePath, Valid: true},
-		ContentHash: sql.NullString{String: push.sha256, Valid: true},
-		Size:        sql.NullInt64{Int64: push.size, Valid: true},
-		ContentType: sql.NullString{String: push.contentType, Valid: push.contentType != ""},
-		FetchedAt:   sql.NullTime{Time: push.pushedAt, Valid: true},
-		Source:      database.SourceLocal,
-		Manifest:    sql.NullString{String: string(push.manifest), Valid: true},
-	}); err != nil {
-		return fmt.Errorf("upserting artifact: %w", err)
+		return fmt.Errorf("recording pushed artifact: %w", err)
 	}
 	return nil
 }
@@ -266,19 +390,8 @@ func (p *Proxy) hostedOnly(ecosystem, name string) bool {
 		return false
 	}
 	namespace, _, namespaced := strings.Cut(name, "/")
-	if !namespaced {
-		return false
-	}
-	switch ecosystem {
-	case "npm":
-		return slices.Contains(p.HostedNPMScopes, namespace)
-	case "composer":
-		return slices.ContainsFunc(p.HostedComposerVendors, func(vendor string) bool {
-			return strings.EqualFold(vendor, namespace)
-		})
-	default:
-		return false
-	}
+	eco := hostedEcosystems[ecosystem]
+	return namespaced && eco.hostedOnly != nil && eco.hostedOnly(p, namespace)
 }
 
 // localVersion is a pushed version as ecosystem metadata lists it.
@@ -328,16 +441,25 @@ func (p *Proxy) localVersions(ecosystem, name string) ([]localVersion, error) {
 // DeleteLocalVersion removes the archives pushed for name@version. If the
 // upstream has the version, clients get the upstream archive again.
 func (p *Proxy) DeleteLocalVersion(ecosystem, name, version string) error {
+	return p.deleteLocal(ecosystem, name, version, "", ErrHostedVersionNotFound)
+}
+
+// DeleteLocalFile removes one pushed file of name@version.
+func (p *Proxy) DeleteLocalFile(ecosystem, name, version, filename string) error {
+	return p.deleteLocal(ecosystem, name, version, filename, ErrHostedFileNotFound)
+}
+
+func (p *Proxy) deleteLocal(ecosystem, name, version, filename string, notFound error) error {
 	_, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
 		return err
 	}
-	deleted, err := p.DB.DeleteLocalArtifacts(versionPURL)
+	deleted, err := p.DB.DeleteLocalArtifacts(versionPURL, filename)
 	if err != nil {
 		return fmt.Errorf("deleting local artifacts: %w", err)
 	}
 	if deleted == 0 {
-		return ErrHostedVersionNotFound
+		return notFound
 	}
 	return nil
 }

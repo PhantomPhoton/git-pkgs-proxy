@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -312,6 +313,7 @@ func TestGenericHandler_RejectsUnknownUpstreamAndBadPaths(t *testing.T) {
 		{"traversal", http.MethodGet, "/github/../etc/passwd", http.StatusBadRequest},
 		{"encoded traversal", http.MethodGet, "/github/%2e%2e/etc/passwd", http.StatusBadRequest},
 		{"post", http.MethodPost, "/github/owner/repo/releases/download/v1/asset", http.StatusMethodNotAllowed},
+		{"hosted files with hosting off", http.MethodGet, "/hosted/tools/1.2.0/tool.tar.gz", http.StatusNotFound},
 	}
 
 	for _, tt := range tests {
@@ -627,4 +629,20 @@ func serveGenericRequest(h *GenericHandler, target string) *httptest.ResponseRec
 	w := httptest.NewRecorder()
 	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
 	return w
+}
+
+func TestGenericHandler_UpstreamNamedHostedWhileHostingIsOff(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "from upstream "+r.URL.Path)
+	}))
+	t.Cleanup(upstream.Close)
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	h := NewGenericHandler(proxy, map[string]string{"hosted": upstream.URL})
+
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/hosted/index.json", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "from upstream /index.json" {
+		t.Errorf("status = %d, body %q, want the upstream response", w.Code, w.Body)
+	}
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,9 +11,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/git-pkgs/proxy/internal/handler"
 )
 
 const (
@@ -19,10 +24,11 @@ const (
 	hostedTokenEnv      = "PROXY_HOSTED_TOKEN"
 	hostedClientTimeout = 10 * time.Minute
 
-	pushArgCount   = 4 // ecosystem, name, version, file
-	listArgCount   = 2 // ecosystem, name
-	deleteArgCount = 3 // ecosystem, name, version
-	tablePadding   = 2
+	pushArgCount      = 4 // ecosystem, name, version, file
+	listArgCount      = 2 // ecosystem, name
+	deleteArgCount    = 3 // ecosystem, name, version
+	deleteMaxArgCount = 4 // ecosystem, name, version, file for generic files
+	tablePadding      = 2
 )
 
 // hostedArtifact mirrors the JSON the /api/hosted endpoints return.
@@ -69,15 +75,16 @@ func newHostedCommand(name, usage, summary string, getenv func(string) string) h
 	return cmd
 }
 
-// parse parses flags and checks for exactly want positional arguments.
-func (c hostedCommand) parse(args []string, want int) ([]string, error) {
+// parse parses flags and checks for between minArgs and maxArgs positional
+// arguments.
+func (c hostedCommand) parse(args []string, minArgs, maxArgs int) ([]string, error) {
 	if err := c.flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			c.flags.Usage()
 		}
 		return nil, fmt.Errorf("%w\nusage: %s", err, c.usage)
 	}
-	if c.flags.NArg() != want {
+	if n := c.flags.NArg(); n < minArgs || n > maxArgs {
 		return nil, fmt.Errorf("usage: %s", c.usage)
 	}
 	return c.flags.Args(), nil
@@ -105,7 +112,7 @@ func hostedToken(getenv func(string) string) (string, error) {
 func runPush(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
 	cmd := newHostedCommand("push", "proxy hosted push [-url URL] <ecosystem> <name> <version> <file>",
 		"Push a package archive to the proxy", getenv)
-	positional, err := cmd.parse(args, pushArgCount)
+	positional, err := cmd.parse(args, pushArgCount, pushArgCount)
 	if err != nil {
 		return err
 	}
@@ -121,12 +128,32 @@ func runPush(args []string, getenv func(string) string, stdout io.Writer, client
 	}
 	defer func() { _ = file.Close() }()
 
-	req, err := http.NewRequest(http.MethodPut, cmd.endpoint(ecosystem, name, version), file)
+	// The proxy checks the upload against this, so a truncated or corrupted
+	// transfer is refused rather than stored.
+	digest := sha256.New()
+	size, err := io.Copy(digest, file)
 	if err != nil {
 		return err
 	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	segments := []string{version}
+	if handler.HostedFileInPath(ecosystem) {
+		segments = append(segments, filepath.Base(path))
+	}
+	endpoint := cmd.endpoint(ecosystem, name, segments...) + "?sha256=" + hex.EncodeToString(digest.Sum(nil))
+	req, err := http.NewRequest(http.MethodPut, endpoint, file)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = size
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/octet-stream")
+	// The proxy refuses an existing file or a bad token before reading the
+	// body, so the file is only uploaded once it would be accepted.
+	req.Header.Set("Expect", "100-continue")
 
 	var pushed hostedPushResponse
 	if err := doHosted(client, req, http.StatusCreated, &pushed); err != nil {
@@ -139,7 +166,7 @@ func runPush(args []string, getenv func(string) string, stdout io.Writer, client
 
 func runList(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
 	cmd := newHostedCommand("list", "proxy hosted list [-url URL] <ecosystem> <name>", "List pushed package archives", getenv)
-	positional, err := cmd.parse(args, listArgCount)
+	positional, err := cmd.parse(args, listArgCount, listArgCount)
 	if err != nil {
 		return err
 	}
@@ -161,16 +188,20 @@ func runList(args []string, getenv func(string) string, stdout io.Writer, client
 }
 
 func runDelete(args []string, getenv func(string) string, stdout io.Writer, client *http.Client) error {
-	cmd := newHostedCommand("delete", "proxy hosted delete [-url URL] <ecosystem> <name> <version>", "Delete a pushed version", getenv)
-	positional, err := cmd.parse(args, deleteArgCount)
+	cmd := newHostedCommand("delete", "proxy hosted delete [-url URL] <ecosystem> <name> <version> [file]",
+		"Delete a pushed version, or one generic file of it", getenv)
+	positional, err := cmd.parse(args, deleteArgCount, deleteMaxArgCount)
 	if err != nil {
 		return err
+	}
+	if len(positional) > deleteArgCount && !handler.HostedFileInPath(positional[0]) {
+		return fmt.Errorf("only generic files can be deleted one at a time\nusage: %s", cmd.usage)
 	}
 	token, err := hostedToken(getenv)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodDelete, cmd.endpoint(positional[0], positional[1], positional[2]), nil)
+	req, err := http.NewRequest(http.MethodDelete, cmd.endpoint(positional[0], positional[1], positional[2:]...), nil)
 	if err != nil {
 		return err
 	}
@@ -179,7 +210,11 @@ func runDelete(args []string, getenv func(string) string, stdout io.Writer, clie
 	if err := doHosted(client, req, http.StatusNoContent, nil); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "deleted %s %s@%s\n", positional[0], positional[1], positional[2])
+	deleted := positional[1] + "@" + positional[2]
+	if len(positional) > deleteArgCount {
+		deleted += " " + positional[deleteArgCount]
+	}
+	_, err = fmt.Fprintf(stdout, "deleted %s %s\n", positional[0], deleted)
 	return err
 }
 
@@ -210,7 +245,7 @@ func doHosted(client *http.Client, req *http.Request, wantStatus int, out any) e
 const hostedUsage = "usage: proxy hosted <push|list|delete> [flags] ...\n\n" +
 	"  push     Push a package archive to the proxy\n" +
 	"  list     List pushed package archives\n" +
-	"  delete   Delete a pushed version"
+	"  delete   Delete a pushed version, or one generic file of it"
 
 type hostedSubcommand func([]string, func(string) string, io.Writer, *http.Client) error
 
