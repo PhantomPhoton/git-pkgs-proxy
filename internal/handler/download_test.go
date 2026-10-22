@@ -871,6 +871,109 @@ func TestMavenHandler_ChecksumsCachedAsArtifacts(t *testing.T) {
 	}
 }
 
+// Any file named after its coordinates goes through the download path, so
+// policy applies to it whatever its extension.
+func TestMavenHandler_DeniedVersionBlocksEveryArtifactFile(t *testing.T) {
+	proxy, _, _, fetcher := setupTestProxy(t)
+	setTestDenylist(t, proxy, "pkg:maven/com.google.protobuf/protoc@3.21.0")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("denied file %s proxied to upstream", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	h := NewMavenHandler(proxy, "http://localhost", upstream.URL, upstream.URL)
+	proxy.HTTPClient = upstream.Client()
+
+	for _, name := range []string{
+		"protoc-3.21.0-linux-x86_64.exe",
+		"protoc-3.21.0-linux-x86_64.exe.sha1",
+		"protoc-3.21.0.hpi",
+		"protoc-3.21.0.pom",
+	} {
+		fetcher.fetchCalled = false
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/com/google/protobuf/protoc/3.21.0/"+name, nil))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("GET %s: status = %d, want %d", name, w.Code, http.StatusForbidden)
+		}
+		if fetcher.fetchCalled {
+			t.Errorf("GET %s: fetched a denied file", name)
+		}
+	}
+}
+
+func TestMavenHandler_UncommonArtifactFilesCached(t *testing.T) {
+	proxy, _, _, fetcher := setupTestProxy(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("artifact file %s proxied without caching", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	h := NewMavenHandler(proxy, "http://localhost", upstream.URL, upstream.URL)
+	proxy.HTTPClient = upstream.Client()
+
+	for _, path := range []string{
+		"/com/google/protobuf/protoc/3.21.0/protoc-3.21.0-linux-x86_64.exe",
+		"/com/google/protobuf/protoc/3.21.0/protoc-3.21.0-linux-x86_64.exe.sha1",
+		"/org/example/plugin/1.0/plugin-1.0.hpi",
+		"/org/example/native/1.0/native-1.0-linux.so",
+		"/org/example/lib/1.0-SNAPSHOT/lib-1.0-20240101.120000-1.exe",
+	} {
+		for i := range 2 {
+			fetcher.artifact = &fetch.Artifact{
+				Body:        io.NopCloser(strings.NewReader("binary")),
+				ContentType: "application/octet-stream",
+			}
+			fetcher.fetchCalled = false
+
+			w := httptest.NewRecorder()
+			h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+
+			if w.Code != http.StatusOK || w.Body.String() != "binary" {
+				t.Errorf("GET %s: status %d body %q", path, w.Code, w.Body.String())
+			}
+			if fetcher.fetchCalled != (i == 0) {
+				t.Errorf("GET %s request %d: fetched = %v, want %v", path, i+1, fetcher.fetchCalled, i == 0)
+			}
+		}
+	}
+}
+
+func TestMavenHandler_NonArtifactPathsProxied(t *testing.T) {
+	proxy, _, _, fetcher := setupTestProxy(t)
+
+	var proxied []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied = append(proxied, r.URL.Path)
+		_, _ = fmt.Fprint(w, "listing")
+	}))
+	defer upstream.Close()
+
+	h := NewMavenHandler(proxy, "http://localhost", upstream.URL, upstream.URL)
+	proxy.HTTPClient = upstream.Client()
+
+	paths := []string{
+		"/com/google/protobuf/protoc/3.21.0/",
+		"/com/google/protobuf/protoc/",
+		"/archetype-catalog.xml",
+	}
+	for _, path := range paths {
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK || w.Body.String() != "listing" {
+			t.Errorf("GET %s: status %d body %q", path, w.Code, w.Body.String())
+		}
+	}
+	if len(proxied) != len(paths) {
+		t.Errorf("proxied %v, want %v", proxied, paths)
+	}
+	if fetcher.fetchCalled {
+		t.Error("non-artifact path went through the download path")
+	}
+}
+
 func TestMavenHandler_CacheMiss(t *testing.T) {
 	proxy, _, _, fetcher := setupTestProxy(t)
 	fetcher.artifact = &fetch.Artifact{

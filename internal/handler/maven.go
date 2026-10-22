@@ -135,12 +135,12 @@ func (h *MavenHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.isArtifactFile(filename) || h.isChecksumFile(filename) {
+	if h.isArtifactFile(filename) || h.isChecksumFile(filename) || h.isCoordinateFile(urlPath) {
 		h.handleDownload(w, r, source, urlPath)
 		return
 	}
 
-	// Proxy everything else (directory listings etc.)
+	// Proxy everything else (directory listings, catalogs etc.)
 	h.proxyUpstream(w, r, source, urlPath)
 }
 
@@ -266,6 +266,18 @@ func (h *MavenHandler) isArtifactFile(filename string) bool {
 		}
 	}
 	return false
+}
+
+// isCoordinateFile reports whether urlPath is a file named after the
+// artifact and version of its directory, {artifact}-{version}..., as Maven
+// names every file it publishes, whatever the extension. A SNAPSHOT's
+// files carry a timestamp in place of "SNAPSHOT".
+func (h *MavenHandler) isCoordinateFile(urlPath string) bool {
+	_, artifact, version, filename := h.parsePath(urlPath)
+	if artifact == "" || version == "" {
+		return false
+	}
+	return strings.HasPrefix(filename, artifact+"-"+strings.TrimSuffix(version, "SNAPSHOT"))
 }
 
 // isVersionListingFile matches maven-metadata.xml and its checksums. The
