@@ -252,3 +252,59 @@ func TestDenylistMalformedMetadataFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// Denylist entries must match however the ecosystem spells the name or
+// version in download URLs.
+func TestDenylistMatchesEcosystemSpellings(t *testing.T) {
+	pypi := func(p *Proxy) http.Handler {
+		return NewPyPIHandlerWithUpstreams(p, "http://proxy.test", "", "").Routes()
+	}
+	for _, tc := range []struct {
+		name, entry, path string
+		ecosystem, pkg    string
+		version, filename string
+		handler           func(*Proxy) http.Handler
+	}{
+		{"pypi wheel", "pkg:pypi/zope.interface@6.0", "/packages/a/b/zope_interface-6.0-py3-none-any.whl",
+			"pypi", "zope_interface", "6.0", "zope_interface-6.0-py3-none-any.whl", pypi},
+		{"pypi dotted sdist", "pkg:pypi/zope-interface@6.0", "/packages/a/b/zope.interface-6.0.tar.gz",
+			"pypi", "zope.interface", "6.0", "zope.interface-6.0.tar.gz", pypi},
+		{"nuget", "pkg:nuget/Newtonsoft.Json@13.0.1-Beta", "/v3-flatcontainer/newtonsoft.json/13.0.1-beta/newtonsoft.json.13.0.1-beta.nupkg",
+			"nuget", "newtonsoft.json", "13.0.1-beta", "newtonsoft.json.13.0.1-beta.nupkg",
+			func(p *Proxy) http.Handler { return NewNuGetHandler(p, "http://proxy.test").Routes() }},
+		{"gem platform", "pkg:gem/nokogiri@1.16.0", "/gems/nokogiri-1.16.0-x86_64-linux.gem",
+			"gem", "nokogiri", "1.16.0-x86_64-linux", "nokogiri-1.16.0-x86_64-linux.gem",
+			func(p *Proxy) http.Handler { return NewGemHandler(p, "http://proxy.test").Routes() }},
+		{"conda any channel", "pkg:conda/numpy@1.26.4", "/conda-forge/linux-64/numpy-1.26.4-py311_0.conda",
+			"conda", "conda-forge/numpy", "1.26.4", "numpy-1.26.4-py311_0.conda",
+			func(p *Proxy) http.Handler { return NewCondaHandler(p, "http://proxy.test").Routes() }},
+		{"conda channel qualifier", "pkg:conda/numpy@1.26.4?channel=conda-forge", "/conda-forge/linux-64/numpy-1.26.4-py311_0.conda",
+			"conda", "conda-forge/numpy", "1.26.4", "numpy-1.26.4-py311_0.conda",
+			func(p *Proxy) http.Handler { return NewCondaHandler(p, "http://proxy.test").Routes() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The seeded artifact would be served if the entry didn't match.
+			p, db, store, _ := setupTestProxy(t)
+			seedPackage(t, db, store, tc.ecosystem, tc.pkg, tc.version, tc.filename, "cached content")
+			setTestDenylist(t, p, tc.entry)
+			w := httptest.NewRecorder()
+			tc.handler(p).ServeHTTP(w, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("denied download status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestPyPIDenylistSimpleMatchesSeparators(t *testing.T) {
+	body := `<html><a href="https://files.pythonhosted.org/packages/a/b/zope_interface-6.0-py3-none-any.whl">x</a><a href="https://files.pythonhosted.org/packages/a/b/zope_interface-7.0-py3-none-any.whl">y</a></html>`
+	h, p := setupPyPIHandler(t, func(r *http.Request) (*http.Response, error) {
+		return pypiHTTPResponse(r, "text/html", body), nil
+	})
+	setTestDenylist(t, p, "pkg:pypi/zope.interface@6.0")
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/simple/zope-interface/", nil))
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "6.0") || !strings.Contains(w.Body.String(), "7.0") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}

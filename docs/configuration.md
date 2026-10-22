@@ -969,10 +969,21 @@ denylist:
     - "pkg:npm/%40scope/example@4.5.6"
 ```
 
-Entries must be versioned PURLs without qualifiers or subpaths. Package names
-are canonicalized (including PyPI case/separator normalization and npm scopes);
+Entries must be versioned PURLs without subpaths or qualifiers (except a conda
+`channel`, below). Package names are canonicalized (including npm scopes);
 versions match exactly, not by range or glob. Invalid entries prevent startup.
 An empty list disables the policy. Restart the proxy after changing the list.
+
+Names and versions are compared the way each ecosystem treats them:
+
+- PyPI names ignore case, and runs of `-`, `_` and `.` are equivalent (PEP 503),
+  so `pkg:pypi/zope.interface@6.0` also covers `zope_interface-6.0-*.whl`.
+- NuGet ids and versions ignore case.
+- A RubyGems entry also covers that version's platform gems:
+  `pkg:gem/nokogiri@1.16.0` denies `nokogiri-1.16.0-x86_64-linux.gem`.
+- A conda entry covers the package in every channel. Add a `channel` qualifier,
+  such as `pkg:conda/numpy@1.26.4?channel=conda-forge`, to deny it in one
+  channel only.
 
 Denied versions are removed from npm packuments, Cargo sparse indexes, and PyPI
 simple HTML/JSON and release metadata, including responses served from cached
