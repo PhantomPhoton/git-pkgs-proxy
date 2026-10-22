@@ -1197,10 +1197,6 @@ func JSONError(w http.ResponseWriter, status int, message string) {
 	_, _ = fmt.Fprintf(w, `{"error":%q}`, message)
 }
 
-// ErrUpstreamRefused indicates the upstream answered 401 or 403: the
-// credentials the proxy sends are missing, wrong or no longer allowed.
-var ErrUpstreamRefused = errors.New("upstream refused the request")
-
 // staleWarning marks a response served from the metadata cache because the
 // upstream could not be reached.
 const staleWarning = `110 - "Response is Stale"`
@@ -1404,13 +1400,6 @@ func (p *Proxy) fetchMetadataFromUpstream(ctx context.Context, ecosystem, cacheK
 			}
 		}
 		return metadataResult{body: meta.body, contentType: meta.contentType, contentEncoding: meta.contentEncoding, digest: digest}
-	}
-
-	// A 404 or 401/403 is the upstream's answer, not an outage: the package
-	// is gone, or the proxy may no longer read it. Serving the cached copy
-	// would hide that from the client, so only other failures fall back.
-	if errors.Is(err, ErrUpstreamNotFound) || errors.Is(err, ErrUpstreamRefused) {
-		return metadataResult{err: err}
 	}
 
 	// Upstream failed -- fall back to cache if available
@@ -1627,9 +1616,6 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 	if resp.StatusCode == http.StatusNotFound {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamNotFoundBodyLimit))
 		return nil, &upstreamNotFoundError{body: body}
-	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("%w: upstream returned %d", ErrUpstreamRefused, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)

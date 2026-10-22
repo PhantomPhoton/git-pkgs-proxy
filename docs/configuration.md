@@ -987,7 +987,7 @@ Or via environment variable: `PROXY_METADATA_TTL=10m`.
 
 Set to `"0"` to always revalidate with upstream (ETag-based conditional requests still avoid re-downloading unchanged content).
 
-When upstream is unreachable and the cached entry is past its TTL, the proxy serves the stale cached copy with a `Warning: 110 - "Response is Stale"` header so clients can tell the data may be outdated. This covers timeouts, connection errors, 5xx and 429 responses. A 404 or a 401/403 from the upstream is an answer rather than an outage, so it is not covered: a removed package answers 404, and credentials the upstream rejects answer 502, instead of the client getting a cached version list that no longer exists or can no longer be read.
+When upstream is unreachable and the cached entry is past its TTL, the proxy serves the stale cached copy with a `Warning: 110 - "Response is Stale"` header so clients can tell the data may be outdated.
 
 ### Metadata size limit
 

@@ -263,14 +263,12 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		}
 		// If rewriting fails, just proxy the original
 		h.proxy.Logger.Warn("failed to rewrite metadata, proxying original", "error", err)
-		markStale(w, upstream.stale)
 		w.Header().Set(headerContentType, contentTypeJSON)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(upstream.body)
 		return
 	}
 
-	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, rewritten)
 }
 
@@ -298,8 +296,8 @@ func (h *NPMHandler) packumentAccept() string {
 // filtered packument so cooldown and dist-tags match the root metadata response.
 func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *http.Request, packageName, specifier, accept, registryURL, cacheKey, metadataCacheKey string) {
 	_, packumentPath := npmMetadataPath(packageName)
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), "npm", cacheKey, registryURL+"/"+packumentPath, accept)
-	if err := upstream.err; err != nil {
+	packument, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", cacheKey, registryURL+"/"+packumentPath, accept)
+	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
 			return
@@ -312,7 +310,7 @@ func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *
 		return
 	}
 
-	rewritten, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, upstream.body, "", func(b []byte) ([]byte, []string, error) {
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "npm", h.proxyURL, metadataCacheKey, packument, "", func(b []byte) ([]byte, []string, error) {
 		out, err := h.rewriteNPMVersionFromPackument(packageName, specifier, b)
 		return out, nil, err
 	})
@@ -337,7 +335,6 @@ func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *
 		return
 	}
 
-	markStale(w, upstream.stale)
 	w.Header().Set(headerContentType, contentTypeJSON)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(rewritten.body)
