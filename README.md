@@ -66,6 +66,7 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | RPM | RHEL/Fedora | | ✓ |
 | Alpine | Alpine Linux | | ✓ |
 | Arch | Arch Linux | | ✓ |
+| FreeBSD | FreeBSD (ports and pkgbase) | | ✓ |
 | Chef Supermarket | Chef | | ✓ |
 | Generic | Any | | ✓ |
 | Git | Any | | ✓ |
@@ -777,6 +778,59 @@ Avoid `mirror.archlinuxarm.org` as the upstream. It redirects each request to a
 changing regional mirror over plain HTTP, so the database and the packages can come
 from mirrors with a different sync state.
 
+### FreeBSD / pkg
+
+Override the repositories in `/usr/local/etc/pkg/repos/FreeBSD.conf`. Settings
+there are merged with `/etc/pkg/FreeBSD.conf`, so only the URL and mirror type
+change and the signature settings stay. The default repository name `freebsd`
+proxies the official mirror (`https://pkg.freebsd.org`). On FreeBSD 15:
+
+```
+FreeBSD-ports: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/quarterly",
+  mirror_type: "none"
+}
+FreeBSD-ports-kmods: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/kmods_quarterly_${VERSION_MINOR}",
+  mirror_type: "none"
+}
+FreeBSD-base: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/base_release_${VERSION_MINOR}",
+  mirror_type: "none"
+}
+```
+
+FreeBSD 14 has a single repository called `FreeBSD`:
+
+```
+FreeBSD: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/quarterly",
+  mirror_type: "none"
+}
+```
+
+Then:
+
+```bash
+pkg update
+```
+
+Keep the path after `${ABI}` that `pkg -vv` shows for each repository
+(`quarterly`, `latest`, `base_latest`, ...) and replace only the host part.
+
+The repository catalogues (`meta.conf`, `packagesite.pkg`, `data.pkg`) carry
+their signature inside the archive and are served byte-for-byte unchanged
+through the metadata cache (`metadata_ttl`, stale fallback). Enable
+`cache_metadata` so `pkg update` keeps working while the upstream is down.
+Packages under `Hashed/` have their content hash in the file name, so they are
+stored in the shared artifact cache as `pkg:bsd/freebsd/{name}@{version}` and
+remain available when the upstream is unreachable.
+
+Other files are passed through uncached. That includes the bootstrap package
+under `Latest/`, whose signature file is rewritten with every repository build,
+and package files without a hash in their name, which can be rebuilt under the
+same name.
+
 ### GitHub Releases / mise (aqua backend)
 
 Configure named generic upstreams:
@@ -1171,6 +1225,7 @@ Recently cached:
 | `GET /v2/homebrew/core/*` | Homebrew core bottle manifests and blobs from GHCR |
 | `GET /apk/{repository}/*` | Alpine APK repository protocol |
 | `GET /arch/{repository}/*` | Arch Linux pacman repository protocol |
+| `GET /freebsd/{repository}/*` | FreeBSD pkg repository protocol |
 | `GET /generic/{name}/*` | Generic HTTP download proxy (GitHub release assets, mise/aqua) |
 | `GET /git/{name}/{repo}/info/refs`, `POST /git/{name}/{repo}/git-upload-pack` | Git smart HTTP protocol, read-only |
 | `GET /debian/*` | Debian/APT repository protocol (main archive) |

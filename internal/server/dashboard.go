@@ -145,6 +145,7 @@ func supportedEcosystems() []string {
 		"conda",
 		"cran",
 		"deb",
+		"freebsd",
 		"gem",
 		"golang",
 		"hex",
@@ -213,6 +214,8 @@ func ecosystemColorClasses(ecosystem string) string {
 		return "bg-lime-100 text-lime-800 dark:bg-lime-900/50 dark:text-lime-300"
 	case "arch":
 		return "bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-300"
+	case "freebsd":
+		return "bg-red-200 text-red-900 dark:bg-red-950/60 dark:text-red-200"
 	default:
 		return "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"
 	}
@@ -552,6 +555,21 @@ Server = ` + baseURL + `/arch/archlinux/$repo/os/$arch
 
 # Then run:
 pacman -Syu</code></pre>`),
+		},
+		{
+			ID:       "freebsd",
+			Name:     "FreeBSD pkg",
+			Language: "FreeBSD",
+			Endpoint: "/freebsd/",
+			Instructions: template.HTML(`<p class="config-note">Configure pkg to use the proxy. On FreeBSD 15, do the same for FreeBSD-ports-kmods and FreeBSD-base, keeping their paths; FreeBSD 14 calls the ports repository FreeBSD.</p>
+<pre><code># /usr/local/etc/pkg/repos/FreeBSD.conf
+FreeBSD-ports: {
+  url: "` + baseURL + `/freebsd/freebsd/${ABI}/quarterly",
+  mirror_type: "none"
+}
+
+# Then run:
+pkg update</code></pre>`),
 		},
 	}
 }

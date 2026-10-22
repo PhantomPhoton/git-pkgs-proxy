@@ -124,6 +124,7 @@ The package rule covers every release and asset in that repository, but each cac
 | `conda` | yes | `pkg:conda/conda-forge/numpy`, with the channel as the namespace; the package name's case doesn't matter. A key without a channel is refused. |
 | `cran` | yes | `pkg:cran/ggplot2`, the package name as published, case included (`pkg:cran/Rcpp`). A rule covers source and binary builds alike. |
 | `deb` | yes | `pkg:deb/curl`; case doesn't matter. A vendor namespace such as `pkg:deb/debian/curl` is accepted and dropped, so a rule covers the package from every configured archive. Debian and Ubuntu archives only keep the current version per suite, so an evicted older one can't be fetched again. |
+| `freebsd` | yes | `pkg:bsd/freebsd/zsh`, the package name as published, case included (`pkg:bsd/freebsd/FreeBSD-acct`). A rule covers the package in every configured repository and ABI. Only packages under `Hashed/` are cached, and mirrors keep only the current build, so an evicted older one can't be fetched again. |
 | `gem` | yes | `pkg:gem/rails`, the gem name as published, case included. |
 | `generic` | yes, explicit rules only | `pkg:generic/owner%2Frepo` for a GitHub Release repository such as `jqlang/jq`. The ecosystem rule covers all cached version-pinned generic downloads, including GitHub Release assets and configured `generic_artifacts`. The global `default` never applies; metadata/API responses are not artifact retention candidates. |
 | `golang` | yes | `pkg:golang/github.com/stretchr/testify`, the module path as in `go.mod`; case doesn't matter. A major version like `/v2` (or `.v3` on gopkg.in) is a module of its own and needs its own rule. The `!`-escaped form from proxy URLs and the module cache (`github.com/!azure/...`) is refused. |
@@ -536,6 +537,26 @@ When `upstream.arch` is empty, a single repository named `archlinux` pointing at
 `https://geo.mirror.pkgbuild.com` is available; configuring any entry replaces
 that default. Arch Linux ARM has no default: pick a regional HTTPS mirror, not
 the `mirror.archlinuxarm.org` redirector.
+
+```yaml
+upstream:
+
+  # Named FreeBSD pkg mirrors, served at /freebsd/{name}/.
+  freebsd:
+    freebsd: "https://pkg.freebsd.org"
+```
+
+FreeBSD pkg repositories are read-only. Requests to `/freebsd/{name}/…` are
+passed to the mirror unchanged, e.g.
+`/freebsd/freebsd/FreeBSD:14:amd64/quarterly/packagesite.pkg`, so ports and
+pkgbase repositories and repositories built with poudriere work. Catalogues
+(`meta`, `meta.conf`, `packagesite` and `data` as `.pkg`, `.txz` or `.tzst`)
+are cached with the metadata TTL and served byte-for-byte unchanged, which
+keeps their embedded signatures valid. Packages under `Hashed/` use the shared
+artifact cache; everything else, including `Latest/` and unhashed package
+files, is passed through uncached. When `upstream.freebsd` is empty, a single
+repository named `freebsd` pointing at `https://pkg.freebsd.org` is available;
+configuring any entry replaces that default.
 
 ### Go checksum database
 

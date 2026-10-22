@@ -1433,7 +1433,7 @@ func TestValidateNamedUpstreams(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "valid Helm, OCI, APK, Arch, and generic upstreams",
+			name: "valid Helm, OCI, APK, Arch, FreeBSD, and generic upstreams",
 			modify: func(cfg *Config) {
 				cfg.Upstream.Helm = map[string]string{"bitnami": "https://charts.bitnami.com/bitnami"}
 				cfg.Upstream.OCI = map[string]string{"ghcr": "https://ghcr.io"}
@@ -1442,6 +1442,7 @@ func TestValidateNamedUpstreams(t *testing.T) {
 					"archlinux":    "https://geo.mirror.pkgbuild.com",
 					"archlinuxarm": "https://de3.mirror.archlinuxarm.org",
 				}
+				cfg.Upstream.FreeBSD = map[string]string{"freebsd": "https://pkg.freebsd.org"}
 				cfg.Upstream.Generic = map[string]string{
 					"github":     "https://github.com",
 					"github-api": "https://api.github.com",
@@ -1613,6 +1614,20 @@ func TestValidateNamedUpstreams(t *testing.T) {
 			name: "Arch upstream URL is not absolute",
 			modify: func(cfg *Config) {
 				cfg.Upstream.Arch = map[string]string{"archlinux": "geo.mirror.pkgbuild.com"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "FreeBSD upstream name contains path separator",
+			modify: func(cfg *Config) {
+				cfg.Upstream.FreeBSD = map[string]string{"freebsd/ports": "https://pkg.freebsd.org"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "FreeBSD upstream URL is not absolute",
+			modify: func(cfg *Config) {
+				cfg.Upstream.FreeBSD = map[string]string{"freebsd": "pkg.freebsd.org"}
 			},
 			wantErr: true,
 		},
