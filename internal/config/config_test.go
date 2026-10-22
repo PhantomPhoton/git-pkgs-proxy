@@ -1322,6 +1322,10 @@ func TestUpstreamAuthForURLMatchesURLComponents(t *testing.T) {
 		{name: "lookalike host rejected", url: "https://registry.example.com.evil.test/package"},
 		{name: "different scheme rejected", url: "http://registry.example.com/package"},
 		{name: "different port rejected", url: "https://registry.example.com:8443/package"},
+		{name: "dot dot segment rejected", url: "https://registry.example.com/private/../package"},
+		{name: "encoded dot dot segment rejected", url: "https://registry.example.com/private/%2e%2e/package"},
+		{name: "double encoded dot dot segment rejected", url: "https://registry.example.com/private/%252e%252e/package"},
+		{name: "dot segment rejected", url: "https://registry.example.com/private/./package"},
 	}
 
 	for _, tt := range tests {

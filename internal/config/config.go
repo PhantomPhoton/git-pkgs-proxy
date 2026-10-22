@@ -1068,6 +1068,12 @@ func parseAuthURL(value string) (*url.URL, error) {
 }
 
 func authURLMatches(configured, target *url.URL) bool {
+	// An upstream resolves dot segments, so /scope/../other would leave the
+	// configured path while still matching it by prefix. Real package URLs
+	// never contain them, so they get no credentials at all.
+	if HasDotSegment(target.Path) {
+		return false
+	}
 	if !strings.EqualFold(configured.Scheme, target.Scheme) ||
 		!strings.EqualFold(configured.Hostname(), target.Hostname()) ||
 		authURLPort(configured) != authURLPort(target) {
@@ -1083,6 +1089,24 @@ func authURLMatches(configured, target *url.URL) bool {
 	}
 	targetPath := strings.TrimSuffix(target.EscapedPath(), "/")
 	return targetPath == configuredPath || strings.HasPrefix(targetPath, configuredPath+"/")
+}
+
+// HasDotSegment reports whether the URL path p, or p decoded once more, has a
+// '.' or '..' segment. Backslashes count as separators, since some upstream
+// servers treat them as such.
+func HasDotSegment(p string) bool {
+	candidates := []string{p}
+	if decoded, err := url.PathUnescape(p); err == nil {
+		candidates = append(candidates, decoded)
+	}
+	for _, candidate := range candidates {
+		for segment := range strings.SplitSeq(strings.ReplaceAll(candidate, `\`, "/"), "/") {
+			if segment == "." || segment == ".." {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func authURLPort(value *url.URL) string {

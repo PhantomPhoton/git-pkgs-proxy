@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/git-pkgs/proxy/internal/accesslog"
+	"github.com/git-pkgs/proxy/internal/config"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -133,6 +134,22 @@ func requestEcosystem(path string) string {
 func rejectQueryInPath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.ContainsAny(r.URL.Path, "?#") && !strings.HasPrefix(r.URL.Path, "/composer/files/") {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// rejectDotSegments refuses requests whose decoded path has a '.' or '..'
+// segment. Routers clean literal dot segments, but encoded ones such as
+// %2e%2e reach the handlers, and several of them append the path to the
+// upstream URL, where the upstream resolves it outside the configured base
+// path. Backslashes count as separators, and the path is decoded once more
+// so double-encoded segments are refused too.
+func rejectDotSegments(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if config.HasDotSegment(r.URL.Path) {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
