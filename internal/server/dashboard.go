@@ -556,12 +556,18 @@ Server = ` + baseURL + `/arch/archlinux/$repo/os/$arch
 # Then run:
 pacman -Syu</code></pre>`),
 		},
-		{
-			ID:       "freebsd",
-			Name:     "FreeBSD pkg",
-			Language: "FreeBSD",
-			Endpoint: "/freebsd/",
-			Instructions: template.HTML(`<p class="config-note">Configure pkg to use the proxy. On FreeBSD 15, do the same for FreeBSD-ports-kmods and FreeBSD-base, keeping their paths; FreeBSD 14 calls the ports repository FreeBSD.</p>
+		freebsdRegistryConfig(baseURL),
+	}
+}
+
+// freebsdRegistryConfig describes the FreeBSD pkg endpoint for the dashboard.
+func freebsdRegistryConfig(baseURL string) RegistryConfig {
+	return RegistryConfig{
+		ID:       "freebsd",
+		Name:     "FreeBSD pkg",
+		Language: "FreeBSD",
+		Endpoint: "/freebsd/",
+		Instructions: template.HTML(`<p class="config-note">Configure pkg to use the proxy. On FreeBSD 15, do the same for FreeBSD-ports-kmods and FreeBSD-base, keeping their paths; FreeBSD 14 calls the ports repository FreeBSD.</p>
 <pre><code># /usr/local/etc/pkg/repos/FreeBSD.conf
 FreeBSD-ports: {
   url: "` + baseURL + `/freebsd/freebsd/${ABI}/quarterly",
@@ -570,6 +576,5 @@ FreeBSD-ports: {
 
 # Then run:
 pkg update</code></pre>`),
-		},
 	}
 }
