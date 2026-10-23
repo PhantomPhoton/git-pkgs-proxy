@@ -212,6 +212,14 @@ Add PyPI registry support
 - Add tests for wheel and sdist downloads
 ```
 
+## Reviewing and Merging
+
+Maintainers are the members of the proxy team in the git-pkgs org. Any maintainer can review and merge. A pull request needs green CI and an approval from a maintainer other than its author. A "request changes" review from any maintainer blocks it until that reviewer approves or withdraws the review.
+
+Using AI to write or review is fine, but whoever approves a pull request should understand it and stand behind it. If it touches an ecosystem you don't use, you can ask someone who does to look before you approve.
+
+Open an issue before a bigger change: anything that changes behaviour users rely on, new configuration that would be hard to remove, or a change that fans out into other git-pkgs modules. If no maintainer objects within a few days, open the pull request; it's reviewed like any other. Objections are worked out in the issue, with @andrew breaking ties for now. Where possible, deprecate before removing: an old configuration key keeps working, with a warning, in at least one release before the one that removes it.
+
 ## Releases
 
 A patch release is cut on the 1st of each month by `.github/workflows/monthly-release.yml` when `main` is green and something has merged since the last tag. It is skipped if a pull request labelled `breaking` was merged since then: label pull requests that change behaviour users rely on, and release those as a new minor version by hand.
