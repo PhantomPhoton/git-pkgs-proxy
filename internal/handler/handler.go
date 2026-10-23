@@ -815,12 +815,38 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	// in between would otherwise be repeated. Serve that record only if its
 	// bytes are still present: a record can outlive them, and refetching is
 	// the same recovery the cache lookup makes.
-	if stored, path, ok := recheck(); ok {
-		if res, err := p.openStoredArtifact(ctx, stored, path); err == nil {
-			f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, nil
-			return res, nil
+	served := func() (*CacheResult, bool) {
+		stored, path, ok := recheck()
+		if !ok {
+			return nil, false
 		}
+		res, err := p.openStoredArtifact(ctx, stored, path)
+		if err != nil {
+			return nil, false
+		}
+		f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, nil
+		return res, true
 	}
+	if res, ok := served(); ok {
+		return res, nil
+	}
+
+	// Another instance sharing the database may be fetching the same
+	// artifact. Wait for it to store the artifact rather than fetch it too.
+	var waitedFor *CacheResult
+	release, storedElsewhere, err := p.awaitFetchLease(ctx, metrics.CacheKindArtifact, key, func() bool {
+		res, ok := served()
+		waitedFor = res
+		return ok
+	})
+	if err != nil {
+		f.err = err
+		return nil, err
+	}
+	if storedElsewhere {
+		return waitedFor, nil
+	}
+	defer release()
 
 	commitCtx := ctx
 	if upstreamFetchDetached(ctx) && p.acquireDetachSlot() {
@@ -1368,6 +1394,22 @@ func (p *Proxy) coalescedMetadataMiss(ctx context.Context, ecosystem, cacheKey, 
 		entry, hit := p.cachedMetadataState(fetchCtx, ecosystem, cacheKey, validate)
 		if hit != nil {
 			return *hit
+		}
+		// Another instance sharing the database may be fetching the same
+		// document. Only a stored copy within TTL can be served after
+		// waiting, so without that there is nothing to wait for.
+		if p.CacheMetadata && p.MetadataTTL > 0 {
+			release, stored, err := p.awaitFetchLease(fetchCtx, metrics.CacheKindMetadata, key, func() bool {
+				entry, hit = p.cachedMetadataState(fetchCtx, ecosystem, cacheKey, validate)
+				return hit != nil
+			})
+			if err != nil {
+				return metadataResult{err: err}
+			}
+			if stored {
+				return *hit
+			}
+			defer release()
 		}
 		return p.fetchMetadataFromUpstream(fetchCtx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate, entry)
 	})

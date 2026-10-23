@@ -242,3 +242,53 @@ func TestMigrateAddsJobRuns(t *testing.T) {
 		}
 	})
 }
+
+func TestFetchLeases(t *testing.T) {
+	db := createTestPostgresDB(t)
+	if db == nil {
+		t.Skip("PROXY_DATABASE_URL not set")
+	}
+	defer func() { _ = db.Close() }()
+
+	acquire := func(owner string, ttl time.Duration) bool {
+		t.Helper()
+		ok, err := db.AcquireFetchLease("k", owner, ttl)
+		if err != nil {
+			t.Fatalf("AcquireFetchLease(%s): %v", owner, err)
+		}
+		return ok
+	}
+	if !acquire("a", time.Minute) {
+		t.Fatal("a could not take a free lease")
+	}
+	if acquire("b", time.Minute) {
+		t.Fatal("b took a lease a holds")
+	}
+	if held, err := db.RenewFetchLease("k", "b", time.Minute); err != nil || held {
+		t.Fatalf("b renewed a's lease: %v, %v", held, err)
+	}
+	if held, err := db.RenewFetchLease("k", "a", time.Minute); err != nil || !held {
+		t.Fatalf("a could not renew its lease: %v, %v", held, err)
+	}
+	// Only the owner can release it.
+	if err := db.ReleaseFetchLease("k", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if acquire("b", time.Minute) {
+		t.Fatal("b's release dropped a's lease")
+	}
+	if err := db.ReleaseFetchLease("k", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if !acquire("b", time.Millisecond) {
+		t.Fatal("b could not take the lease a released")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if !acquire("c", time.Millisecond) {
+		t.Fatal("c could not take b's expired lease")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n, err := db.DeleteExpiredFetchLeases(0); err != nil || n != 1 {
+		t.Fatalf("DeleteExpiredFetchLeases = %d, %v; want 1", n, err)
+	}
+}

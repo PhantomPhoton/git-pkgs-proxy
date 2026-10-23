@@ -207,7 +207,9 @@ Instances coordinate through PostgreSQL advisory locks:
 - Eviction, reclaim, retention and the Gradle build cache sweep run on one instance at a time. An instance that finds a job running elsewhere skips that pass.
 - A [scheduled mirror](#scheduled-refresh) runs on whichever instance reaches it first in each interval.
 
-Cache misses are only coalesced within an instance. Two instances missing the same file both fetch it from upstream; the extra copy is queued for deletion like any replaced file. Each instance also needs its own [`git.cache_dir`](#git-repositories).
+Cache misses are fetched from upstream once across instances. The instance that fetches holds a lease on the miss in the `fetch_leases` table and renews it while it downloads. Another instance missing the same file waits until it is stored and serves the stored copy; `proxy_fetch_lease_waits_total` counts those waits. If the fetch fails, the waiting instance fetches itself, and a lease of an instance that stopped expires after 30 seconds. Metadata is shared this way only with [`cache_metadata`](#metadata-caching) and a `metadata_ttl` above zero, since without a stored copy there is nothing to wait for. A cache hit costs no extra query; a miss costs one.
+
+Each instance needs its own [`git.cache_dir`](#git-repositories).
 
 ### Hit counts
 
