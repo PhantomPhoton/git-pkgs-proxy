@@ -292,3 +292,44 @@ func TestFetchLeases(t *testing.T) {
 		t.Fatalf("DeleteExpiredFetchLeases = %d, %v; want 1", n, err)
 	}
 }
+
+func TestFetchLeaseFailure(t *testing.T) {
+	db := createTestPostgresDB(t)
+	if db == nil {
+		t.Skip("PROXY_DATABASE_URL not set")
+	}
+	defer func() { _ = db.Close() }()
+
+	if ok, err := db.AcquireFetchLease("k", "a", time.Minute); err != nil || !ok {
+		t.Fatalf("a could not take a free lease: %v, %v", ok, err)
+	}
+	if owner, failed, ok, err := db.FetchLeaseHolder("k"); err != nil || !ok || owner != "a" || failed {
+		t.Fatalf("FetchLeaseHolder = %q, failed %v, ok %v, %v; want a's live lease", owner, failed, ok, err)
+	}
+	// A failed lease stays readable for those waiting on it, and is free to
+	// take.
+	if err := db.FailFetchLease("k", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, failed, _, _ := db.FetchLeaseHolder("k"); failed {
+		t.Fatal("b failed a's lease")
+	}
+	if err := db.FailFetchLease("k", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if owner, failed, ok, err := db.FetchLeaseHolder("k"); err != nil || !ok || owner != "a" || !failed {
+		t.Fatalf("FetchLeaseHolder = %q, failed %v, ok %v, %v; want a's failed lease", owner, failed, ok, err)
+	}
+	if ok, err := db.AcquireFetchLease("k", "b", time.Minute); err != nil || !ok {
+		t.Fatalf("b could not take a's failed lease: %v, %v", ok, err)
+	}
+	if owner, failed, _, _ := db.FetchLeaseHolder("k"); owner != "b" || failed {
+		t.Fatalf("after takeover: owner %q, failed %v", owner, failed)
+	}
+	if err := db.ReleaseFetchLease("k", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := db.FetchLeaseHolder("k"); err != nil || ok {
+		t.Fatalf("FetchLeaseHolder after release: ok %v, %v", ok, err)
+	}
+}

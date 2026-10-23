@@ -1,6 +1,8 @@
 package database
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -13,13 +15,13 @@ import (
 // single-instance, so these are only used on Postgres.
 
 // AcquireFetchLease takes the lease on key for owner unless another owner
-// holds one that has not expired, and reports whether it did.
+// holds one that has neither expired nor failed, and reports whether it did.
 func (db *DB) AcquireFetchLease(key, owner string, ttl time.Duration) (bool, error) {
 	res, err := db.Exec(`
 		INSERT INTO fetch_leases (key, owner, expires_at)
 		VALUES ($1, $2, now() + $3 * interval '1 millisecond')
-		ON CONFLICT (key) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
-		WHERE fetch_leases.expires_at < now()`, key, owner, ttl.Milliseconds())
+		ON CONFLICT (key) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at, failed = FALSE
+		WHERE fetch_leases.expires_at < now() OR fetch_leases.failed`, key, owner, ttl.Milliseconds())
 	if err != nil {
 		return false, fmt.Errorf("acquiring fetch lease: %w", err)
 	}
@@ -44,6 +46,30 @@ func (db *DB) RenewFetchLease(key, owner string, ttl time.Duration) (bool, error
 		return false, fmt.Errorf("renewing fetch lease: %w", err)
 	}
 	return n > 0, nil
+}
+
+// FetchLeaseHolder returns the owner of the lease on key, and whether its
+// fetch failed. ok is false when no lease is held or it has expired.
+func (db *DB) FetchLeaseHolder(key string) (owner string, failed, ok bool, err error) {
+	err = db.QueryRow(`
+		SELECT owner, failed FROM fetch_leases
+		WHERE key = $1 AND expires_at >= now()`, key).Scan(&owner, &failed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, false, nil
+	}
+	if err != nil {
+		return "", false, false, fmt.Errorf("reading fetch lease: %w", err)
+	}
+	return owner, failed, true, nil
+}
+
+// FailFetchLease marks owner's lease on key as failed. Instances waiting on
+// it stop waiting, and the next AcquireFetchLease takes it at once.
+func (db *DB) FailFetchLease(key, owner string) error {
+	if _, err := db.Exec(`UPDATE fetch_leases SET failed = TRUE WHERE key = $1 AND owner = $2`, key, owner); err != nil {
+		return fmt.Errorf("failing fetch lease: %w", err)
+	}
+	return nil
 }
 
 // ReleaseFetchLease drops owner's lease on key.

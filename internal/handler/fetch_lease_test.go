@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,7 +79,11 @@ func sharedInstances(t *testing.T) (*Proxy, *Proxy, *database.DB) {
 const leaseTestURL = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
 
 func fetchLeftPad(p *Proxy) (string, error) {
-	res, err := p.GetOrFetchArtifactFromURL(context.Background(), "npm", "left-pad", "1.3.0", "left-pad-1.3.0.tgz", leaseTestURL)
+	return fetchLeftPadCtx(context.Background(), p)
+}
+
+func fetchLeftPadCtx(ctx context.Context, p *Proxy) (string, error) {
+	res, err := p.GetOrFetchArtifactFromURL(ctx, "npm", "left-pad", "1.3.0", "left-pad-1.3.0.tgz", leaseTestURL)
 	if err != nil {
 		return "", err
 	}
@@ -92,10 +97,10 @@ type fetchResult struct {
 	err  error
 }
 
-func goFetchLeftPad(p *Proxy) chan fetchResult {
+func goFetchLeftPad(ctx context.Context, p *Proxy) chan fetchResult {
 	ch := make(chan fetchResult, 1)
 	go func() {
-		body, err := fetchLeftPad(p)
+		body, err := fetchLeftPadCtx(ctx, p)
 		ch <- fetchResult{body, err}
 	}()
 	return ch
@@ -114,6 +119,28 @@ func waitForLeaseWaits(t *testing.T, kind string, from float64) {
 	}
 }
 
+// waitForArtifactWaiters returns once n callers have joined p's fetch of
+// left-pad.
+func waitForArtifactWaiters(t *testing.T, p *Proxy, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.fetchMu.Lock()
+		joined := 0
+		for _, f := range p.inFlight {
+			joined += f.waiters
+		}
+		p.fetchMu.Unlock()
+		if joined >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for a caller to join the fetch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestFetchLeaseCoalescesArtifactAcrossInstances(t *testing.T) {
 	a, b, _ := sharedInstances(t)
 	const content = "left-pad tarball"
@@ -123,9 +150,9 @@ func TestFetchLeaseCoalescesArtifactAcrossInstances(t *testing.T) {
 	a.Fetcher, b.Fetcher = fa, fb
 
 	waits := testutil.ToFloat64(metrics.FetchLeaseWaits.WithLabelValues(metrics.CacheKindArtifact))
-	resA := goFetchLeftPad(a)
+	resA := goFetchLeftPad(context.Background(), a)
 	<-fa.entered
-	resB := goFetchLeftPad(b)
+	resB := goFetchLeftPad(context.Background(), b)
 	waitForLeaseWaits(t, metrics.CacheKindArtifact, waits)
 	fa.open()
 
@@ -152,9 +179,9 @@ func TestFetchLeaseFailedFetchLetsOtherInstanceFetch(t *testing.T) {
 	a.Fetcher, b.Fetcher = fa, fb
 
 	waits := testutil.ToFloat64(metrics.FetchLeaseWaits.WithLabelValues(metrics.CacheKindArtifact))
-	resA := goFetchLeftPad(a)
+	resA := goFetchLeftPad(context.Background(), a)
 	<-fa.entered
-	resB := goFetchLeftPad(b)
+	resB := goFetchLeftPad(context.Background(), b)
 	waitForLeaseWaits(t, metrics.CacheKindArtifact, waits)
 	started := time.Now()
 	fa.open()
@@ -252,14 +279,150 @@ func TestFetchLeaseNotUsedWithoutMetadataCache(t *testing.T) {
 	}
 }
 
+// TestFetchLeaseWaitOutlivesDetachedCaller checks that a caller waiting on
+// another instance's fetch keeps waiting after its client goes away when its
+// fetch is detached, so callers that joined it still get the artifact.
+func TestFetchLeaseWaitOutlivesDetachedCaller(t *testing.T) {
+	a, b, _ := sharedInstances(t)
+	const content = "left-pad tarball"
+	fa := newGateFetcher(t, content, nil)
+	fb := newGateFetcher(t, content, nil)
+	fb.open()
+	a.Fetcher, b.Fetcher = fa, fb
+
+	waits := testutil.ToFloat64(metrics.FetchLeaseWaits.WithLabelValues(metrics.CacheKindArtifact))
+	resA := goFetchLeftPad(context.Background(), a)
+	<-fa.entered
+	leadCtx, cancelLead := context.WithCancel(DetachUpstreamFetch(context.Background()))
+	defer cancelLead()
+	resLead := goFetchLeftPad(leadCtx, b)
+	waitForLeaseWaits(t, metrics.CacheKindArtifact, waits)
+	resJoined := goFetchLeftPad(context.Background(), b)
+	waitForArtifactWaiters(t, b, 1)
+	cancelLead()
+	fa.open()
+	<-resLead
+
+	for name, ch := range map[string]chan fetchResult{"a": resA, "b's joined caller": resJoined} {
+		r := <-ch
+		if r.err != nil || r.body != content {
+			t.Errorf("%s: body %q, err %v", name, r.body, r.err)
+		}
+	}
+	if got := fb.calls.Load(); got != 0 {
+		t.Errorf("b fetched %d times, want 0", got)
+	}
+}
+
+// TestFetchLeaseFailedFetchWaitersFetchInParallel checks that once a fetch
+// fails, the instances waiting on it fetch at the same time rather than one
+// after another, so a hanging upstream costs each one timeout.
+func TestFetchLeaseFailedFetchWaitersFetchInParallel(t *testing.T) {
+	a, b, db := sharedInstances(t)
+	c := NewProxy(db, b.Storage, &mockFetcher{}, fetch.NewResolver(), b.Logger)
+	const content = "left-pad tarball"
+	fa := newGateFetcher(t, "", errors.New("upstream down"))
+	fb := newGateFetcher(t, content, nil)
+	fc := newGateFetcher(t, content, nil)
+	a.Fetcher, b.Fetcher, c.Fetcher = fa, fb, fc
+
+	waits := testutil.ToFloat64(metrics.FetchLeaseWaits.WithLabelValues(metrics.CacheKindArtifact))
+	resA := goFetchLeftPad(context.Background(), a)
+	<-fa.entered
+	resB := goFetchLeftPad(context.Background(), b)
+	waitForLeaseWaits(t, metrics.CacheKindArtifact, waits)
+	resC := goFetchLeftPad(context.Background(), c)
+	waitForLeaseWaits(t, metrics.CacheKindArtifact, waits+1)
+	fa.open()
+	if r := <-resA; r.err == nil {
+		t.Fatal("instance a: want the upstream error")
+	}
+
+	for name, entered := range map[string]chan struct{}{"b": fb.entered, "c": fc.entered} {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not fetch while the other waiting instance was fetching", name)
+		}
+	}
+	fb.open()
+	fc.open()
+	for name, ch := range map[string]chan fetchResult{"b": resB, "c": resC} {
+		if r := <-ch; r.err != nil || r.body != content {
+			t.Errorf("instance %s: body %q, err %v", name, r.body, r.err)
+		}
+	}
+}
+
+// TestFetchLeaseFailedMetadataServesStale checks that an instance waiting on
+// a metadata fetch that fails serves its stale copy at once, as the holder
+// does, instead of asking the failing upstream again.
+func TestFetchLeaseFailedMetadataServesStale(t *testing.T) {
+	a, b, _ := sharedInstances(t)
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var released sync.Once
+	open := func() { released.Do(func() { close(release) }) }
+	t.Cleanup(open)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if code := int(status.Load()); code != http.StatusOK {
+			entered <- struct{}{}
+			<-release
+			w.WriteHeader(code)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"left-pad"}`))
+	}))
+	t.Cleanup(upstream.Close)
+	for _, p := range []*Proxy{a, b} {
+		p.HTTPClient = upstream.Client()
+		p.CacheMetadata = true
+		p.MetadataTTL = 50 * time.Millisecond
+	}
+	fetchMeta := func(p *Proxy) chan metadataCall {
+		ch := make(chan metadataCall, 1)
+		go func() {
+			body, _, err := p.FetchOrCacheMetadata(context.Background(), "npm", "left-pad", upstream.URL+"/left-pad", "application/json")
+			ch <- metadataCall{body, err}
+		}()
+		return ch
+	}
+	if r := <-fetchMeta(a); r.err != nil {
+		t.Fatalf("seeding the cache: %v", r.err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	status.Store(http.StatusServiceUnavailable)
+	waits := testutil.ToFloat64(metrics.FetchLeaseWaits.WithLabelValues(metrics.CacheKindMetadata))
+	resA := fetchMeta(a)
+	<-entered
+	resB := fetchMeta(b)
+	waitForLeaseWaits(t, metrics.CacheKindMetadata, waits)
+	open()
+
+	for name, ch := range map[string]chan metadataCall{"a": resA, "b": resB} {
+		if r := <-ch; r.err != nil || string(r.body) != `{"name":"left-pad"}` {
+			t.Errorf("instance %s: body %q, err %v; want the stale copy", name, r.body, r.err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream requests = %d, want 2: the seed and a's failed refresh", got)
+	}
+}
+
 func TestFetchLeaseNotUsedOnSQLite(t *testing.T) {
 	proxy, _, _, _ := setupTestProxy(t)
-	release, stored, err := proxy.awaitFetchLease(context.Background(), metrics.CacheKindArtifact, "k", func() bool {
+	release, outcome, err := proxy.awaitFetchLease(context.Background(), metrics.CacheKindArtifact, "k", func() bool {
 		t.Error("ready polled on SQLite")
 		return false
 	})
-	if err != nil || stored {
-		t.Fatalf("awaitFetchLease = %v, %v; want to fetch at once", stored, err)
+	if err != nil || outcome != leaseFetch {
+		t.Fatalf("awaitFetchLease = %v, %v; want to fetch at once", outcome, err)
 	}
-	release()
+	release(false)
 }

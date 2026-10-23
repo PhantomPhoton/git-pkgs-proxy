@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS job_runs (
 CREATE TABLE IF NOT EXISTS fetch_leases (
 	key TEXT NOT NULL PRIMARY KEY,
 	owner TEXT NOT NULL,
-	expires_at DATETIME NOT NULL
+	expires_at DATETIME NOT NULL,
+	failed BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
@@ -230,7 +231,8 @@ CREATE TABLE IF NOT EXISTS job_runs (
 CREATE TABLE IF NOT EXISTS fetch_leases (
 	key TEXT NOT NULL PRIMARY KEY,
 	owner TEXT NOT NULL,
-	expires_at TIMESTAMP NOT NULL
+	expires_at TIMESTAMP NOT NULL,
+	failed BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
@@ -771,7 +773,8 @@ func migrateAddFetchLeases(db *DB) error {
 	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS fetch_leases (
 		key TEXT NOT NULL PRIMARY KEY,
 		owner TEXT NOT NULL,
-		expires_at %s NOT NULL
+		expires_at %s NOT NULL,
+		failed BOOLEAN NOT NULL DEFAULT FALSE
 	)`, ts)
 	if _, err := db.Exec(query); err != nil {
 		return fmt.Errorf("creating fetch_leases table: %w", err)

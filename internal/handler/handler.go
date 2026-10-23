@@ -744,6 +744,10 @@ type inflightFetch struct {
 	done chan struct{}
 	val  fetchedArtifact
 	err  error
+
+	// waiters counts callers that joined the fetch, guarded by fetchMu.
+	// Tests read it to know a caller has joined.
+	waiters int
 }
 
 // coalesceFetch runs commit at most once for concurrent callers sharing key,
@@ -776,7 +780,9 @@ func (p *Proxy) coalesceFetch(ctx context.Context, key string, recheck func() (a
 		p.inFlight = make(map[string]*inflightFetch)
 	}
 	f, joined := p.inFlight[key]
-	if !joined {
+	if joined {
+		f.waiters++
+	} else {
 		f = &inflightFetch{done: make(chan struct{})}
 		p.inFlight[key] = f
 	}
@@ -815,7 +821,7 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	// in between would otherwise be repeated. Serve that record only if its
 	// bytes are still present: a record can outlive them, and refetching is
 	// the same recovery the cache lookup makes.
-	served := func() (*CacheResult, bool) {
+	served := func(ctx context.Context) (*CacheResult, bool) {
 		stored, path, ok := recheck()
 		if !ok {
 			return nil, false
@@ -827,15 +833,22 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, nil
 		return res, true
 	}
-	if res, ok := served(); ok {
+	if res, ok := served(ctx); ok {
 		return res, nil
 	}
 
 	// Another instance sharing the database may be fetching the same
 	// artifact. Wait for it to store the artifact rather than fetch it too.
+	// The wait makes no upstream request, so a detached fetch waits past
+	// its client too, bounded by the holder's fetch and the lease expiry;
+	// otherwise callers that joined this one would get its cancellation.
+	waitCtx := ctx
+	if upstreamFetchDetached(ctx) {
+		waitCtx = context.WithoutCancel(ctx)
+	}
 	var waitedFor *CacheResult
-	release, storedElsewhere, err := p.awaitFetchLease(ctx, metrics.CacheKindArtifact, key, func() bool {
-		res, ok := served()
+	release, outcome, err := p.awaitFetchLease(waitCtx, metrics.CacheKindArtifact, key, func() bool {
+		res, ok := served(waitCtx)
 		waitedFor = res
 		return ok
 	})
@@ -843,10 +856,14 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		f.err = err
 		return nil, err
 	}
-	if storedElsewhere {
+	if outcome == leaseStored {
 		return waitedFor, nil
 	}
-	defer release()
+	// With leaseFailed, release is a no-op and this instance fetches on its
+	// own, so a failing upstream costs each instance one attempt in
+	// parallel.
+	failed := true
+	defer func() { release(failed) }()
 
 	commitCtx := ctx
 	if upstreamFetchDetached(ctx) && p.acquireDetachSlot() {
@@ -854,6 +871,7 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		commitCtx = context.WithoutCancel(ctx)
 	}
 	stored, path, err := commit(commitCtx)
+	failed = err != nil
 	f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, err
 	if err != nil {
 		return nil, err
@@ -1398,20 +1416,35 @@ func (p *Proxy) coalescedMetadataMiss(ctx context.Context, ecosystem, cacheKey, 
 		// Another instance sharing the database may be fetching the same
 		// document. Only a stored copy within TTL can be served after
 		// waiting, so without that there is nothing to wait for.
+		release := func(bool) {}
 		if p.CacheMetadata && p.MetadataTTL > 0 {
-			release, stored, err := p.awaitFetchLease(fetchCtx, metrics.CacheKindMetadata, key, func() bool {
+			var outcome leaseOutcome
+			var err error
+			release, outcome, err = p.awaitFetchLease(fetchCtx, metrics.CacheKindMetadata, key, func() bool {
 				entry, hit = p.cachedMetadataState(fetchCtx, ecosystem, cacheKey, validate)
 				return hit != nil
 			})
 			if err != nil {
 				return metadataResult{err: err}
 			}
-			if stored {
+			switch outcome {
+			case leaseStored:
 				return *hit
+			case leaseFailed:
+				// Serve the stale copy at once, as the holder did, rather
+				// than trying the failing upstream again. Without one, fetch.
+				if entry != nil {
+					if res := p.staleMetadata(fetchCtx, ecosystem, cacheKey, validate, entry, errFetchFailedElsewhere); res.err == nil {
+						return res
+					}
+				}
+			case leaseFetch:
 			}
-			defer release()
 		}
-		return p.fetchMetadataFromUpstream(fetchCtx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate, entry)
+		res := metadataResult{err: errSharedFetchAbandoned}
+		defer func() { release(res.err != nil || res.stale) }()
+		res = p.fetchMetadataFromUpstream(fetchCtx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate, entry)
+		return res
 	})
 	// The fetch ran the first caller's validate. A caller that joined it runs
 	// its own on the shared bytes, since validate may also decode them for it.
@@ -1470,7 +1503,16 @@ func (p *Proxy) fetchMetadataFromUpstream(ctx context.Context, ecosystem, cacheK
 		return metadataResult{body: meta.body, contentType: meta.contentType, contentEncoding: meta.contentEncoding, digest: digest}
 	}
 
-	// Upstream failed -- fall back to cache if available
+	return p.staleMetadata(ctx, ecosystem, cacheKey, validate, entry, err)
+}
+
+// errFetchFailedElsewhere is the upstream error behind a stale copy served
+// because another instance's fetch for it failed.
+var errFetchFailedElsewhere = errors.New("upstream fetch failed on another instance")
+
+// staleMetadata falls back to the cached copy in entry after the upstream
+// fetch failed with err.
+func (p *Proxy) staleMetadata(ctx context.Context, ecosystem, cacheKey string, validate func([]byte) error, entry *database.MetadataCacheEntry, err error) metadataResult {
 	if !p.CacheMetadata || entry == nil {
 		return metadataResult{err: fmt.Errorf("upstream failed and no cached metadata: %w", err)}
 	}

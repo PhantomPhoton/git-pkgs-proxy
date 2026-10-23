@@ -44,21 +44,32 @@ func (p *Proxy) fetchLeasesEnabled() bool {
 	return p.DB != nil && p.DB.Dialect() == database.DialectPostgres
 }
 
+// leaseOutcome says how a caller goes on after awaitFetchLease.
+type leaseOutcome int
+
+const (
+	// leaseFetch: this instance fetches, and calls release afterwards.
+	leaseFetch leaseOutcome = iota
+	// leaseStored: ready found the result another instance stored.
+	leaseStored
+	// leaseFailed: the fetch this caller waited on failed. It fetches
+	// without the lease, as every instance that waited does at the same
+	// time, or serves a stale copy, rather than queueing behind the others.
+	leaseFailed
+)
+
 // awaitFetchLease takes the lease on key before this instance fetches it from
 // upstream. While another instance holds the lease, it polls ready, which
 // reports whether that instance's result is now stored and, if so, keeps it
-// for the caller. It returns:
-//   - stored true when ready found the result: serve it, nothing to release.
-//   - release when this instance should fetch: call it once the result is
-//     stored or the fetch failed.
-//   - err when ctx ended while waiting.
+// for the caller. release is to be called with whether the fetch failed once
+// it is done; err is set when ctx ended while waiting.
 //
 // A failing lease query is logged and the fetch goes ahead without a lease,
 // so a database hiccup costs a duplicate fetch rather than the request.
-func (p *Proxy) awaitFetchLease(ctx context.Context, kind, key string, ready func() bool) (release func(), stored bool, err error) {
-	noop := func() {}
+func (p *Proxy) awaitFetchLease(ctx context.Context, kind, key string, ready func() bool) (release func(failed bool), outcome leaseOutcome, err error) {
+	noop := func(bool) {}
 	if !p.fetchLeasesEnabled() {
-		return noop, false, nil
+		return noop, leaseFetch, nil
 	}
 	leaseKey := fetchLeaseKey(kind, key)
 	owner := newLeaseOwner()
@@ -68,38 +79,67 @@ func (p *Proxy) awaitFetchLease(ctx context.Context, kind, key string, ready fun
 		acquired, err := p.DB.AcquireFetchLease(leaseKey, owner, fetchLeaseTTL)
 		if err != nil {
 			p.Logger.Warn("fetch lease unavailable, fetching without it", "kind", kind, "error", err)
-			return noop, false, nil
+			return noop, leaseFetch, nil
 		}
 		if acquired {
 			// The holder may have stored the result and released the lease
 			// between this caller's last poll and taking it.
 			if waited && ready() {
 				p.releaseFetchLease(leaseKey, owner)
-				return noop, true, nil
+				return noop, leaseStored, nil
 			}
-			return p.holdFetchLease(leaseKey, owner), false, nil
+			return p.holdFetchLease(leaseKey, owner), leaseFetch, nil
 		}
 		if !waited {
 			metrics.RecordFetchLeaseWait(kind)
 			waited = true
 		}
-		timer := time.NewTimer(delay)
+		outcome, done, err := p.waitForLeaseHolder(ctx, kind, leaseKey, ready, &delay)
+		if done || err != nil {
+			return noop, outcome, err
+		}
+	}
+}
+
+// waitForLeaseHolder polls ready while another instance holds the lease on
+// leaseKey. It is done when ready found the result, when the fetch it waited
+// on failed, or when the lease can't be read; otherwise it returns once the
+// lease is free to take.
+func (p *Proxy) waitForLeaseHolder(ctx context.Context, kind, leaseKey string, ready func() bool, delay *time.Duration) (outcome leaseOutcome, done bool, err error) {
+	holder := ""
+	for {
+		current, failed, held, err := p.DB.FetchLeaseHolder(leaseKey)
+		if err != nil {
+			p.Logger.Warn("fetch lease unavailable, fetching without it", "kind", kind, "error", err)
+			return leaseFetch, true, nil
+		}
+		if failed && current == holder {
+			return leaseFailed, true, nil
+		}
+		if !held || failed {
+			// Released, expired, or failed before this caller waited on
+			// it: free to take.
+			return leaseFetch, false, nil
+		}
+		holder = current
+		timer := time.NewTimer(*delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, false, ctx.Err()
+			return leaseFetch, true, ctx.Err()
 		case <-timer.C:
 		}
 		if ready() {
-			return noop, true, nil
+			return leaseStored, true, nil
 		}
-		delay = min(delay+delay, fetchLeasePollMax)
+		*delay = min(*delay+*delay, fetchLeasePollMax)
 	}
 }
 
 // holdFetchLease renews owner's lease on leaseKey until the returned release
-// is called, which also drops it.
-func (p *Proxy) holdFetchLease(leaseKey, owner string) func() {
+// is called. release drops the lease, or marks it failed so instances
+// waiting on it stop waiting.
+func (p *Proxy) holdFetchLease(leaseKey, owner string) func(failed bool) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -120,10 +160,17 @@ func (p *Proxy) holdFetchLease(leaseKey, owner string) func() {
 			}
 		}
 	}()
-	return func() {
+	return func(failed bool) {
 		close(stop)
 		<-done
-		p.releaseFetchLease(leaseKey, owner)
+		if !failed {
+			p.releaseFetchLease(leaseKey, owner)
+			return
+		}
+		if err := p.DB.FailFetchLease(leaseKey, owner); err != nil {
+			// Waiting instances take the lease once it expires.
+			p.Logger.Warn("failed to mark fetch lease failed", "error", err)
+		}
 	}
 }
 
