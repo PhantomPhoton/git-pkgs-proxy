@@ -84,10 +84,17 @@ func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 		rest := path[idx+4:] // after "/@v/"
 
 		decodedMod := decodeGoModule(module)
+		cooldown := h.cooldownEnabled()
 		switch {
+		case rest == "list" && cooldown:
+			h.serveCooldownList(w, r, module, decodedMod)
+
 		case rest == "list":
 			// GET /{module}/@v/list - list versions
 			h.proxyCached(w, r, decodedMod+"/@v/list")
+
+		case strings.HasSuffix(rest, ".info") && cooldown:
+			h.serveCooldownInfo(w, r, module, decodedMod, rest)
 
 		case strings.HasSuffix(rest, ".info"):
 			// GET /{module}/@v/{version}.info - version metadata
@@ -95,6 +102,14 @@ func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 		case strings.HasSuffix(rest, ".mod"):
 			// GET /{module}/@v/{version}.mod - go.mod file
+			version, err := gomodule.UnescapeVersion(strings.TrimSuffix(rest, ".mod"))
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			if h.checkCooldown(w, r, module, decodedMod, version) {
+				return
+			}
 			h.proxyCached(w, r, decodedMod+"/@v/"+rest)
 
 		case strings.HasSuffix(rest, ".zip"):
@@ -111,6 +126,10 @@ func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Check for @latest
 	if strings.HasSuffix(path, "/@latest") {
 		module := strings.TrimSuffix(path, "/@latest")
+		if h.cooldownEnabled() {
+			h.serveCooldownLatest(w, r, module, decodeGoModule(module))
+			return
+		}
 		h.proxyCached(w, r, decodeGoModule(module)+"/@latest")
 		return
 	}
@@ -130,8 +149,17 @@ func (h *GoHandler) handleDownload(w http.ResponseWriter, r *http.Request, modul
 	// The URL escapes uppercase letters in the version (v1.0.0-!r!c1 for
 	// v1.0.0-RC1), and the zip is cached under that form, so the denylist
 	// is checked against the version itself.
-	if unescaped, err := gomodule.UnescapeVersion(version); err == nil && h.proxy.versionDenied("golang", decodedModule, unescaped) {
+	// A version that doesn't unescape can't be checked, so it isn't fetched.
+	unescaped, err := gomodule.UnescapeVersion(version)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if h.proxy.versionDenied("golang", decodedModule, unescaped) {
 		http.Error(w, ErrVersionDenied.Error()+": "+canonicalVersionPURL("golang", decodedModule, unescaped), http.StatusForbidden)
+		return
+	}
+	if h.checkCooldown(w, r, module, decodedModule, unescaped) {
 		return
 	}
 

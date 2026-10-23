@@ -47,7 +47,7 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | npm | JavaScript | Yes | ✓ |
 | Cargo | Rust | Yes | ✓ |
 | RubyGems | Ruby | Yes | ✓ |
-| Go proxy | Go | | ✓ |
+| Go proxy | Go | Yes† | ✓ |
 | Hex | Elixir | Yes* | ✓ |
 | pub.dev | Dart | Yes | ✓ |
 | PyPI | Python | Yes | ✓ |
@@ -76,6 +76,8 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 Cooldown requires publish timestamps in metadata. Registries without a "Yes" in the cooldown column either don't expose timestamps or haven't been wired up yet.
 
 \* Hex cooldown requires disabling registry signature verification (`HEX_NO_VERIFY_REPO_ORIGIN=1`) since the proxy re-encodes the protobuf payload.
+
+† Go cooldown uses the time in each version's `.info`, which is the commit time of the tagged revision, not when the tag was pushed.
 
 ## Install
 
