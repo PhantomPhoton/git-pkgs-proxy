@@ -1328,3 +1328,72 @@ func TestNPMVersionMetadataDenied(t *testing.T) {
 		t.Fatalf("status = %d, want 403; body: %s", w.Code, w.Body.String())
 	}
 }
+
+// `npm search` asks for /-/v1/search?text=.... The path used to fall through to
+// the package dispatch, which dropped the query string, escaped the path into
+// a package name and cached the answer, so every later search got the first
+// one's results.
+func TestNPMSearchRelaysQueryUncached(t *testing.T) {
+	var (
+		requests int
+		gotPaths []string
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		gotPaths = append(gotPaths, r.URL.EscapedPath())
+		if r.URL.EscapedPath() != "/-/v1/search" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"objects":[],"total":0,"query":%q}`, r.URL.RawQuery)
+	}))
+	defer upstream.Close()
+
+	proxy, db, _, _ := setupTestProxy(t)
+	proxy.CacheMetadata = true
+	proxy.MetadataTTL = time.Hour
+	proxy.HTTPClient = upstream.Client()
+	h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL)
+
+	for _, query := range []string{"text=foo&size=20", "text=bar&size=20", "text=foo&size=20"} {
+		w := serveNPM(t, h, http.MethodGet, "/-/v1/search?"+query, nil, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("search %q: status = %d; body: %s", query, w.Code, w.Body.String())
+		}
+		if want := fmt.Sprintf(`{"objects":[],"total":0,"query":%q}`, query); w.Body.String() != want {
+			t.Errorf("search %q: body = %s, want %s", query, w.Body.String(), want)
+		}
+	}
+	if requests != 3 {
+		t.Errorf("upstream requests = %d (%q), want 3: searches must not be cached", requests, gotPaths)
+	}
+	for _, key := range []string{"-/v1/search", "-", "-/v1"} {
+		if entry, _ := db.GetMetadataCache("npm", key); entry != nil {
+			t.Errorf("search response cached under %q", key)
+		}
+	}
+}
+
+// `npm ping` reads /-/ping, which used to be looked up as a package.
+func TestNPMPingRelaysUpstream(t *testing.T) {
+	var gotPath, gotQuery string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.EscapedPath(), r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{}")
+	}))
+	defer upstream.Close()
+
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	h := NewNPMHandler(proxy, "http://proxy.test", upstream.URL)
+
+	w := serveNPM(t, h, http.MethodGet, "/-/ping?write=true", nil, nil)
+	if w.Code != http.StatusOK || w.Body.String() != "{}" {
+		t.Fatalf("ping = %d %q, want 200 {}", w.Code, w.Body.String())
+	}
+	if gotPath != "/-/ping" || gotQuery != "write=true" {
+		t.Errorf("upstream request = %q?%q, want /-/ping?write=true", gotPath, gotQuery)
+	}
+}

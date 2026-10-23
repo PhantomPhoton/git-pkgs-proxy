@@ -36,7 +36,7 @@ func TestMetadataNotModifiedKeepsStoredDocument(t *testing.T) {
 	proxy.HTTPClient = upstream.Client()
 
 	ctx := context.Background()
-	first := proxy.fetchMetadataDocument(ctx, "test", "pkg", upstream.URL+"/pkg", contentTypeJSON)
+	first := proxy.fetchMetadataDocument(ctx, "test", "pkg", upstream.URL+"/pkg", contentTypeJSON, nil)
 	if first.err != nil {
 		t.Fatal(first.err)
 	}
@@ -46,7 +46,7 @@ func TestMetadataNotModifiedKeepsStoredDocument(t *testing.T) {
 	}
 
 	for range 2 {
-		res := proxy.fetchMetadataDocument(ctx, "test", "pkg", upstream.URL+"/pkg", contentTypeJSON)
+		res := proxy.fetchMetadataDocument(ctx, "test", "pkg", upstream.URL+"/pkg", contentTypeJSON, nil)
 		if res.err != nil || string(res.body) != body || res.digest != first.digest {
 			t.Fatalf("revalidated fetch = %q, digest %q, err %v; want %q, digest %q", res.body, res.digest, res.err, body, first.digest)
 		}
@@ -99,7 +99,7 @@ func TestMetadataNotModifiedStoresRowWithoutDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := proxy.fetchMetadataDocument(context.Background(), "test", "pkg", upstream.URL+"/pkg", contentTypeJSON)
+	res := proxy.fetchMetadataDocument(context.Background(), "test", "pkg", upstream.URL+"/pkg", contentTypeJSON, nil)
 	if res.err != nil || string(res.body) != `{"v":1}` {
 		t.Fatalf("fetch = %q, %v", res.body, res.err)
 	}

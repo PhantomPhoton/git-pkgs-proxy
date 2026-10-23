@@ -353,7 +353,7 @@ upstream:
 - Composer metadata of routed packages carries an empty `notification-url`, so Composer does not report their installs to the default upstream's `notify-batch` endpoint.
 - Use `upstream.auth` for the registry's credentials. The proxy has no authentication of its own, so every client that can reach it can download routed packages.
 - Search (`/composer/search.json`) and the package list (`/composer/packages/list.json`) still come from the default upstream only.
-- npm audit and signing-key requests still go to `upstream.npm`. An audit request lists every package in the dependency tree, routed ones included.
+- npm audit, signing-key, search and ping requests still go to `upstream.npm`. An audit request lists every package in the dependency tree, routed ones included.
 - Routes can only be set in the configuration file, not with environment variables.
 
 Helm HTTP repositories and additional OCI registries are configured as named maps:
@@ -981,6 +981,8 @@ Exact `packages` entries take precedence over patterns. When several patterns ma
 Resolution order: exact package override, then package pattern, then ecosystem override, then global default. This lets you set a conservative default while exempting trusted package families.
 
 Currently supported for npm, PyPI, pub.dev, Composer, Cargo, NuGet, Conda, RubyGems, and Hex. These ecosystems include publish timestamps in their metadata.
+
+With cooldown on, the proxy asks npm for full packuments, since the abbreviated ones it uses otherwise carry no publish times. Abbreviated packuments cached before cooldown was turned on are fetched again in full rather than served, including as a stale copy when the upstream is down.
 
 Note: Hex cooldown requires disabling registry signature verification since the proxy re-encodes the protobuf payload without the original signature. Set `HEX_NO_VERIFY_REPO_ORIGIN=1` or configure your repo with `no_verify: true`.
 

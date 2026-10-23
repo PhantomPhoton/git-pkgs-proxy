@@ -1335,9 +1335,10 @@ func (p *Proxy) fetchOrCacheMetadata(ctx context.Context, ecosystem, cacheKey, u
 
 // fetchMetadataDocument is FetchOrCacheMetadata for callers that rewrite the
 // document and need to know which one they got: the result carries its
-// digest along with the body.
-func (p *Proxy) fetchMetadataDocument(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept string) metadataResult {
-	return p.lookupMetadata(ctx, ecosystem, cacheKey, upstreamURL, accept, "", nil)
+// digest along with the body. validate, which may be nil, is as for
+// fetchOrCacheMetadata.
+func (p *Proxy) fetchMetadataDocument(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept string, validate func([]byte) error) metadataResult {
+	return p.lookupMetadata(ctx, ecosystem, cacheKey, upstreamURL, accept, "", validate)
 }
 
 // lookupMetadata implements fetchOrCacheMetadata and fetchMetadataDocument.
