@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -62,59 +63,85 @@ func (h *GoHandler) fetchGoMetadata(ctx context.Context, escapedModule, module, 
 	return body, err
 }
 
-// storesGoTimes reports whether publish times for module can be kept in the
-// versions table. Its rows are keyed by PURL, which lowercases golang names,
-// so modules that differ only in case would share them; such modules read
-// their times from the metadata cache instead.
-func (h *GoHandler) storesGoTimes(module string) bool {
-	return h.proxy.DB != nil && module == strings.ToLower(module)
+// goTimeKey returns the versions-table PURLs a module's times are stored
+// under. golang PURLs lowercase the name, so the key uses the escaped module
+// path (github.com/!azure for github.com/Azure), which keeps modules that
+// differ only in case apart and is the plain path for lowercase modules.
+// Only canonical versions are stored: a query such as a branch name can
+// resolve to another commit later.
+func (h *GoHandler) goTimeKey(module, version string) (versionPURL, packagePURL string, ok bool) {
+	if h.proxy.DB == nil || gomodule.CanonicalVersion(version) != version {
+		return "", "", false
+	}
+	escaped, err := gomodule.EscapePath(module)
+	if err != nil {
+		return "", "", false
+	}
+	return canonicalVersionPURL("golang", escaped, version), canonicalPackagePURL("golang", escaped), true
 }
 
 // publishTime returns a version's time from the versions table, or from its
-// .info, which is then stored. A version whose time can't be read gets the
-// zero time and is let through, as in the other ecosystems.
-func (h *GoHandler) publishTime(ctx context.Context, escapedModule, module, version string) time.Time {
-	versionPURL := canonicalVersionPURL("golang", module, version)
-	if h.storesGoTimes(module) {
+// .info, which is then stored. A version upstream doesn't know, or whose
+// .info has no time, gets the zero time and is let through, as in the other
+// ecosystems. A failed fetch is an error, so a flaky or rate-limited
+// upstream can't let a version through.
+func (h *GoHandler) publishTime(ctx context.Context, escapedModule, module, version string) (time.Time, error) {
+	if versionPURL, _, ok := h.goTimeKey(module, version); ok {
 		if ver, err := h.proxy.DB.GetVersionByPURL(versionPURL); err == nil && ver != nil && ver.PublishedAt.Valid {
-			return ver.PublishedAt.Time
+			return ver.PublishedAt.Time, nil
 		}
 	}
 
 	escapedVersion, err := gomodule.EscapeVersion(version)
 	if err != nil {
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	body, err := h.fetchGoMetadata(ctx, escapedModule, module, "@v/"+escapedVersion+".info")
+	if errors.Is(err, ErrUpstreamNotFound) {
+		return time.Time{}, nil
+	}
 	if err != nil {
-		h.proxy.Logger.Warn("cooldown: could not fetch go version info",
-			"module", module, "version", version, "error", err)
-		return time.Time{}
+		return time.Time{}, err
 	}
 	var info goInfo
-	if err := json.Unmarshal(body, &info); err != nil || info.Time.IsZero() {
-		return time.Time{}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return time.Time{}, err
 	}
-	h.storePublishTime(module, version, info.Time)
-	return info.Time
+	if !info.Time.IsZero() {
+		h.storePublishTime(module, version, info.Time)
+	}
+	return info.Time, nil
 }
 
 func (h *GoHandler) storePublishTime(module, version string, published time.Time) {
-	if !h.storesGoTimes(module) {
+	versionPURL, packagePURL, ok := h.goTimeKey(module, version)
+	if !ok {
 		return
 	}
-	if err := h.proxy.DB.SetVersionPublishedAt(canonicalVersionPURL("golang", module, version), canonicalPackagePURL("golang", module), published); err != nil {
+	if err := h.proxy.DB.SetVersionPublishedAt(versionPURL, packagePURL, published); err != nil {
 		h.proxy.Logger.Warn("cooldown: could not store go publish time",
 			"module", module, "version", version, "error", err)
 	}
 }
 
-// versionInCooldown reports whether an exact version is still in cooldown.
-func (h *GoHandler) versionInCooldown(ctx context.Context, escapedModule, module, version string) bool {
+// checkCooldown answers a request for an exact version in cooldown, or whose
+// time couldn't be read, and reports whether it did.
+func (h *GoHandler) checkCooldown(w http.ResponseWriter, r *http.Request, escapedModule, module, version string) bool {
 	if !h.cooldownEnabled() {
 		return false
 	}
-	return !h.allowedAt(module, h.publishTime(ctx, escapedModule, module, version))
+	published, err := h.publishTime(r.Context(), escapedModule, module, version)
+	if err != nil {
+		h.proxy.Logger.Warn("cooldown: could not read go version time",
+			"module", module, "version", version, "error", err)
+		http.Error(w, "failed to check cooldown", http.StatusBadGateway)
+		return true
+	}
+	if !h.allowedAt(module, published) {
+		h.refuseCooldown(w, module, version)
+		return true
+	}
+	return false
 }
 
 func (h *GoHandler) refuseCooldown(w http.ResponseWriter, module, version string) {
@@ -141,11 +168,17 @@ func (h *GoHandler) allowedVersions(ctx context.Context, escapedModule, module s
 	g.SetLimit(goInfoFetchLimit)
 	for i, v := range versions {
 		g.Go(func() error {
-			keep[i] = h.allowedAt(module, h.publishTime(gctx, escapedModule, module, v))
+			published, err := h.publishTime(gctx, escapedModule, module, v)
+			if err != nil {
+				return fmt.Errorf("reading time of %s: %w", v, err)
+			}
+			keep[i] = h.allowedAt(module, published)
 			return nil
 		})
 	}
-	_ = g.Wait()
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
 
 	allowed := versions[:0]
 	for i, v := range versions {
@@ -186,7 +219,7 @@ func (h *GoHandler) serveCooldownInfo(w http.ResponseWriter, r *http.Request, es
 			h.refuseCooldown(w, module, info.Version)
 			return
 		}
-		if !info.Time.IsZero() && semver.IsValid(info.Version) {
+		if !info.Time.IsZero() {
 			h.storePublishTime(module, info.Version, info.Time)
 		}
 	}

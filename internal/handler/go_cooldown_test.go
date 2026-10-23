@@ -189,3 +189,72 @@ func TestNewestGoVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestGoCooldownFailsClosedOnUpstreamErrors(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/@v/list"):
+			_, _ = w.Write([]byte("v1.0.0\n"))
+		case strings.HasSuffix(r.URL.Path, ".info"):
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+		default:
+			_, _ = w.Write([]byte("module example.com/mod\n"))
+		}
+	}))
+	defer upstream.Close()
+
+	proxy, _, _, fetcher := setupTestProxy(t)
+	proxy.Cooldown = &cooldown.Config{Default: "3d"}
+	h := NewGoHandlerWithUpstream(proxy, "http://localhost:8080", upstream.URL).Routes()
+
+	for _, p := range []string{
+		"/example.com/mod/@v/list",
+		"/example.com/mod/@v/v1.0.0.mod",
+		"/example.com/mod/@v/v1.0.0.zip",
+	} {
+		if w := goGet(h, p); w.Code != http.StatusBadGateway {
+			t.Errorf("%s: status = %d, want 502", p, w.Code)
+		}
+	}
+	if fetcher.fetchCalled {
+		t.Error("zip was fetched without a known time")
+	}
+}
+
+func TestGoCooldownStoresTimesPerExactModule(t *testing.T) {
+	u := newGoCooldownUpstream(t, "v1.1.0")
+	proxy, db, _, _ := setupTestProxy(t)
+	proxy.Cooldown = &cooldown.Config{Default: "3d"}
+	h := NewGoHandlerWithUpstream(proxy, "http://localhost:8080", u.server.URL).Routes()
+
+	_ = goGet(h, "/example.com/mod/@v/list")
+	ver, err := db.GetVersionByPURL(canonicalVersionPURL("golang", "example.com/mod", "v1.0.0"))
+	if err != nil || ver == nil || !ver.PublishedAt.Valid {
+		t.Fatalf("time of v1.0.0 not stored: %v %v", ver, err)
+	}
+
+	gh := &GoHandler{proxy: proxy}
+	upper, _, ok := gh.goTimeKey("github.com/Azure/sdk", "v1.0.0")
+	lower, _, _ := gh.goTimeKey("github.com/azure/sdk", "v1.0.0")
+	if !ok || upper == lower {
+		t.Errorf("modules differing in case share a key: %q %q", upper, lower)
+	}
+	for _, query := range []string{"master", "v1.2", "v1.0.0+meta"} {
+		if _, _, ok := gh.goTimeKey("example.com/mod", query); ok {
+			t.Errorf("time of non-canonical %q would be stored", query)
+		}
+	}
+}
+
+func TestGoRejectsBadlyEscapedVersions(t *testing.T) {
+	u := newGoCooldownUpstream(t, "v1.1.0")
+	h, fetcher, _ := goCooldownHandler(t, u)
+	for _, p := range []string{"/example.com/mod/@v/V1.0.0.zip", "/example.com/mod/@v/V1.0.0.mod"} {
+		if w := goGet(h, p); w.Code != http.StatusNotFound {
+			t.Errorf("%s: status = %d, want 404", p, w.Code)
+		}
+	}
+	if fetcher.fetchCalled || u.count("/example.com/mod/@v/V1.0.0.mod") != 0 {
+		t.Error("badly escaped version reached upstream")
+	}
+}
