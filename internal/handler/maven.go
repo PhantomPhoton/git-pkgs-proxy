@@ -171,6 +171,10 @@ func (s mavenSource) cacheFilename(filename string) string {
 const mavenUpstreamHashBytes = 8
 
 func (h *MavenHandler) handleMetadata(w http.ResponseWriter, r *http.Request, source mavenSource, urlPath string) {
+	if h.cooldownEnabled() && h.serveCooldownMetadata(w, r, source, urlPath) {
+		return
+	}
+
 	body, contentType, cacheKey, err := h.fetchMetadata(r.Context(), source, urlPath)
 	if err != nil {
 		h.writeMetadataError(w, err)
@@ -218,6 +222,10 @@ func (h *MavenHandler) handleDownload(w http.ResponseWriter, r *http.Request, so
 	group, artifact, version, filename := h.parsePath(urlPath)
 	if artifact == "" {
 		h.proxyUpstream(w, r, source, urlPath)
+		return
+	}
+
+	if h.checkCooldown(w, r, source, urlPath, version) {
 		return
 	}
 
