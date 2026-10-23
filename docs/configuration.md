@@ -980,9 +980,18 @@ Exact `packages` entries take precedence over patterns. When several patterns ma
 
 Resolution order: exact package override, then package pattern, then ecosystem override, then global default. This lets you set a conservative default while exempting trusted package families.
 
-Currently supported for npm, PyPI, pub.dev, Composer, Cargo, NuGet, Conda, RubyGems, Hex and Go. These ecosystems include publish timestamps in their metadata.
+Currently supported for npm, PyPI, pub.dev, Composer, Cargo, NuGet, Conda, RubyGems, Hex, Go and Maven. Most of these ecosystems include publish timestamps in their metadata; Go and Maven are described below.
 
 Go has no publish time. The module proxy's `.info` gives the commit time of the revision a version points at, so a version tagged on an old commit counts as old. The proxy reads each listed version's `.info` once, stores the time, and leaves versions in cooldown out of `@v/list` and `@latest`. When upstream's `@latest` is in cooldown, it serves the newest release out of cooldown instead. Requests for a version in cooldown, including its `.info`, `.mod` and `.zip`, and a branch or commit query that resolves to one, get 403 rather than 404, because the go command moves on to the next `GOPROXY` entry, such as `direct`, after a 404. If a version's `.info` can't be fetched, the list or download fails with 502 instead of letting the version through.
+
+Maven metadata has no publish time per version. The proxy uses the `Last-Modified` header of each version's `.pom`, which on Maven Central is the time the version was deployed. It reads the header once per version with a `HEAD` request and stores the time, for each repository under `upstream.maven_repositories` separately. To keep requests to the upstream down, it only checks versions that can still be in cooldown: none when the metadata's `<lastUpdated>` is older than the cooldown, and otherwise the versions from the end of the list back to the first one that is old enough. Versions in cooldown are left out of `maven-metadata.xml`, `<latest>` and `<release>` are set to the last versions left, and the metadata's `.md5`, `.sha1`, `.sha256` and `.sha512` files are computed from what is served. Requests for any file of a version in cooldown get 403, as for a version on the denylist. If a `.pom` can't be checked, the metadata or download fails with 502 instead of letting the version through; a version without a `.pom` is let through.
+
+Maven caveats:
+
+- A Nexus or Artifactory upstream may report when it cached the `.pom` rather than when it was published, so a version can stay in cooldown longer than it should.
+- On Google's Maven Central mirror, `Last-Modified` is when the file reached the mirror's bucket, a few hours after it was published, so versions stay in cooldown a little longer. The upload time is in `x-goog-meta-last-modified`, which the proxy does not read. It is missing for files from the mirror's 2019 bulk import.
+- Maven Central lists versions in version order, not in the order they were published. A patch to an older release line published after a newer release that is out of cooldown stays listed while it is in cooldown, but its files are still refused.
+- SNAPSHOT versions are not held back.
 
 With cooldown on, the proxy asks npm for full packuments, since the abbreviated ones it uses otherwise carry no publish times. Abbreviated packuments cached before cooldown was turned on are fetched again in full rather than served, including as a stale copy when the upstream is down.
 
