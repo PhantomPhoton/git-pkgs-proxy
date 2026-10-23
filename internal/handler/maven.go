@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -170,32 +171,44 @@ func (s mavenSource) cacheFilename(filename string) string {
 const mavenUpstreamHashBytes = 8
 
 func (h *MavenHandler) handleMetadata(w http.ResponseWriter, r *http.Request, source mavenSource, urlPath string) {
-	cacheKey := source.metadataCacheKey(urlPath)
+	body, contentType, cacheKey, err := h.fetchMetadata(r.Context(), source, urlPath)
+	if err != nil {
+		h.writeMetadataError(w, err)
+		return
+	}
+
+	h.proxy.writeMetadataCachedResponse(w, r, "maven", cacheKey, body, contentType)
+}
+
+// fetchMetadata fetches a metadata file from the source's upstream, or from
+// its fallback when the upstream doesn't have it, and returns it with the
+// key it is cached under.
+func (h *MavenHandler) fetchMetadata(ctx context.Context, source mavenSource, urlPath string) (body []byte, contentType, cacheKey string, err error) {
+	cacheKey = source.metadataCacheKey(urlPath)
 	upstreamURL := fmt.Sprintf("%s/%s", source.upstreamURL, urlPath)
 
-	body, contentType, err := h.proxy.FetchOrCacheMetadata(r.Context(), "maven", cacheKey, upstreamURL, "*/*")
+	body, contentType, err = h.proxy.FetchOrCacheMetadata(ctx, "maven", cacheKey, upstreamURL, "*/*")
 	if err != nil && source.fallbackURL != "" {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			pluginPortalURL := fmt.Sprintf("%s/%s", source.fallbackURL, urlPath)
 			h.proxy.Logger.Info("maven metadata unavailable in primary upstream, trying Gradle Plugin Portal",
 				"path", urlPath)
-			body, contentType, err = h.proxy.FetchOrCacheMetadata(r.Context(), "maven", cacheKey, pluginPortalURL, "*/*")
+			body, contentType, err = h.proxy.FetchOrCacheMetadata(ctx, "maven", cacheKey, pluginPortalURL, "*/*")
 		}
 	}
-	if err != nil {
-		if errors.Is(err, ErrUpstreamNotFound) {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		if writeUpstreamHeld(w, err) {
-			return
-		}
-		h.proxy.Logger.Error("metadata fetch failed", "error", err)
-		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
+	return body, contentType, cacheKey, err
+}
+
+func (h *MavenHandler) writeMetadataError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrUpstreamNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-
-	h.proxy.writeMetadataCachedResponse(w, r, "maven", cacheKey, body, contentType)
+	if writeUpstreamHeld(w, err) {
+		return
+	}
+	h.proxy.Logger.Error("metadata fetch failed", "error", err)
+	http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 }
 
 // handleDownload serves an artifact file, fetching and caching from upstream if needed.
