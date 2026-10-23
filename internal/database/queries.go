@@ -795,6 +795,7 @@ func (db *DB) SearchPackages(query string, ecosystem string, limit int, offset i
 	var args []any
 
 	if ecosystem != "" {
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
 		sqlQuery = db.Rebind(`
 			SELECT p.ecosystem, p.name, p.latest_version, p.license,
 			       COALESCE(SUM(a.hit_count), 0) as hits,
@@ -803,12 +804,12 @@ func (db *DB) SearchPackages(query string, ecosystem string, limit int, offset i
 			FROM packages p
 			LEFT JOIN versions v ON v.package_purl = p.purl
 			LEFT JOIN artifacts a ON a.version_purl = v.purl
-			WHERE p.name LIKE ? AND p.ecosystem = ? AND a.storage_path IS NOT NULL
+			WHERE p.name LIKE ? AND ` + condition + ` AND a.storage_path IS NOT NULL
 			GROUP BY p.purl, p.ecosystem, p.name, p.latest_version, p.license
 			ORDER BY hits DESC
 			LIMIT ? OFFSET ?
 		`)
-		args = []any{searchPattern, ecosystem, limit, offset}
+		args = append(append([]any{searchPattern}, ecosystemArgs...), limit, offset)
 	} else {
 		sqlQuery = db.Rebind(`
 			SELECT p.ecosystem, p.name, p.latest_version, p.license,
@@ -847,14 +848,15 @@ func (db *DB) CountSearchResults(query string, ecosystem string) (int64, error) 
 	var args []any
 
 	if ecosystem != "" {
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
 		sqlQuery = db.Rebind(`
 			SELECT COUNT(DISTINCT p.purl)
 			FROM packages p
 			LEFT JOIN versions v ON v.package_purl = p.purl
 			LEFT JOIN artifacts a ON a.version_purl = v.purl
-			WHERE p.name LIKE ? AND p.ecosystem = ? AND a.storage_path IS NOT NULL
+			WHERE p.name LIKE ? AND ` + condition + ` AND a.storage_path IS NOT NULL
 		`)
-		args = []any{searchPattern, ecosystem}
+		args = append([]any{searchPattern}, ecosystemArgs...)
 	} else {
 		sqlQuery = db.Rebind(`
 			SELECT COUNT(DISTINCT p.purl)
@@ -1093,8 +1095,9 @@ func (db *DB) ListCachedPackages(ecosystem string, sortBy string, limit int, off
 	whereClause := "WHERE a.storage_path IS NOT NULL"
 	args := []any{}
 	if ecosystem != "" {
-		whereClause += " AND p.ecosystem = ?"
-		args = append(args, ecosystem)
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
+		whereClause += " AND " + condition
+		args = append(args, ecosystemArgs...)
 	}
 
 	groupByClause := "GROUP BY p.purl, p.ecosystem, p.name, p.latest_version, p.license"
@@ -1176,8 +1179,9 @@ func (db *DB) CountCachedPackages(ecosystem string) (int64, error) {
 	whereClause := "WHERE a.storage_path IS NOT NULL"
 	args := []any{}
 	if ecosystem != "" {
-		whereClause += " AND p.ecosystem = ?"
-		args = append(args, ecosystem)
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
+		whereClause += " AND " + condition
+		args = append(args, ecosystemArgs...)
 	}
 
 	query := fmt.Sprintf(`
