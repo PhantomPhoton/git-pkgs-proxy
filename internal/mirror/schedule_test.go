@@ -175,3 +175,59 @@ func TestSchedulerSkipsScheduleWithoutInterval(t *testing.T) {
 		t.Errorf("calls = %d, want 0", got)
 	}
 }
+
+func TestSchedulerSkipsRunClaimedElsewhere(t *testing.T) {
+	images := &scheduleImages{}
+	schedule := Schedule{PURLs: []string{"pkg:docker/alpine@3"}, Interval: time.Hour}
+	s := newTestScheduler(images, schedule)
+	var mu sync.Mutex
+	var keys []string
+	var gaps []time.Duration
+	claim := true
+	s.Claim = func(key string, minGap time.Duration) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		keys = append(keys, key)
+		gaps = append(gaps, minGap)
+		return claim, nil
+	}
+
+	s.run(context.Background(), 0, schedule)
+	if got := images.calls.Load(); got != 1 {
+		t.Fatalf("calls after a claimed run = %d, want 1", got)
+	}
+	claim = false
+	s.run(context.Background(), 0, schedule)
+	if got := images.calls.Load(); got != 1 {
+		t.Fatalf("calls after a run claimed elsewhere = %d, want 1", got)
+	}
+	s.Claim = func(string, time.Duration) (bool, error) { return false, errors.New("database down") }
+	s.run(context.Background(), 0, schedule)
+	if got := images.calls.Load(); got != 1 {
+		t.Fatalf("calls after a failed claim = %d, want 1", got)
+	}
+
+	if keys[0] != keys[1] {
+		t.Errorf("claim keys differ between runs: %q, %q", keys[0], keys[1])
+	}
+	// Runs come at least 0.9 intervals apart; the gap stays below that.
+	if want := 48 * time.Minute; gaps[0] != want {
+		t.Errorf("minGap = %s, want %s", gaps[0], want)
+	}
+}
+
+func TestScheduleKey(t *testing.T) {
+	base := Schedule{PURLs: []string{"pkg:docker/alpine@3"}, Platforms: []string{"linux/amd64"}, Interval: time.Hour}
+	if scheduleKey(base) != scheduleKey(Schedule{PURLs: []string{"pkg:docker/alpine@3"}, Platforms: []string{"linux/amd64"}, Interval: time.Hour}) {
+		t.Error("same schedule gave different keys")
+	}
+	for name, other := range map[string]Schedule{
+		"purls":     {PURLs: []string{"pkg:docker/alpine@4"}, Platforms: base.Platforms, Interval: base.Interval},
+		"platforms": {PURLs: base.PURLs, Platforms: []string{"linux/arm64"}, Interval: base.Interval},
+		"interval":  {PURLs: base.PURLs, Platforms: base.Platforms, Interval: 2 * time.Hour},
+	} {
+		if scheduleKey(other) == scheduleKey(base) {
+			t.Errorf("changing %s kept the key", name)
+		}
+	}
+}

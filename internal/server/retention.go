@@ -47,16 +47,22 @@ func (s *Server) startRetentionLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.ParseRetentionSweepInterval())
 	defer ticker.Stop()
 
-	sweepRetention(ctx, s.db, s.logger, reg, rules, time.Now())
+	s.sweepRetention(ctx, reg, rules)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sweepRetention(ctx, s.db, s.logger, reg, rules, time.Now())
+			s.sweepRetention(ctx, reg, rules)
 		}
 	}
+}
+
+func (s *Server) sweepRetention(ctx context.Context, reg *retention.Registry, rules retention.Rules) {
+	s.runExclusive(ctx, "retention", func() {
+		sweepRetention(ctx, s.db, s.logger, reg, rules, time.Now())
+	})
 }
 
 // notCovered returns the known ecosystem keys the global default cannot reach.

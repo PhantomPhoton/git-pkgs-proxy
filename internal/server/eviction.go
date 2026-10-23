@@ -39,7 +39,9 @@ func (s *Server) startEvictionLoop(ctx context.Context) {
 }
 
 func (s *Server) runEviction(ctx context.Context, maxSize int64) {
-	evictLRU(ctx, s.db, s.storage, s.logger, maxSize)
+	s.runExclusive(ctx, "eviction", func() {
+		evictLRU(ctx, s.db, s.storage, s.logger, maxSize)
+	})
 }
 
 // evictLRU removes the least recently used cached artifacts and metadata

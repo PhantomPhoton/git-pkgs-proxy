@@ -24,6 +24,7 @@ func (s *Server) startMirrorSchedules(ctx context.Context, proxy *handler.Proxy)
 		schedules[i] = mirror.Schedule{PURLs: schedule.Images, Platforms: schedule.Platforms, Interval: schedule.IntervalDuration()}
 	}
 	s.scheduler = mirror.NewScheduler(m, schedules, s.logger)
+	s.scheduler.Claim = s.db.ClaimJobRun
 	s.scheduler.Start(ctx)
 	s.logger.Info("mirror schedules enabled", "schedules", len(schedules))
 }
