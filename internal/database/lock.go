@@ -96,3 +96,12 @@ func (db *DB) ClaimJobRun(name string, minGap time.Duration) (bool, error) {
 	}
 	return n > 0, nil
 }
+
+// ReleaseJobRun drops the named job's last claim, so the next attempt on any
+// instance runs it. It is for a run that was interrupted before it finished.
+func (db *DB) ReleaseJobRun(name string) error {
+	if _, err := db.Exec(db.Rebind(`DELETE FROM job_runs WHERE name = ?`), name); err != nil {
+		return fmt.Errorf("releasing job run %s: %w", name, err)
+	}
+	return nil
+}

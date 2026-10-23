@@ -35,6 +35,9 @@ type Scheduler struct {
 	// instance keeps its own timer, so without it every instance would run
 	// every schedule.
 	Claim func(key string, minGap time.Duration) (bool, error)
+	// Release, when set, drops the claim of a run that was interrupted, so
+	// the next attempt runs it rather than waiting an interval.
+	Release func(key string) error
 	// randN returns a value in [0, n); tests replace it.
 	randN func(n int64) int64
 }
@@ -83,11 +86,12 @@ func (s *Scheduler) loop(ctx context.Context, index int, schedule Schedule) {
 }
 
 func (s *Scheduler) run(ctx context.Context, index int, schedule Schedule) {
+	key := scheduleKey(schedule)
 	if s.Claim != nil {
 		// Later runs come at least interval - 2*spread apart, so a run
 		// started more recently than that was another instance's.
 		minGap := schedule.Interval - 2*(schedule.Interval/scheduleJitter) //nolint:mnd // two spreads of margin
-		claimed, err := s.Claim(scheduleKey(schedule), minGap)
+		claimed, err := s.Claim(key, minGap)
 		if err != nil {
 			s.logger.Warn("mirror schedule: failed to claim run, skipping it", "schedule", index, "error", err)
 			return
@@ -100,6 +104,11 @@ func (s *Scheduler) run(ctx context.Context, index int, schedule Schedule) {
 	started := time.Now()
 	progress, err := s.mirror.Run(ctx, &PURLSource{PURLs: schedule.PURLs, Platforms: schedule.Platforms})
 	if ctx.Err() != nil {
+		if s.Claim != nil && s.Release != nil {
+			if err := s.Release(key); err != nil {
+				s.logger.Warn("mirror schedule: failed to release interrupted run", "schedule", index, "error", err)
+			}
+		}
 		return
 	}
 	if err != nil {

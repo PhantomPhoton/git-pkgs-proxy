@@ -216,6 +216,54 @@ func TestSchedulerSkipsRunClaimedElsewhere(t *testing.T) {
 	}
 }
 
+// TestSchedulerReleasesInterruptedRun checks that a run cut off by shutdown
+// does not count as done: the next attempt, on a restarted instance or
+// another one, runs the schedule again.
+func TestSchedulerReleasesInterruptedRun(t *testing.T) {
+	images := &scheduleImages{block: make(chan struct{})}
+	schedule := Schedule{PURLs: []string{"pkg:docker/alpine@3"}, Interval: time.Hour}
+	s := newTestScheduler(images, schedule)
+	// The claims of a shared database: a claimed key is not claimed again.
+	var mu sync.Mutex
+	claims := map[string]bool{}
+	s.Claim = func(key string, _ time.Duration) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if claims[key] {
+			return false, nil
+		}
+		claims[key] = true
+		return true, nil
+	}
+	s.Release = func(key string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		delete(claims, key)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.run(ctx, 0, schedule)
+		close(done)
+	}()
+	waitFor(t, "the run to start", func() bool { return images.calls.Load() == 1 })
+	cancel()
+	<-done
+
+	close(images.block)
+	s.run(context.Background(), 0, schedule)
+	if got := images.calls.Load(); got != 2 {
+		t.Fatalf("calls = %d, want 2: the interrupted run blocked the next one", got)
+	}
+	// A finished run keeps its claim.
+	s.run(context.Background(), 0, schedule)
+	if got := images.calls.Load(); got != 2 {
+		t.Fatalf("calls = %d, want 2 after a finished run", got)
+	}
+}
+
 func TestScheduleKey(t *testing.T) {
 	base := Schedule{PURLs: []string{"pkg:docker/alpine@3"}, Platforms: []string{"linux/amd64"}, Interval: time.Hour}
 	if scheduleKey(base) != scheduleKey(Schedule{PURLs: []string{"pkg:docker/alpine@3"}, Platforms: []string{"linux/amd64"}, Interval: time.Hour}) {

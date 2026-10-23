@@ -1508,7 +1508,7 @@ mirror:
 
 Each run checks the tag with a HEAD request. If the tag still points to the cached digest, nothing else is fetched. If it moved, the new manifests and blobs are fetched first and the tag is switched only when all of them are cached, so a failed run leaves the previous image pullable. Images of one schedule are mirrored one after the other.
 
-- The first run starts within ten minutes of startup, later runs every `interval` ±10 %, so restarts and several instances don't hit the registry at once. Instances sharing a PostgreSQL database run each schedule once per interval: the first to reach it records the run, and the others skip it.
+- The first run starts within ten minutes of startup, later runs every `interval` ±10 %, so restarts and several instances don't hit the registry at once. Instances sharing a PostgreSQL database run each schedule once per interval: the first to reach it records the run, and the others skip it. A run cut off by a shutdown is not recorded, so the next instance to reach the schedule runs it.
 - Digest-pinned PURLs never move and are rejected. A `pkg:oci` digest with `tag=` is accepted; the tag is refreshed and a warning is logged when it no longer matches the digest.
 - The previous digest stays cached, so pulls by digest keep working, until eviction or retention removes it.
 - Docker Hub does not count HEAD requests against its pull limit, but every changed manifest is a pull. Set `platforms` and `upstream.auth` for `registry-1.docker.io` to stay under the anonymous limit.

@@ -46,6 +46,18 @@ func TestClaimJobRun(t *testing.T) {
 		if err != nil || !claimed {
 			t.Fatalf("claim after the gap = %v, %v; want claimed", claimed, err)
 		}
+		// A released run can be claimed again within the gap.
+		if err := db.ReleaseJobRun("mirror-schedule:a"); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err = db.ClaimJobRun("mirror-schedule:a", time.Hour)
+		if err != nil || !claimed {
+			t.Fatalf("claim after release = %v, %v; want claimed", claimed, err)
+		}
+		claimed, err = db.ClaimJobRun("mirror-schedule:b", time.Hour)
+		if err != nil || claimed {
+			t.Fatalf("other job after release = %v, %v; want still claimed", claimed, err)
+		}
 	})
 }
 
