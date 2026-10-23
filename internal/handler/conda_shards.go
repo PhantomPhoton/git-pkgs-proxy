@@ -18,23 +18,12 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// Sharded repodata (CEP 16) splits repodata.json into an index,
-// <subdir>/repodata_shards.msgpack.zst, that maps each package name to the
-// sha256 of its shard, and one zstd-compressed msgpack shard per package
-// stored under that hash.
-//
-// Without cooldown the index and the shards are passed through and cached as
-// metadata. With cooldown, shards have to be filtered, and that changes their
-// bytes. Clients cache shards by the hash in the index and never fetch the same
-// hash again, so a filtered shard can't be served under its upstream hash. The
-// proxy rewrites the index instead: every hash is XORed with a mask derived
-// from the channel, the subdir and the current hour, and shards_base_url points
-// at cooldown-shards/{hour}/. A shard request there undoes the mask, fetches
-// the upstream shard and filters it. Each hour the keys change, so clients
-// fetch shards again and see versions that have left cooldown since.
-//
-// When the index can't be served this way, the proxy answers 404 and clients
-// fall back to repodata.json, which is filtered too.
+// Sharded repodata (CEP 16) maps each package name to the sha256 of its
+// shard. With cooldown the proxy filters shards, which changes their bytes,
+// but clients cache shards by hash and never fetch the same hash again. So
+// the rewritten index XORs every hash with a mask that changes each hour:
+// filtered shards get hashes of their own, and clients fetch them again once
+// versions have left cooldown.
 const (
 	condaShardIndexFile   = "repodata_shards.msgpack.zst"
 	condaShardSuffix      = ".msgpack.zst"
@@ -285,7 +274,10 @@ func (idx *condaShardIndex) infoString(key string) (string, error) {
 
 // shardsLayout checks that packages and shards sit where the proxy routes
 // them, below the subdir of indexURL, and returns the shards directory
-// relative to the subdir: "" or "shards/".
+// relative to the subdir: "" or "shards/". Clients resolve base_url and
+// shards_base_url against the proxy's URL, so only relative paths stay on
+// the proxy: a scheme or host leads clients around it, a leading / outside
+// its mount.
 func (idx *condaShardIndex) shardsLayout(indexURL string) (string, error) {
 	base, err := url.Parse(indexURL)
 	if err != nil {
@@ -299,6 +291,9 @@ func (idx *condaShardIndex) shardsLayout(indexURL string) (string, error) {
 		u, err := url.Parse(ref)
 		if err != nil {
 			return "", err
+		}
+		if u.Scheme != "" || u.Host != "" || strings.HasPrefix(u.Path, "/") {
+			return "", errCondaShardLayout
 		}
 		return base.ResolveReference(u).String(), nil
 	}
@@ -316,11 +311,8 @@ func (idx *condaShardIndex) shardsLayout(indexURL string) (string, error) {
 		return "", err
 	}
 	resolved, err := resolve(shardsBaseURL)
-	if err != nil {
-		return "", err
-	}
 	rel, ok := strings.CutPrefix(resolved, subdir)
-	if !ok || (rel != "" && rel != condaShardsSubdir) {
+	if err != nil || !ok || (rel != "" && rel != condaShardsSubdir) {
 		return "", fmt.Errorf("%w: shards_base_url %q", errCondaShardLayout, shardsBaseURL)
 	}
 	return rel, nil

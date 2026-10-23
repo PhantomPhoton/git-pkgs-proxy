@@ -74,12 +74,7 @@ func newShardUpstream(t *testing.T, info map[string]any) *shardFixture {
 	if s, _ := info["shards_base_url"].(string); strings.Contains(s, "shards/") {
 		layout = "shards/"
 	}
-	index := zstdMsgpack(t, map[string]any{
-		"version": 1,
-		"info":    info,
-		"shards":  map[string]any{"testpkg": sum[:]},
-	})
-
+	var index []byte
 	f.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.requests = append(f.requests, r.URL.Path)
 		switch r.URL.Path {
@@ -92,6 +87,20 @@ func newShardUpstream(t *testing.T, info map[string]any) *shardFixture {
 		}
 	}))
 	t.Cleanup(f.upstream.Close)
+
+	// {upstream} in an info value stands for the upstream's URL, {host} for
+	// its host.
+	placeholders := strings.NewReplacer("{upstream}", f.upstream.URL, "{host}", strings.TrimPrefix(f.upstream.URL, "http://"))
+	for k, v := range info {
+		if s, ok := v.(string); ok {
+			info[k] = placeholders.Replace(s)
+		}
+	}
+	index = zstdMsgpack(t, map[string]any{
+		"version": 1,
+		"info":    info,
+		"shards":  map[string]any{"testpkg": sum[:]},
+	})
 	return f
 }
 
@@ -236,9 +245,14 @@ func TestCondaCooldownShardRejectsBadPaths(t *testing.T) {
 
 func TestCondaShardIndexUnsupportedLayout(t *testing.T) {
 	for name, info := range map[string]map[string]any{
-		"packages elsewhere": {"base_url": "https://cdn.example.com/conda-forge/noarch/", "shards_base_url": ""},
-		"shards elsewhere":   {"base_url": "", "shards_base_url": "https://cdn.example.com/shards/"},
-		"nested shards":      {"base_url": "", "shards_base_url": "./a/b/"},
+		"packages elsewhere":   {"base_url": "https://cdn.example.com/conda-forge/noarch/", "shards_base_url": ""},
+		"shards elsewhere":     {"base_url": "", "shards_base_url": "https://cdn.example.com/shards/"},
+		"nested shards":        {"base_url": "", "shards_base_url": "./a/b/"},
+		"packages upstream":    {"base_url": "{upstream}/conda-forge/noarch/", "shards_base_url": ""},
+		"shards upstream":      {"base_url": "", "shards_base_url": "{upstream}/conda-forge/noarch/"},
+		"no scheme upstream":   {"base_url": "//{host}/conda-forge/noarch/", "shards_base_url": ""},
+		"root-relative":        {"base_url": "/conda-forge/noarch/", "shards_base_url": ""},
+		"root-relative shards": {"base_url": "", "shards_base_url": "/conda-forge/noarch/shards/"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newShardUpstream(t, info)
