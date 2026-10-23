@@ -152,10 +152,14 @@ func (p *Proxy) ReadMetadata(r io.Reader) ([]byte, error) {
 
 // Proxy provides shared functionality for protocol handlers.
 type Proxy struct {
-	DB                  *database.DB
-	Storage             storage.Storage
-	Fetcher             fetch.FetcherInterface
-	Resolver            *fetch.Resolver
+	DB       *database.DB
+	Storage  storage.Storage
+	Fetcher  fetch.FetcherInterface
+	Resolver *fetch.Resolver
+	// RouteFor returns how to fetch a package that doesn't come from the
+	// ecosystem's default upstream, such as an npm package in
+	// upstream.npm_routes, or nil to use Resolver.
+	RouteFor            func(ecosystem, name string) *ArtifactRoute
 	Logger              *slog.Logger
 	Cooldown            CooldownPolicy
 	Denylist            *denylist.Policy
@@ -290,6 +294,9 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 		filename = info.Filename
 		if filename == "" {
 			return nil, errors.New("resolved artifact has no filename")
+		}
+		if route := p.routeFor(ecosystem, name); route != nil {
+			filename = route.FilenamePrefix + filename
 		}
 	}
 	if p.StreamArtifacts {
@@ -521,8 +528,29 @@ func (p *Proxy) rejectUnusableCacheRecord(artifact *database.CachedArtifact, ver
 	}
 }
 
+// ArtifactRoute fetches a package from an upstream other than its
+// ecosystem's default one.
+type ArtifactRoute struct {
+	// Resolver finds the package's download URLs on that upstream.
+	Resolver *fetch.Resolver
+	// FilenamePrefix qualifies the artifact filename the way the handler
+	// does for the route, so clients are served what was fetched.
+	FilenamePrefix string
+}
+
+func (p *Proxy) routeFor(ecosystem, name string) *ArtifactRoute {
+	if p.RouteFor == nil {
+		return nil
+	}
+	return p.RouteFor(ecosystem, name)
+}
+
 func (p *Proxy) resolveArtifact(ctx context.Context, ecosystem, name, version string) (*fetch.ArtifactInfo, error) {
-	info, err := p.Resolver.Resolve(ctx, ecosystem, name, version)
+	resolver := p.Resolver
+	if route := p.routeFor(ecosystem, name); route != nil {
+		resolver = route.Resolver
+	}
+	info, err := resolver.Resolve(ctx, ecosystem, name, version)
 	if err != nil {
 		if errors.Is(err, fetch.ErrNotFound) {
 			return nil, ErrUpstreamNotFound
