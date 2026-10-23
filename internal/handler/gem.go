@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -88,19 +89,45 @@ func (h *GemHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 // e.g., "rails-7.1.0.gem" -> ("rails", "7.1.0")
 // e.g., "aws-sdk-s3-1.142.0.gem" -> ("aws-sdk-s3", "1.142.0")
 // e.g., "sorbet-static-0.5.11002-universal-darwin-22.gem" -> ("sorbet-static", "0.5.11002-universal-darwin-22")
+// e.g., "devise-2fa-1.0.0.gem" -> ("devise-2fa", "1.0.0")
 //
-// The version starts at the first hyphen followed by a digit. Platforms can
-// end in a number (universal-java-17, arm64-darwin-23), so splitting at the
-// last one would cut the platform; only gem names with a "-<digit>" segment
-// are misread this way, and those are rare.
+// A gem file is named {name}-{version}[-{platform}]. RubyGems writes a
+// version as dot-separated alphanumeric segments starting with a digit,
+// turning any "-" into ".pre.", and a platform starts with a letter (its
+// CPU, or java), though it can end in a number (universal-java-17), so
+// splitting at the last "-<digit>" would cut the platform. The version
+// starts at the first "-<digit>" that leaves such a version and platform,
+// so a name with a "-<digit>" segment of its own, such as devise-2fa, is
+// kept whole. A filename no split fits is split at the first "-<digit>".
 func (h *GemHandler) parseGemFilename(filename string) (name, version string) {
 	base := strings.TrimSuffix(filename, ".gem")
+	first := -1
 	for i := 0; i+1 < len(base); i++ {
-		if base[i] == '-' && base[i+1] >= '0' && base[i+1] <= '9' {
+		if base[i] != '-' || base[i+1] < '0' || base[i+1] > '9' {
+			continue
+		}
+		if first < 0 {
+			first = i
+		}
+		if gemVersionAndPlatform(base[i+1:]) {
 			return base[:i], base[i+1:]
 		}
 	}
-	return "", ""
+	if first < 0 {
+		return "", ""
+	}
+	return base[:first], base[first+1:]
+}
+
+var (
+	gemVersionPattern  = regexp.MustCompile(`^[0-9]+(\.[0-9A-Za-z]+)*$`)
+	gemPlatformPattern = regexp.MustCompile(`^[A-Za-z][0-9A-Za-z_]*(-[0-9A-Za-z_]+)*$`)
+)
+
+// gemVersionAndPlatform reports whether s reads as {version}[-{platform}].
+func gemVersionAndPlatform(s string) bool {
+	version, platform, hasPlatform := strings.Cut(s, "-")
+	return gemVersionPattern.MatchString(version) && (!hasPlatform || gemPlatformPattern.MatchString(platform))
 }
 
 // handleCompactIndex serves the compact index for a gem, filtering versions

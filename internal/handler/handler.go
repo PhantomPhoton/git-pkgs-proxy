@@ -1924,9 +1924,14 @@ func (p *Proxy) getOrFetchArtifactFromURL(ctx context.Context, ecosystem, name, 
 }
 
 func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (*CacheResult, error) {
-	// Some protocols use qualified cache keys. Check their package identity too.
+	// Some protocols use qualified cache keys. Check their package identity
+	// too, and the cache key itself for those, such as Swift, whose name has
+	// no PURL of its own.
 	if p.versionDenied(ecosystem, name, version) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, canonicalVersionPURL(ecosystem, name, version))
+	}
+	if p.Denylist.Denied(versionPURL) {
+		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
 	}
 	if p.StreamArtifacts {
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash, declared,

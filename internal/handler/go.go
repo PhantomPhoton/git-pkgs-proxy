@@ -10,6 +10,7 @@ import (
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/registries/fetch"
+	gomodule "golang.org/x/mod/module"
 )
 
 const (
@@ -125,6 +126,14 @@ func (h *GoHandler) handleDownload(w http.ResponseWriter, r *http.Request, modul
 
 	h.proxy.Logger.Info("go module download request",
 		"module", decodedModule, "version", version)
+
+	// The URL escapes uppercase letters in the version (v1.0.0-!r!c1 for
+	// v1.0.0-RC1), and the zip is cached under that form, so the denylist
+	// is checked against the version itself.
+	if unescaped, err := gomodule.UnescapeVersion(version); err == nil && h.proxy.versionDenied("golang", decodedModule, unescaped) {
+		http.Error(w, ErrVersionDenied.Error()+": "+canonicalVersionPURL("golang", decodedModule, unescaped), http.StatusForbidden)
+		return
+	}
 
 	downloadURL := h.upstreamURL + r.URL.Path
 	h.discardOtherModulesZip(decodedModule, module, version, filename)

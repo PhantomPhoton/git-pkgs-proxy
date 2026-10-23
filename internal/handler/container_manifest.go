@@ -49,14 +49,16 @@ type cachedContainerManifest struct {
 	fetchedAt     time.Time
 }
 
-func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request, registryURL, name, reference string) {
+// serveManifest serves a manifest unless the denylist names the digest it
+// resolves to under cacheName, the name blobs are stored under.
+func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request, registryURL, name, cacheName, reference string) {
 	accept := containerManifestAccept(r)
 	cacheAccept := normalizeContainerManifestAccept(accept)
 	cached, fromFallback := h.loadContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept)
 
 	immutable := manifestDigestReferencePattern.MatchString(reference)
 	if cached != nil && (immutable || h.containerManifestFresh(cached)) {
-		writeContainerManifest(w, r, cached, false)
+		h.writeManifest(w, r, cacheName, cached, false)
 		return
 	}
 
@@ -73,7 +75,7 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
-		h.serveStaleManifestOrError(w, r, reference, cached, err)
+		h.serveStaleManifestOrError(w, r, cacheName, reference, cached, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -87,12 +89,12 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 		} else {
 			h.storeContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
 		}
-		writeContainerManifest(w, r, cached, false)
+		h.writeManifest(w, r, cacheName, cached, false)
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
 		if shouldServeStaleManifest(resp.StatusCode) && (cached != nil || referrersTagPattern.MatchString(reference)) {
-			h.serveStaleManifestOrError(w, r, reference, cached, fmt.Errorf("upstream status %d", resp.StatusCode))
+			h.serveStaleManifestOrError(w, r, cacheName, reference, cached, fmt.Errorf("upstream status %d", resp.StatusCode))
 			return
 		}
 		h.proxy.relayResponse(w, r, resp, copyContainerManifestHeaders)
@@ -100,13 +102,16 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 	}
 
 	if r.Method == http.MethodHead {
+		if h.manifestDenied(w, cacheName, resp.Header.Get("Docker-Content-Digest")) {
+			return
+		}
 		h.proxy.relayResponse(w, r, resp, copyContainerManifestHeaders)
 		return
 	}
 
 	body, err := h.proxy.ReadMetadata(resp.Body)
 	if err != nil {
-		h.serveStaleManifestOrError(w, r, reference, cached, fmt.Errorf("reading manifest: %w", err))
+		h.serveStaleManifestOrError(w, r, cacheName, reference, cached, fmt.Errorf("reading manifest: %w", err))
 		return
 	}
 	computedDigest := sha256Digest(body)
@@ -136,13 +141,13 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 	if manifest.contentDigest != reference && manifestDigestReferencePattern.MatchString(manifest.contentDigest) {
 		h.storeContainerManifestForAccept(r.Context(), registryURL, name, manifest.contentDigest, accept, cacheAccept, manifest)
 	}
-	writeContainerManifest(w, r, manifest, false)
+	h.writeManifest(w, r, cacheName, manifest, false)
 }
 
-func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *http.Request, reference string, cached *cachedContainerManifest, err error) {
+func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *http.Request, cacheName, reference string, cached *cachedContainerManifest, err error) {
 	if cached != nil {
 		h.proxy.Logger.Warn("upstream manifest fetch failed, serving stale cache", "error", err)
-		writeContainerManifest(w, r, cached, true)
+		h.writeManifest(w, r, cacheName, cached, true)
 		return
 	}
 	if referrersTagPattern.MatchString(reference) {
@@ -155,6 +160,25 @@ func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *h
 	}
 	h.proxy.Logger.Error("failed to fetch manifest", "error", err)
 	h.containerError(w, http.StatusBadGateway, "INTERNAL_ERROR", "failed to fetch from upstream")
+}
+
+// manifestDenied writes a 403 and reports true when the denylist names
+// reference, a tag or digest, under the repository's cache name.
+func (h *ContainerHandler) manifestDenied(w http.ResponseWriter, cacheName, reference string) bool {
+	if reference == "" || !h.proxy.versionDenied("oci", cacheName, reference) {
+		return false
+	}
+	h.containerError(w, http.StatusForbidden, "DENIED",
+		ErrVersionDenied.Error()+": "+canonicalVersionPURL("oci", cacheName, reference))
+	return true
+}
+
+// writeManifest writes manifest unless the denylist names its digest.
+func (h *ContainerHandler) writeManifest(w http.ResponseWriter, r *http.Request, cacheName string, manifest *cachedContainerManifest, stale bool) {
+	if h.manifestDenied(w, cacheName, manifest.contentDigest) {
+		return
+	}
+	writeContainerManifest(w, r, manifest, stale)
 }
 
 func (h *ContainerHandler) containerManifestFresh(manifest *cachedContainerManifest) bool {
