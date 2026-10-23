@@ -13,6 +13,7 @@ import (
 
 func TestTryLockSQLiteAlwaysGranted(t *testing.T) {
 	db := createTestDB(t)
+	defer func() { _ = db.Close() }()
 	release, ok, err := db.TryLock(context.Background(), "job:test")
 	if err != nil || !ok {
 		t.Fatalf("TryLock = %v, %v; want granted", ok, err)
@@ -51,7 +52,11 @@ func TestClaimJobRun(t *testing.T) {
 // forEachDialect runs fn against SQLite and, when PROXY_DATABASE_URL is set,
 // against Postgres.
 func forEachDialect(t *testing.T, fn func(t *testing.T, db *DB)) {
-	t.Run("sqlite", func(t *testing.T) { fn(t, createTestDB(t)) })
+	t.Run("sqlite", func(t *testing.T) {
+		db := createTestDB(t)
+		defer func() { _ = db.Close() }()
+		fn(t, db)
+	})
 	t.Run("postgres", func(t *testing.T) {
 		db := createTestPostgresDB(t)
 		if db == nil {
