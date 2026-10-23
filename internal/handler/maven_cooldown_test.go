@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/git-pkgs/cooldown"
+	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -32,8 +33,9 @@ type mavenCooldownUpstream struct {
 	times       map[string]time.Time
 	pomStatus   map[string]int
 
-	mu   sync.Mutex
-	poms map[string]int
+	mu    sync.Mutex
+	poms  map[string]int
+	heads int
 }
 
 func newMavenCooldownUpstream(t *testing.T) *mavenCooldownUpstream {
@@ -84,11 +86,17 @@ func (u *mavenCooldownUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(file, ".pom") {
 		u.mu.Lock()
 		u.poms[version]++
+		if r.Method == http.MethodHead {
+			u.heads++
+		}
 		u.mu.Unlock()
 		w.Header().Set(headerLastModified, published.UTC().Format(http.TimeFormat))
 		if status := u.pomStatus[version]; status != 0 {
 			// An error page dated long ago must not count as an old version.
 			w.Header().Set(headerLastModified, time.Unix(0, 0).UTC().Format(http.TimeFormat))
+			if status == http.StatusTooManyRequests {
+				w.Header().Set("Retry-After", "60")
+			}
 			w.WriteHeader(status)
 			return
 		}
@@ -265,6 +273,42 @@ func TestMavenCooldownRefusesFiles(t *testing.T) {
 	}
 }
 
+// TestMavenCooldownPOMDownloadCarriesItsTime checks that a build fetching
+// pinned versions, which never reads maven-metadata.xml, costs no requests
+// beyond its downloads: the .pom's own Last-Modified gives the version's
+// time, and Maven fetches the .pom before the version's other files.
+func TestMavenCooldownPOMDownloadCarriesItsTime(t *testing.T) {
+	u := newMavenCooldownUpstream(t)
+	h, proxy := newMavenCooldownHandler(t, u)
+
+	for _, c := range []struct {
+		file string
+		want int
+	}{
+		{"2.1/lib-2.1.pom", http.StatusForbidden},
+		{"2.1/lib-2.1.jar", http.StatusForbidden},
+		{"1.0/lib-1.0.pom", http.StatusOK},
+		{"1.0/lib-1.0.jar", http.StatusOK},
+	} {
+		if w := getMaven(h, mavenTestDir+c.file); w.Code != c.want {
+			t.Errorf("%s: status = %d, want %d", c.file, w.Code, c.want)
+		}
+	}
+	u.mu.Lock()
+	heads := u.heads
+	u.mu.Unlock()
+	if heads != 0 {
+		t.Errorf("HEAD requests = %d, want 0", heads)
+	}
+	if got := u.pomRequests(); got["2.1"] != 1 || got["1.0"] != 1 {
+		t.Errorf("pom requests = %v, want one GET each", got)
+	}
+	ver, _ := proxy.DB.GetVersionByPURL(canonicalVersionPURL("maven", "com.example:lib", "2.1"))
+	if ver == nil || !ver.PublishedAt.Valid || !ver.PublishedAt.Time.Equal(u.times["2.1"].Truncate(time.Second)) {
+		t.Errorf("stored time of 2.1 = %v, want %v", ver, u.times["2.1"])
+	}
+}
+
 func TestMavenCooldownOldLastUpdatedSkipsPOMs(t *testing.T) {
 	u := newMavenCooldownUpstream(t)
 	u.lastUpdated = time.Now().Add(-4 * 24 * time.Hour)
@@ -304,6 +348,24 @@ func TestMavenCooldownIgnoresNon2xxPOMResponses(t *testing.T) {
 	}
 	if ver, _ := proxy.DB.GetVersionByPURL(canonicalVersionPURL("maven", "com.example:lib", "2.1")); ver != nil && ver.PublishedAt.Valid {
 		t.Errorf("time of a 429 stored: %v", ver.PublishedAt.Time)
+	}
+}
+
+// TestMavenCooldownRateLimitedPOMIsHeld checks that a 429 on a .pom time
+// request is answered like any held upstream request, with 503 and the
+// upstream's Retry-After, so clients wait instead of failing the build.
+func TestMavenCooldownRateLimitedPOMIsHeld(t *testing.T) {
+	u := newMavenCooldownUpstream(t)
+	u.pomStatus["2.0"] = http.StatusTooManyRequests
+	h, proxy := newMavenCooldownHandler(t, u)
+	gate := registryclient.NewRateLimitGate(u.server.Client().Transport)
+	proxy.HTTPClient = &http.Client{Transport: gate}
+	proxy.RateLimits = gate
+
+	// Not the .pom, so its time is read with a HEAD.
+	w := getMaven(h, mavenTestDir+"2.0/lib-2.0.jar")
+	if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {
+		t.Errorf("status = %d, Retry-After %q; want 503 with Retry-After", w.Code, w.Header().Get("Retry-After"))
 	}
 }
 

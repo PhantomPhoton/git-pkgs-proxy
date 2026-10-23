@@ -129,6 +129,34 @@ func (h *MavenHandler) publishTime(ctx context.Context, source mavenSource, arti
 	return published, nil
 }
 
+// cooldownFromDownload returns a context that stores the publish time of a
+// version from the download of its .pom, and whether the cooldown check is
+// to run after the download. It does so only for the .pom of a version
+// whose time is not stored yet; for anything else the check runs before.
+func (h *MavenHandler) cooldownFromDownload(ctx context.Context, source mavenSource, urlPath, version string) (context.Context, bool) {
+	if !h.cooldownEnabled() || strings.HasSuffix(version, mavenSnapshot) {
+		return ctx, false
+	}
+	artifactDir := path.Dir(path.Dir(urlPath))
+	group, artifact, ok := mavenCoordinates(artifactDir)
+	if !ok || !usableMavenVersion(version) || path.Base(urlPath) != artifact+"-"+version+".pom" {
+		return ctx, false
+	}
+	versionPURL, packagePURL, store := h.mavenTimeKey(source, group, artifact, version)
+	if !store {
+		return ctx, false
+	}
+	if ver, err := h.proxy.DB.GetVersionByPURL(versionPURL); err == nil && ver != nil && ver.PublishedAt.Valid {
+		return ctx, false
+	}
+	return WithUpstreamLastModified(ctx, func(published time.Time) {
+		if err := h.proxy.DB.SetVersionPublishedAt(versionPURL, packagePURL, published); err != nil {
+			h.proxy.Logger.Warn("cooldown: could not store maven publish time",
+				"group", group, "artifact", artifact, "version", version, "error", err)
+		}
+	}), true
+}
+
 // pomLastModified sends a HEAD request for a .pom and returns its
 // Last-Modified. found is false when upstream doesn't have the file. Only a
 // 2xx response's header is used: an error page's date says nothing about the
@@ -146,6 +174,12 @@ func (h *MavenHandler) pomLastModified(ctx context.Context, pomURL string) (publ
 	switch {
 	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
 		return time.Time{}, false, nil
+	case resp.StatusCode == http.StatusTooManyRequests && h.proxy.RateLimits != nil:
+		// The gate has just noted the upstream's Retry-After; pass it on.
+		if err := h.proxy.RateLimits.Held(pomURL); err != nil {
+			return time.Time{}, false, err
+		}
+		return time.Time{}, false, fmt.Errorf("reading pom time: upstream returned %d", resp.StatusCode)
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		return time.Time{}, false, fmt.Errorf("reading pom time: upstream returned %d", resp.StatusCode)
 	}

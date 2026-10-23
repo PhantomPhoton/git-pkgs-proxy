@@ -225,7 +225,11 @@ func (h *MavenHandler) handleDownload(w http.ResponseWriter, r *http.Request, so
 		return
 	}
 
-	if h.checkCooldown(w, r, source, urlPath, version) {
+	// The .pom of a version whose time isn't known yet carries it in its
+	// own Last-Modified, so it is checked once fetched, without a request
+	// of its own. Maven fetches the .pom before a version's other files.
+	ctx, checkAfter := h.cooldownFromDownload(r.Context(), source, urlPath, version)
+	if !checkAfter && h.checkCooldown(w, r, source, urlPath, version) {
 		return
 	}
 
@@ -238,17 +242,21 @@ func (h *MavenHandler) handleDownload(w http.ResponseWriter, r *http.Request, so
 	upstreamURL := fmt.Sprintf("%s/%s", source.upstreamURL, urlPath)
 	cacheFilename := source.cacheFilename(filename)
 
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "maven", name, version, cacheFilename, upstreamURL)
+	result, err := h.proxy.GetOrFetchArtifactFromURL(ctx, "maven", name, version, cacheFilename, upstreamURL)
 	if err != nil && source.fallbackURL != "" {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			pluginPortalURL := fmt.Sprintf("%s/%s", source.fallbackURL, urlPath)
 			h.proxy.Logger.Info("maven artifact not found in primary upstream, trying Gradle Plugin Portal",
 				"group", group, "artifact", artifact, "version", version, "filename", filename)
-			result, err = h.proxy.GetOrFetchArtifactFromURL(r.Context(), "maven", name, version, cacheFilename, pluginPortalURL)
+			result, err = h.proxy.GetOrFetchArtifactFromURL(ctx, "maven", name, version, cacheFilename, pluginPortalURL)
 		}
 	}
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch artifact")
+		return
+	}
+	if checkAfter && h.checkCooldown(w, r, source, urlPath, version) {
+		_ = result.Reader.Close()
 		return
 	}
 
