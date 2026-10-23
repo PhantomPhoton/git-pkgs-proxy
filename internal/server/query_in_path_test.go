@@ -93,15 +93,21 @@ func TestProtocolHandlersRejectQueryInPath(t *testing.T) {
 }
 
 // TestComposerFilesAllowHashInVersion keeps Composer archive downloads of git
-// branches with '#' in their name working: the version is escaped in the dist
-// URL and the archive is resolved from metadata, not from the request path.
+// branches with '#' or ';' in their name working: the version is escaped in
+// the dist URL and the archive is resolved from metadata, not from the
+// request path.
 func TestComposerFilesAllowHashInVersion(t *testing.T) {
-	var reached atomic.Bool
-	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) })
+	for _, target := range []string{
+		"/composer/files/acme/lib/dev-fix%2F%2342/abc123.zip",
+		"/composer/files/acme/lib/dev-fix%3B42/abc123.zip",
+	} {
+		var reached atomic.Bool
+		next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) })
 
-	w := httptest.NewRecorder()
-	rejectQueryInPath(next).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/composer/files/acme/lib/dev-fix%2F%2342/abc123.zip", nil))
-	if w.Code == http.StatusBadRequest || !reached.Load() {
-		t.Errorf("status = %d, reached = %v; want the request passed on", w.Code, reached.Load())
+		w := httptest.NewRecorder()
+		rejectQueryInPath(next).ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+		if w.Code == http.StatusBadRequest || !reached.Load() {
+			t.Errorf("%s: status = %d, reached = %v; want the request passed on", target, w.Code, reached.Load())
+		}
 	}
 }
