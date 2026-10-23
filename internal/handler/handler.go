@@ -1800,19 +1800,24 @@ func (p *Proxy) proxyCachedWithEncoding(w http.ResponseWriter, r *http.Request, 
 
 	body, contentType, contentEncoding, err := p.fetchOrCacheMetadata(r.Context(), ecosystem, cacheKey, upstreamURL, acceptEncoding, nil, acceptHeaders...)
 	if err != nil {
-		if errors.Is(err, ErrUpstreamNotFound) {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		if writeUpstreamHeld(w, err) {
-			return
-		}
-		p.Logger.Error("metadata fetch failed", "error", err)
-		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
+		p.writeMetadataFetchError(w, err)
 		return
 	}
 
 	p.writeMetadataCachedResponseWithEncoding(w, r, ecosystem, cacheKey, body, contentType, contentEncoding)
+}
+
+// writeMetadataFetchError answers a failed metadata fetch.
+func (p *Proxy) writeMetadataFetchError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrUpstreamNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
+	p.Logger.Error("metadata fetch failed", "error", err)
+	http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 }
 
 // writeMetadataCachedResponse writes a cached metadata response and handles

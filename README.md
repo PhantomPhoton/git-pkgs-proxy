@@ -411,6 +411,8 @@ Or set via command:
 conda config --add channels http://localhost:8080/conda/main
 ```
 
+pixi and other rattler-based clients use sharded repodata ([CEP 16](https://github.com/conda/ceps/blob/main/cep-0016.md)) where a channel offers it, as conda-forge does. Point them at the same channel URLs, for example `pixi init -c http://localhost:8080/conda/conda-forge`. The shard index and shards are cached as metadata when `cache_metadata` is on.
+
 ### CRAN (R)
 
 Set the repository in R:
