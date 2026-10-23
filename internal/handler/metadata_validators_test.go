@@ -429,8 +429,8 @@ func TestRewrittenMetadataLastModifiedAcrossRestart(t *testing.T) {
 }
 
 // TestRewrittenMetadataValidatorsWithCooldown checks that with cooldown on,
-// rewritten metadata keeps an exact ETag but has no Last-Modified: cooldown
-// changes the rewrite as versions age in, while upstream stays the same.
+// rewritten metadata from the rewrite cache has an ETag and a Last-Modified,
+// so clients that only send If-Modified-Since, such as Composer, get 304.
 func TestRewrittenMetadataValidatorsWithCooldown(t *testing.T) {
 	for _, c := range validatorCases {
 		t.Run(c.ecosystem, func(t *testing.T) {
@@ -444,15 +444,34 @@ func TestRewrittenMetadataValidatorsWithCooldown(t *testing.T) {
 			if etag == "" {
 				t.Fatal("no ETag with cooldown on")
 			}
-			if lm := first.Header().Get("Last-Modified"); lm != "" {
-				t.Errorf("Last-Modified = %q with cooldown on, want none", lm)
+			lm := first.Header().Get("Last-Modified")
+			if lm == "" {
+				t.Fatal("no Last-Modified with cooldown on")
 			}
 			if rec := serve(handler, c.path, http.Header{"If-None-Match": {etag}}); rec.Code != http.StatusNotModified {
 				t.Errorf("If-None-Match: status %d, want 304", rec.Code)
 			}
-			future := time.Now().Add(time.Hour).Format(http.TimeFormat)
-			if rec := serve(handler, c.path, http.Header{"If-Modified-Since": {future}}); rec.Code != http.StatusOK {
-				t.Errorf("If-Modified-Since: status %d, want 200", rec.Code)
+			if rec := serve(handler, c.path, http.Header{"If-Modified-Since": {lm}}); rec.Code != http.StatusNotModified {
+				t.Errorf("If-Modified-Since: status %d, want 304", rec.Code)
+			}
+		})
+	}
+}
+
+// TestRewrittenMetadataWithCooldownIsGzipped checks that with cooldown on,
+// clients accepting gzip get the cached compressed copy.
+func TestRewrittenMetadataWithCooldownIsGzipped(t *testing.T) {
+	for _, c := range validatorCases {
+		t.Run(c.ecosystem, func(t *testing.T) {
+			u := newValidatorUpstream(t)
+			compressibleDocuments(u)
+			proxy := validatorProxy(t, u, time.Hour)
+			proxy.Cooldown = &cooldown.Config{Default: "3d"}
+			handler := c.handler(proxy, u)
+			for range 2 {
+				if rec := serve(handler, c.path, http.Header{"Accept-Encoding": {"gzip"}}); rec.Code != http.StatusOK || rec.Header().Get("Content-Encoding") != "gzip" {
+					t.Errorf("status %d, Content-Encoding %q; want 200 gzip", rec.Code, rec.Header().Get("Content-Encoding"))
+				}
 			}
 		})
 	}
@@ -481,7 +500,7 @@ func TestRewriteCacheETag(t *testing.T) {
 	exclaim := func(b []byte) ([]byte, error) { return []byte(string(b) + "!"), nil }
 	key := rewriteCacheKey("npm", "http://proxy", "demo", []byte("doc"))
 
-	m, err := c.rewrite(t.Context(), key, []byte("doc"), exclaim)
+	m, err := c.rewrite(t.Context(), key, []byte("doc"), 0, exclaim)
 	if err != nil || string(m.body) != "doc!" {
 		t.Fatalf("rewrite = %q, %v", m.body, err)
 	}
@@ -685,33 +704,39 @@ func cooldownUpstream(t *testing.T) *validatorUpstream {
 
 // TestRewrittenMetadataETagWithCooldownFollowsKeptVersions checks that with
 // cooldown on, the ETag changes when a version leaves cooldown although the
-// upstream document stays the same, and comes back when the same versions do.
+// upstream document stays the same, once the cached rewrite has expired, and
+// comes back when the same versions do.
 func TestRewrittenMetadataETagWithCooldownFollowsKeptVersions(t *testing.T) {
 	for _, c := range validatorCases {
 		t.Run(c.ecosystem, func(t *testing.T) {
 			u := cooldownUpstream(t)
-			proxy := validatorProxy(t, u, time.Hour)
+			proxy, _, clock := validatorProxyWithDB(t, u, time.Hour)
 			handler := c.handler(proxy, u)
 
 			proxy.Cooldown = &cooldown.Config{Default: "1d"}
 			etag := serve(handler, c.path, nil).Header().Get("ETag")
 
 			proxy.Cooldown = &cooldown.Config{Default: "1h"}
+			if rec := serve(handler, c.path, http.Header{"If-None-Match": {etag}}); rec.Code != http.StatusNotModified {
+				t.Errorf("within the rewrite's lifetime: status %d, want 304 from the cached rewrite", rec.Code)
+			}
+			clock.advance(cooldownRewriteTTL)
 			rec := serve(handler, c.path, http.Header{"If-None-Match": {etag}})
 			if rec.Code != http.StatusOK || rec.Header().Get("ETag") == etag {
 				t.Errorf("after a version left cooldown: status %d, ETag %q; want 200 with a new ETag", rec.Code, rec.Header().Get("ETag"))
 			}
 
 			proxy.Cooldown = &cooldown.Config{Default: "1d"}
+			clock.advance(cooldownRewriteTTL)
 			expectNotModified(t, serve(handler, c.path, http.Header{"If-None-Match": {etag}}), etag)
 		})
 	}
 }
 
 // TestRewrittenMetadataETagWithCooldownComesFromInputs checks that with
-// cooldown on, the ETag is derived from what fixes the rewrite rather than
-// from the rewritten body, when the metadata cache knows the upstream
-// digest, and falls back to the body when it does not.
+// cooldown on and no rewrite cache, the ETag is derived from what fixes the
+// rewrite rather than from the rewritten body, when the metadata cache knows
+// the upstream digest, and falls back to the body when it does not.
 func TestRewrittenMetadataETagWithCooldownComesFromInputs(t *testing.T) {
 	for _, c := range validatorCases {
 		for _, cacheMetadata := range []bool{true, false} {
@@ -719,6 +744,7 @@ func TestRewrittenMetadataETagWithCooldownComesFromInputs(t *testing.T) {
 				u := cooldownUpstream(t)
 				proxy := validatorProxy(t, u, time.Hour)
 				proxy.CacheMetadata = cacheMetadata
+				proxy.SetMetadataRewriteCacheSize(0)
 				proxy.Cooldown = &cooldown.Config{Default: "1d"}
 				handler := c.handler(proxy, u)
 

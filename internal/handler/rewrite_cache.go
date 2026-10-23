@@ -33,7 +33,10 @@ import (
 // Entries are keyed by a hash of the raw document, so new bytes from upstream
 // are rewritten again rather than served stale. Everything else a rewrite
 // depends on is fixed for the life of the process: the proxy URL is part of
-// the key, and the denylist is loaded at startup.
+// the key, and the denylist is loaded at startup. The exception is cooldown,
+// which depends on the time of the request: with cooldown on, entries expire
+// after cooldownRewriteTTL, so a version is held back at most that long past
+// its cooldown.
 //
 // Each entry keeps the ETag of its output, so clients can revalidate their
 // copy without the output being hashed again on every request. Dates are not
@@ -45,6 +48,8 @@ import (
 // on every request, by the proxy or by a reverse proxy in front of it.
 type rewriteCache struct {
 	maxBytes int64
+	// now reads the time entries expire by; nil means time.Now.
+	now func() time.Time
 
 	mu       sync.Mutex
 	size     int64
@@ -56,7 +61,14 @@ type rewriteCache struct {
 type rewriteEntry struct {
 	key string
 	rewrittenMetadata
+	// expires is when the entry stops being served, or zero for never.
+	expires time.Time
 }
+
+// cooldownRewriteTTL is how long a rewrite made with cooldown on is served.
+// Versions leave cooldown as time passes, so a cached rewrite would otherwise
+// keep hiding them.
+const cooldownRewriteTTL = time.Minute
 
 // size is how much of the cache's room the entry takes.
 func (e *rewriteEntry) size() int64 {
@@ -159,29 +171,59 @@ func (c *rewriteCache) get(key string) (rewrittenMetadata, bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	el, ok := c.entries[key]
+	e, ok := c.lookup(key, c.clock())
 	if !ok {
 		return rewrittenMetadata{}, false
 	}
+	return e.rewrittenMetadata, true
+}
+
+// lookup returns the live entry for key and marks it recently used. An
+// expired entry is dropped. Called with mu held.
+func (c *rewriteCache) lookup(key string, now time.Time) (*rewriteEntry, bool) {
+	el, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	e := el.Value.(*rewriteEntry)
+	if !e.expires.IsZero() && !now.Before(e.expires) {
+		c.remove(el)
+		return nil, false
+	}
 	c.order.MoveToFront(el)
-	return el.Value.(*rewriteEntry).rewrittenMetadata, true
+	return e, true
+}
+
+func (c *rewriteCache) clock() time.Time {
+	if c.now == nil {
+		return time.Now()
+	}
+	return c.now()
+}
+
+// remove drops an entry. Called with mu held.
+func (c *rewriteCache) remove(el *list.Element) {
+	e := el.Value.(*rewriteEntry)
+	c.order.Remove(el)
+	delete(c.entries, e.key)
+	c.size -= e.size()
 }
 
 // rewrite returns rewrite(in) with its ETag and gzip copy, from the cache
-// when it can. Callers must treat the returned bytes as read-only: a cached
-// result is shared. A caller waiting on another's rewrite leaves when ctx
-// ends; the rewrite itself always runs to completion, so the result is cached
-// for the next request.
-func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewrite func([]byte) ([]byte, error)) (rewrittenMetadata, error) {
+// when it can. A ttl above zero makes the result expire after that long.
+// Callers must treat the returned bytes as read-only: a cached result is
+// shared. A caller waiting on another's rewrite leaves when ctx ends; the
+// rewrite itself always runs to completion, so the result is cached for the
+// next request.
+func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, ttl time.Duration, rewrite func([]byte) ([]byte, error)) (rewrittenMetadata, error) {
 	if c == nil {
 		return rewriteWithETag(in, rewrite)
 	}
 
 	c.mu.Lock()
-	if el, ok := c.entries[key]; ok {
-		c.order.MoveToFront(el)
+	if e, ok := c.lookup(key, c.clock()); ok {
 		c.mu.Unlock()
-		return el.Value.(*rewriteEntry).rewrittenMetadata, nil
+		return e.rewrittenMetadata, nil
 	}
 	if f, ok := c.inFlight[key]; ok {
 		c.mu.Unlock()
@@ -196,11 +238,17 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, rewri
 	c.inFlight[key] = f
 	c.mu.Unlock()
 
+	// The entry expires counting from before the rewrite, so it never
+	// outlives the time its cooldown decisions were made at by more than ttl.
+	var expires time.Time
+	if ttl > 0 {
+		expires = c.clock().Add(ttl)
+	}
 	defer func() {
 		c.mu.Lock()
 		delete(c.inFlight, key)
 		if f.err == nil {
-			c.add(&rewriteEntry{key: key, rewrittenMetadata: f.m})
+			c.add(&rewriteEntry{key: key, rewrittenMetadata: f.m, expires: expires})
 		}
 		c.mu.Unlock()
 		close(f.done)
@@ -243,45 +291,61 @@ func (c *rewriteCache) add(e *rewriteEntry) {
 	if n > c.maxBytes {
 		return
 	}
+	if old, ok := c.entries[e.key]; ok {
+		c.remove(old)
+	}
 	c.entries[e.key] = c.order.PushFront(e)
 	c.size += n
 	for c.size > c.maxBytes {
-		oldest := c.order.Back()
-		e := oldest.Value.(*rewriteEntry)
-		c.order.Remove(oldest)
-		delete(c.entries, e.key)
-		c.size -= e.size()
+		c.remove(c.order.Back())
 	}
 }
 
 // cachedRewrite rewrites a metadata document through the proxy's rewrite
 // cache and returns it with its validators. digest identifies in when the
-// metadata cache stored it, and is empty otherwise. Cooldown filtering depends
-// on the current time, so with cooldown on a cached rewrite could keep hiding
-// a version past its cooldown; those rewrites always run, with no
-// Last-Modified, and when digest is known their ETag comes from their inputs
-// rather than from hashing each output again. Their ETag also changes with
-// every restart, so replicas would never agree on a date for them.
+// metadata cache stored it, and is empty otherwise; when known it keys the
+// cache, so the document isn't hashed again.
+//
+// With cooldown on, the cached rewrite expires after cooldownRewriteTTL. Its
+// ETag is the hash of its output, and it is dated like any other, so clients
+// revalidate with either validator and get the gzip copy.
+//
+// Without the rewrite cache, cooldown rewrites run on every request and go
+// undated: when digest is known their ETag comes from their inputs rather
+// than from hashing each output again, and that ETag changes with every
+// restart, so replicas would never agree on a date for it.
 func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name string, in []byte, digest string, rewrite keepingRewrite) (rewrittenMetadata, error) {
-	if p.cooldownEnabled() && digest != "" {
+	rewriteOnly := func(b []byte) ([]byte, error) {
+		out, _, err := rewrite(b)
+		return out, err
+	}
+	cooldown := p.cooldownEnabled()
+
+	if p.rewrites != nil {
+		key := rewriteCacheKeyForDigest(ecosystem, proxyURL, name, digest)
+		if digest == "" {
+			key = rewriteCacheKey(ecosystem, proxyURL, name, in)
+		}
+		var ttl time.Duration
+		if cooldown {
+			ttl = cooldownRewriteTTL
+		}
+		m, err := p.rewrites.rewrite(ctx, key, in, ttl, rewriteOnly)
+		if err == nil {
+			m.lastModified = p.metadataDate(ecosystem, proxyURL, name, m.etag)
+		}
+		return m, err
+	}
+
+	if cooldown && digest != "" {
 		out, kept, err := rewrite(in)
 		if err != nil {
 			return rewrittenMetadata{}, err
 		}
 		return rewrittenMetadata{body: out, metadataValidators: metadataValidators{etag: keptVersionsETag(digest, proxyURL, name, kept)}}, nil
 	}
-	rewriteOnly := func(b []byte) ([]byte, error) {
-		out, _, err := rewrite(b)
-		return out, err
-	}
-	var m rewrittenMetadata
-	var err error
-	if p.rewrites == nil || p.cooldownEnabled() {
-		m, err = rewriteWithETag(in, rewriteOnly)
-	} else {
-		m, err = p.rewrites.rewrite(ctx, rewriteCacheKey(ecosystem, proxyURL, name, in), in, rewriteOnly)
-	}
-	if err == nil && !p.cooldownEnabled() {
+	m, err := rewriteWithETag(in, rewriteOnly)
+	if err == nil && !cooldown {
 		m.lastModified = p.metadataDate(ecosystem, proxyURL, name, m.etag)
 	}
 	return m, err
@@ -304,12 +368,13 @@ func (p *Proxy) cooldownEnabled() bool {
 
 // storedRewrite returns the cached rewrite of the metadata stored for
 // ecosystem and cacheKey, when that metadata is still within its TTL and a
-// rewrite of it is cached. It reads only the cache row, never the stored
-// document, so a repeated request for a large packument costs a database
-// lookup instead of reading and hashing the whole document again. When it
-// reports false the caller takes the usual fetch and rewrite path.
+// rewrite of it is cached and has not expired. It reads only the cache row,
+// never the stored document, so a repeated request for a large packument
+// costs a database lookup instead of reading and hashing the whole document
+// again. When it reports false the caller takes the usual fetch and rewrite
+// path.
 func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) (rewrittenMetadata, bool) {
-	if p.rewrites == nil || p.cooldownEnabled() {
+	if p.rewrites == nil {
 		return rewrittenMetadata{}, false
 	}
 	if !p.CacheMetadata || p.DB == nil || p.MetadataTTL <= 0 {
@@ -414,4 +479,7 @@ func notModified(r *http.Request, etag string, lastModified time.Time) bool {
 // room for maxBytes of output. Zero or less disables it.
 func (p *Proxy) SetMetadataRewriteCacheSize(maxBytes int64) {
 	p.rewrites = newRewriteCache(maxBytes)
+	if p.rewrites != nil {
+		p.rewrites.now = p.clock
+	}
 }
