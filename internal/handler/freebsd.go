@@ -3,6 +3,8 @@ package handler
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -48,9 +50,11 @@ func freebsdRetentionKey(p *purl.PURL) (string, bool) {
 // Repository catalogues (meta.conf, packagesite.pkg, data.pkg) carry their
 // signature inside the archive, so they are served byte for byte through the
 // metadata cache. Packages under Hashed/ have the content hash in their name
-// and never change, so they go to the artifact cache. Everything else,
-// including the unversioned bootstrap files under Latest/ whose detached
-// signature is replaced on every repository build, is passed through.
+// and never change, so they go to the artifact cache. Other package files,
+// unhashed ones and the bootstrap package under Latest/, can be rebuilt under
+// the same name and are passed through after the denylist; while a scanner
+// covers freebsd they are refused, since only cached artifacts are scanned.
+// Everything else, such as signatures and keys, is passed through.
 type FreeBSDHandler struct {
 	proxy        *Proxy
 	proxyURL     string
@@ -104,6 +108,8 @@ func (h *FreeBSDHandler) Routes() http.Handler {
 			h.handleMetadata(w, r, repository, upstreamURL, rest)
 		case isFreeBSDHashedPackage(rest):
 			h.handlePackageDownload(w, r, repository, upstreamURL, rest)
+		case isFreeBSDPackageFile(rest):
+			h.handleUncachedPackage(w, r, upstreamURL, rest)
 		default:
 			h.proxyFile(w, r, upstreamURL, rest)
 		}
@@ -147,6 +153,58 @@ func parseFreeBSDPackage(filename string) (name, version string) {
 		return "", ""
 	}
 	return matches[1], matches[2]
+}
+
+// freebsdUnhashedPattern matches {name}-{version} package files in the current
+// (.pkg) and older (.txz, .tzst) packing formats, split at the last '-' like
+// freebsdHashedPattern.
+var freebsdUnhashedPattern = regexp.MustCompile(`^(.+)-([^-~/]+)\.(?:pkg|txz|tzst)$`)
+
+// freebsdPackageFilePattern matches every package file name, including
+// Latest/pkg.pkg, which has no version. Catalogues match it too and must be
+// routed first.
+var freebsdPackageFilePattern = regexp.MustCompile(`\.(?:pkg|txz|tzst)$`)
+
+// isFreeBSDPackageFile reports whether path names a package file.
+func isFreeBSDPackageFile(path string) bool {
+	return freebsdPackageFilePattern.MatchString(freebsdBase(path))
+}
+
+// parseFreeBSDPackageFile returns the name and version of any package file,
+// hashed or not, or empty strings for a file without a version such as
+// Latest/pkg.pkg.
+func parseFreeBSDPackageFile(filename string) (name, version string) {
+	if name, version = parseFreeBSDPackage(filename); name != "" {
+		return name, version
+	}
+	matches := freebsdUnhashedPattern.FindStringSubmatch(filename)
+	if len(matches) != freebsdMatchCount {
+		return "", ""
+	}
+	return matches[1], matches[2]
+}
+
+// errFreeBSDUnscannable refuses package files that can't be cached while
+// scanning covers freebsd.
+var errFreeBSDUnscannable = errors.New("package file can't be scanned: only packages under Hashed/ are cached and scanned; build the repository with pkg repo --hash")
+
+// handleUncachedPackage passes a package file outside Hashed/ through. Its
+// name may be reused for a rebuild with other bytes, which pkg would then
+// reject against the catalogue checksum, so it is never cached. The denylist
+// applies when the name carries a version. Scanners only see cached
+// artifacts, so the file is refused while one covers freebsd.
+func (h *FreeBSDHandler) handleUncachedPackage(w http.ResponseWriter, r *http.Request, upstreamURL, path string) {
+	name, version := parseFreeBSDPackageFile(freebsdBase(path))
+	if name != "" && h.proxy.versionDenied(freebsdEcosystem, name, version) {
+		h.proxy.serveArtifactError(w, fmt.Errorf("%w: %s", ErrVersionDenied, canonicalVersionPURL(freebsdEcosystem, name, version)), "")
+		return
+	}
+	if h.proxy.Scanners.Covers(freebsdEcosystem) {
+		h.proxy.Logger.Warn("refusing unscannable freebsd package", "path", path)
+		JSONError(w, http.StatusForbidden, errFreeBSDUnscannable.Error())
+		return
+	}
+	h.proxyFile(w, r, upstreamURL, path)
 }
 
 // handlePackageDownload caches hashed packages. The cache key holds the

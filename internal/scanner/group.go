@@ -86,6 +86,11 @@ func (g *Group) Enabled() bool {
 	return g != nil && len(g.entries) > 0
 }
 
+// Covers reports whether any scanner, in either mode, applies to ecosystem.
+func (g *Group) Covers(ecosystem string) bool {
+	return g.Enabled() && len(g.applicable(ecosystem)) > 0
+}
+
 // Timeout returns the per-scan-call timeout used to bound the signed fetch
 // URL's validity.
 func (g *Group) Timeout() time.Duration {

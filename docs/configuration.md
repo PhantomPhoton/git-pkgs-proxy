@@ -553,8 +553,14 @@ pkgbase repositories and repositories built with poudriere work. Catalogues
 (`meta`, `meta.conf`, `packagesite` and `data` as `.pkg`, `.txz` or `.tzst`)
 are cached with the metadata TTL and served byte-for-byte unchanged, which
 keeps their embedded signatures valid. Packages under `Hashed/` use the shared
-artifact cache; everything else, including `Latest/` and unhashed package
-files, is passed through uncached. When `upstream.freebsd` is empty, a single
+artifact cache. Other package files (`.pkg`, `.txz`, `.tzst`), unhashed ones
+and the bootstrap package under `Latest/`, can be rebuilt under the same name,
+so they are passed through uncached after the [denylist](#version-denylist)
+check on their `{name}-{version}`. Only cached artifacts are scanned, so while
+a scanner covers the `freebsd` ecosystem these files are refused with
+`403 Forbidden`: serve repositories built with `pkg repo --hash` (as the
+official mirror is) and bootstrap pkg without the proxy. Everything else, such
+as signatures and keys, is passed through uncached. When `upstream.freebsd` is empty, a single
 repository named `freebsd` pointing at `https://pkg.freebsd.org` is available;
 configuring any entry replaces that default.
 

@@ -1,13 +1,18 @@
 package handler
 
 import (
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/git-pkgs/proxy/internal/config"
+	"github.com/git-pkgs/proxy/internal/scanner"
 	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries/fetch"
 )
@@ -58,6 +63,34 @@ func TestParseFreeBSDPackage(t *testing.T) {
 		name, version := parseFreeBSDPackage(tt.filename)
 		if name != tt.name || version != tt.version {
 			t.Errorf("parseFreeBSDPackage(%q) = %q, %q, want %q, %q", tt.filename, name, version, tt.name, tt.version)
+		}
+	}
+}
+
+func TestParseFreeBSDPackageFile(t *testing.T) {
+	tests := []struct {
+		filename, name, version string
+		pkgfile                 bool
+	}{
+		{"zsh-5.9_5~2$3rwh1rgp.pkg", "zsh", "5.9_5", true},
+		{"zsh-5.9_5.pkg", "zsh", "5.9_5", true},
+		{"zsh-navigation-tools-2.2.7.pkg", "zsh-navigation-tools", "2.2.7", true},
+		{"py311-requests-2.32.3_1,1.txz", "py311-requests", "2.32.3_1,1", true},
+		{"FreeBSD-acct-15.snap20261021214449.tzst", "FreeBSD-acct", "15.snap20261021214449", true},
+		{"pkg.pkg", "", "", true},
+		{"pkg.txz", "", "", true},
+		{"pkg.pkg.sig", "", "", false},
+		{"pkg.pkg.pub", "", "", false},
+		{"zsh-5.9_5.pkg.sig", "", "", false},
+		{"zsh-5.9_5.tar", "", "", false},
+	}
+	for _, tt := range tests {
+		name, version := parseFreeBSDPackageFile(tt.filename)
+		if name != tt.name || version != tt.version {
+			t.Errorf("parseFreeBSDPackageFile(%q) = %q, %q, want %q, %q", tt.filename, name, version, tt.name, tt.version)
+		}
+		if got := isFreeBSDPackageFile("FreeBSD:14:amd64/latest/All/" + tt.filename); got != tt.pkgfile {
+			t.Errorf("isFreeBSDPackageFile(%q) = %v, want %v", tt.filename, got, tt.pkgfile)
 		}
 	}
 }
@@ -187,6 +220,7 @@ func TestFreeBSDHandler_HashedPackagesCachedPerABI(t *testing.T) {
 
 // Unhashed packages can be rebuilt under the same name, and the bootstrap
 // files under Latest/ change with every build, so none of them are cached.
+// Without a denylist entry or a scanner they are passed through.
 func TestFreeBSDHandler_UnhashedFilesPassedThrough(t *testing.T) {
 	files := map[string]string{
 		freebsdABI + "/latest/Latest/pkg.pkg":     "bootstrap package",
@@ -213,6 +247,128 @@ func TestFreeBSDHandler_UnhashedFilesPassedThrough(t *testing.T) {
 			t.Errorf("%s fetched %d times, want 2 (not cached)", path, got)
 		}
 	}
+}
+
+// Package files without a hash in their name are checked against the
+// denylist like hashed ones, before anything is fetched.
+func TestFreeBSDHandler_DenylistCoversEveryPackageFile(t *testing.T) {
+	denied := []string{
+		freebsdABI + "/latest/All/Hashed/zsh-5.9_5~2$3rwh1rgp.pkg",
+		freebsdABI + "/latest/All/zsh-5.9_5.pkg",
+		freebsdABI + "/latest/All/zsh-5.9_5~2$3rwh1rgp.pkg",
+		"/142amd64-default/All/zsh-5.9_5.txz",
+		"/142amd64-default/All/zsh-5.9_5.tzst",
+	}
+	allowed := map[string]string{
+		freebsdABI + "/latest/All/zsh-5.9_4.pkg":                  "older build",
+		freebsdABI + "/latest/All/zsh-navigation-tools-5.9_5.pkg": "another package",
+	}
+	files := map[string]string{}
+	for _, path := range denied {
+		files[path] = "denied package"
+	}
+	for path, body := range allowed {
+		files[path] = body
+	}
+	mirror := newFakeFreeBSDMirror(t, files)
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = mirror.Client()
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(mirror.Client()), fetch.WithMaxRetries(0))
+	proxy.Fetcher = fetcher
+	t.Cleanup(func() { _ = fetcher.Close() })
+	setTestDenylist(t, proxy, "pkg:bsd/freebsd/zsh@5.9_5")
+	h := NewFreeBSDHandler(proxy, "http://proxy.example", map[string]string{"freebsd": mirror.URL})
+
+	for _, path := range denied {
+		if w := serveFreeBSDRequest(h, "/freebsd"+path); w.Code != http.StatusForbidden {
+			t.Errorf("%s: status = %d, want 403", path, w.Code)
+		}
+		if got := mirror.count(path); got != 0 {
+			t.Errorf("%s fetched %d times, want 0", path, got)
+		}
+	}
+	for path, want := range allowed {
+		if w := serveFreeBSDRequest(h, "/freebsd"+path); w.Code != http.StatusOK || w.Body.String() != want {
+			t.Errorf("%s: status = %d, body %q, want 200 and %q", path, w.Code, w.Body, want)
+		}
+	}
+}
+
+// Package files the proxy can't cache can't be scanned either, so they are
+// refused while a scanner covers freebsd. Catalogues, signatures and hashed
+// packages are unaffected.
+func TestFreeBSDHandler_ScanningRefusesUncachablePackages(t *testing.T) {
+	refused := []string{
+		freebsdABI + "/latest/All/zsh-5.9_5.pkg",
+		freebsdABI + "/latest/Latest/pkg.pkg",
+		"/142amd64-default/Latest/pkg.txz",
+		"/142amd64-default/All/zsh-5.9_5.tzst",
+	}
+	served := map[string]string{
+		freebsdABI + "/latest/meta.conf":          "version = 2;\n",
+		freebsdABI + "/latest/Latest/pkg.pkg.sig": "bootstrap signature",
+		freebsdABI + "/latest/Latest/pkg.pkg.pub": "bootstrap key",
+	}
+	files := map[string]string{}
+	for _, path := range refused {
+		files[path] = "unscanned package"
+	}
+	for path, body := range served {
+		files[path] = body
+	}
+
+	for _, ecosystems := range [][]string{nil, {"freebsd"}} {
+		mirror := newFakeFreeBSDMirror(t, files)
+		proxy, _, _, _ := setupTestProxy(t)
+		proxy.HTTPClient = mirror.Client()
+		proxy.Scanners = newFreeBSDScanGroup(t, ecosystems)
+		h := NewFreeBSDHandler(proxy, "http://proxy.example", map[string]string{"freebsd": mirror.URL})
+
+		for _, path := range refused {
+			w := serveFreeBSDRequest(h, "/freebsd"+path)
+			if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "scan") {
+				t.Errorf("ecosystems %v %s: status = %d, body %q, want 403 naming the scan", ecosystems, path, w.Code, w.Body)
+			}
+			if got := mirror.count(path); got != 0 {
+				t.Errorf("ecosystems %v %s fetched %d times, want 0", ecosystems, path, got)
+			}
+		}
+		for path, want := range served {
+			if w := serveFreeBSDRequest(h, "/freebsd"+path); w.Code != http.StatusOK || w.Body.String() != want {
+				t.Errorf("ecosystems %v %s: status = %d, body %q, want 200 and %q", ecosystems, path, w.Code, w.Body, want)
+			}
+		}
+	}
+}
+
+// A scanner restricted to other ecosystems never sees FreeBSD packages, so
+// unhashed files are passed through as without scanning.
+func TestFreeBSDHandler_ScannerForOtherEcosystemsPassesThrough(t *testing.T) {
+	const path = freebsdABI + "/latest/All/zsh-5.9_5.pkg"
+	mirror := newFakeFreeBSDMirror(t, map[string]string{path: "unhashed package"})
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = mirror.Client()
+	proxy.Scanners = newFreeBSDScanGroup(t, []string{"npm"})
+	h := NewFreeBSDHandler(proxy, "http://proxy.example", map[string]string{"freebsd": mirror.URL})
+
+	if w := serveFreeBSDRequest(h, "/freebsd"+path); w.Code != http.StatusOK || w.Body.String() != "unhashed package" {
+		t.Errorf("status = %d, body %q, want 200 and the upstream bytes", w.Code, w.Body)
+	}
+}
+
+func newFreeBSDScanGroup(t *testing.T, ecosystems []string) *scanner.Group {
+	t.Helper()
+	g, err := scanner.NewGroup(config.ScanningConfig{
+		Enabled:    true,
+		SigningKey: "test-signing-key",
+		Scanners: []config.ScannerConfig{
+			{Name: "test-scanner", URL: "http://scanner.invalid/scan", Ecosystems: ecosystems},
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("scanner.NewGroup() error: %v", err)
+	}
+	return g
 }
 
 func serveFreeBSDRequest(h *FreeBSDHandler, target string) *httptest.ResponseRecorder {

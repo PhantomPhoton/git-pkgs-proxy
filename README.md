@@ -829,7 +829,10 @@ remain available when the upstream is unreachable.
 Other files are passed through uncached. That includes the bootstrap package
 under `Latest/`, whose signature file is rewritten with every repository build,
 and package files without a hash in their name, which can be rebuilt under the
-same name.
+same name. The denylist still applies to unhashed package files. Since only
+cached artifacts can be scanned, both kinds of package file are refused while
+a scanner covers `freebsd`; use repositories built with `pkg repo --hash` and
+bootstrap pkg without the proxy.
 
 ### GitHub Releases / mise (aqua backend)
 
