@@ -750,6 +750,12 @@ type UpstreamConfig struct {
 	// Default when empty: {"archlinux": "https://geo.mirror.pkgbuild.com"}.
 	Arch map[string]string `json:"arch" yaml:"arch"`
 
+	// FreeBSD maps repository names to FreeBSD pkg mirror base URLs, served
+	// at /freebsd/{name}/. The remaining request path mirrors the upstream
+	// layout, e.g. /freebsd/freebsd/FreeBSD:14:amd64/latest/packagesite.pkg.
+	// Default when empty: {"freebsd": "https://pkg.freebsd.org"}.
+	FreeBSD map[string]string `json:"freebsd" yaml:"freebsd"`
+
 	// OCI maps names to OCI registry URLs. Requests to a named registry use
 	// the repository prefix upstream/{name}/, for example
 	// oci://proxy.example.com/upstream/ghcr/owner/chart.
@@ -837,6 +843,9 @@ func (u *UpstreamConfig) Validate() error {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.arch", u.Arch); err != nil {
+		return err
+	}
+	if err := validateNamedUpstreams("upstream.freebsd", u.FreeBSD); err != nil {
 		return err
 	}
 	if err := validateNamedUpstreams("upstream.go_sumdbs", u.GoSumDBs); err != nil {

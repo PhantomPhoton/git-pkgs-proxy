@@ -22,7 +22,7 @@ import (
 // outside this list is a typo; a key in it whose handler has not registered
 // yet is not supported by this version.
 var KnownKeys = []string{
-	"alpine", "cargo", "composer", "conan", "conda", "cran", "deb", "gem",
+	"alpine", "cargo", "composer", "conan", "conda", "cran", "deb", "freebsd", "gem",
 	"generic", "golang", "helm", "hex", "julia", "maven", "npm", "nuget", "oci", "pub",
 	"pypi", "rpm", "swift",
 }

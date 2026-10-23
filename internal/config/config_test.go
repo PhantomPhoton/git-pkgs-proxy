@@ -1908,3 +1908,24 @@ func TestGenericUpstreamNamedHosted(t *testing.T) {
 		t.Errorf("upstream.generic named hosted with hosting on: %v, want it refused", err)
 	}
 }
+
+func TestValidateFreeBSDUpstreams(t *testing.T) {
+	tests := []struct {
+		name    string
+		freebsd map[string]string
+		wantErr bool
+	}{
+		{"valid", map[string]string{"freebsd": "https://pkg.freebsd.org", "poudriere": "https://packages.example.com"}, false},
+		{"name contains path separator", map[string]string{"freebsd/ports": "https://pkg.freebsd.org"}, true},
+		{"URL is not absolute", map[string]string{"freebsd": "pkg.freebsd.org"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Upstream.FreeBSD = tt.freebsd
+			if err := cfg.Validate(); (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

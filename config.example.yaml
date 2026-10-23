@@ -315,6 +315,14 @@ upstream:
   #   archlinux: "https://geo.mirror.pkgbuild.com"
   #   archlinuxarm: "https://<region>.mirror.archlinuxarm.org"
 
+  # Named FreeBSD pkg mirrors (used by /freebsd/{name}/), for ports and
+  # pkgbase repositories alike.
+  # Defaults to {"freebsd": "https://pkg.freebsd.org"} when empty;
+  # configuring any entry replaces that default.
+  # freebsd:
+  #   freebsd: "https://pkg.freebsd.org"
+  #   poudriere: "https://packages.example.com"
+
   # Named generic HTTP upstreams (used by /generic/{name}/). The remaining
   # request path and query are appended to the upstream URL. GitHub release
   # assets ({owner}/{repo}/releases/download/{tag}/{asset}) are cached
