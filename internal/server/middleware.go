@@ -125,15 +125,17 @@ func requestEcosystem(path string) string {
 	}
 }
 
-// rejectQueryInPath refuses requests whose decoded path contains '?' or '#'.
-// Handlers build upstream URLs from the decoded path, where such a character
-// would end the path: busybox.apk%3F/foo-9.9-r0.apk fetches busybox but is
-// parsed and cached as foo, under the wrong PURL and past the denylist.
-// Composer archives are exempt: their upstream URL comes from the package
-// metadata, and git branch versions such as dev-fix/#42 may contain '#'.
+// rejectQueryInPath refuses requests whose decoded path contains '?', '#'
+// or ';'. Handlers build upstream URLs from the decoded path, where '?' or
+// '#' would end the path: busybox.apk%3F/foo-9.9-r0.apk fetches busybox but
+// is parsed and cached as foo, under the wrong PURL and past the denylist.
+// Tomcat and Jetty drop ";params" from a path segment, so 1.0;x/evil-1.0.jar
+// would be served as version 1.0 while the proxy checks 1.0;x. Composer
+// archives are exempt: their upstream URL comes from the package metadata,
+// and git branch versions such as dev-fix/#42 may contain '#' or ';'.
 func rejectQueryInPath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.ContainsAny(r.URL.Path, "?#") && !strings.HasPrefix(r.URL.Path, "/composer/files/") {
+		if strings.ContainsAny(r.URL.Path, "?#;") && !strings.HasPrefix(r.URL.Path, "/composer/files/") {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}

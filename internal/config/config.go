@@ -1092,8 +1092,8 @@ func authURLMatches(configured, target *url.URL) bool {
 }
 
 // HasDotSegment reports whether the URL path p, or p decoded once more, has a
-// '.' or '..' segment. Backslashes count as separators, since some upstream
-// servers treat them as such.
+// '.' or '..' segment. Backslashes count as separators, and ";params" are
+// ignored, since some upstream servers (Tomcat, Jetty) treat them that way.
 func HasDotSegment(p string) bool {
 	candidates := []string{p}
 	if decoded, err := url.PathUnescape(p); err == nil {
@@ -1101,6 +1101,7 @@ func HasDotSegment(p string) bool {
 	}
 	for _, candidate := range candidates {
 		for segment := range strings.SplitSeq(strings.ReplaceAll(candidate, `\`, "/"), "/") {
+			segment, _, _ = strings.Cut(segment, ";")
 			if segment == "." || segment == ".." {
 				return true
 			}

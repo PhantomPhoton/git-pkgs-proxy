@@ -17,8 +17,9 @@ import (
 )
 
 // TestProtocolHandlersRejectDotSegments sends paths with encoded '.' and '..'
-// segments to every mounted ecosystem. Several handlers append the decoded
-// path to the upstream URL, where a '..' leaves the configured upstream path.
+// segments, and with ';' path parameters, to every mounted ecosystem. Several
+// handlers append the decoded path to the upstream URL, where a '..' leaves
+// the configured upstream path, and Tomcat and Jetty drop ";params" first.
 func TestProtocolHandlersRejectDotSegments(t *testing.T) {
 	db, err := database.Create(t.TempDir() + "/test.db")
 	if err != nil {
@@ -58,6 +59,11 @@ func TestProtocolHandlersRejectDotSegments(t *testing.T) {
 		"/nuget/v3-flatcontainer/%2e%2e/x/index.json",
 		"/debian/pool/%2e%2e/x.deb",
 		"/rpm/%2e%2e/x.rpm",
+		"/maven/..;/..;/other-repo/com/x/x/1.0/x-1.0.jar",
+		"/maven/com/%2e%2e;/x/1.0/x-1.0.jar",
+		"/maven/com/..%3b/x/1.0/x-1.0.jar",
+		"/maven/com/evil/evil/1.0;x/evil-1.0.jar",
+		"/generic/github/o/r/releases/download/v1/tool.tar.gz;x",
 	} {
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
