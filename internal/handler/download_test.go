@@ -488,7 +488,7 @@ func TestPubHandler_CacheMiss(t *testing.T) {
 
 func TestCondaHandler_DownloadCacheHit(t *testing.T) {
 	proxy, db, store, _ := setupTestProxy(t)
-	seedPackageWithPURL(t, db, store, "conda", "main/numpy", "1.24.0", "numpy-1.24.0-py311h64a7726_0.conda", "conda pkg")
+	seedPackageWithPURL(t, db, store, "conda", "main/numpy", "1.24.0", "linux-64/numpy-1.24.0-py311h64a7726_0.conda", "conda pkg")
 
 	h := NewCondaHandler(proxy, "http://localhost")
 	srv := httptest.NewServer(h.Routes())
@@ -511,7 +511,7 @@ func TestCondaHandler_DownloadCacheHit(t *testing.T) {
 
 func TestCondaHandler_DownloadTarBz2CacheHit(t *testing.T) {
 	proxy, db, store, _ := setupTestProxy(t)
-	seedPackageWithPURL(t, db, store, "conda", "main/scipy", "1.11.0", "scipy-1.11.0-py311hb2e3ea1_0.tar.bz2", "tar bz2 data")
+	seedPackageWithPURL(t, db, store, "conda", "main/scipy", "1.11.0", "linux-64/scipy-1.11.0-py311hb2e3ea1_0.tar.bz2", "tar bz2 data")
 
 	h := NewCondaHandler(proxy, "http://localhost")
 	srv := httptest.NewServer(h.Routes())
