@@ -383,13 +383,8 @@ func (h *ComposerHandler) shouldFilterVersion(packagePURL, packageName, version 
 		return false
 	}
 
-	var timeStr string
-	if err := json.Unmarshal(published, &timeStr); err != nil {
-		return false
-	}
-
-	publishedAt, err := time.Parse(time.RFC3339, timeStr)
-	if err != nil {
+	publishedAt, ok := composerPublishTime(published)
+	if !ok {
 		return false
 	}
 
@@ -400,6 +395,17 @@ func (h *ComposerHandler) shouldFilterVersion(packagePURL, packageName, version 
 	}
 
 	return false
+}
+
+// composerPublishTime parses the raw "time" field of a version, reporting
+// false when it is missing or not an RFC 3339 string.
+func composerPublishTime(published []byte) (time.Time, bool) {
+	var timeStr string
+	if err := json.Unmarshal(published, &timeStr); err != nil {
+		return time.Time{}, false
+	}
+	publishedAt, err := time.Parse(time.RFC3339, timeStr)
+	return publishedAt, err == nil
 }
 
 // disableDefaultNotification stops Composer from reporting installs of a routed
@@ -633,6 +639,8 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	requested := path.Base(r.URL.EscapedPath())
 	if r.URL.RawQuery != "" {
 		requested += "?" + r.URL.RawQuery
+	} else if h.serveCachedRelease(w, r, packageName, version, filename) {
+		return
 	}
 	files := h.metadataFilesForVersion(vendor, pkg, version)
 	dist, downloadURL, ok := h.cachedDist(r.Context(), files, packageName, version, requested)
@@ -641,6 +649,7 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+	h.recordPublishTime(packageName, version, dist.published)
 
 	// Lock files name archive URLs directly, so a version filtered out of the
 	// metadata still has to be withheld here.
@@ -680,6 +689,77 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	}
 
 	ServeArtifactRequest(w, r, result)
+}
+
+// releaseTimeStored reports whether the publish time of version is kept in
+// the versions table, so a download can be checked against cooldown without
+// the metadata. That holds for tagged releases of packages from the default
+// repository. A branch is left out: its archive and time change with every
+// push. So are routed packages, as for npm: the versions row is keyed by the
+// plain PURL, which does not say which repository the version came from, so
+// a time read from the default repository would be trusted for a private
+// version of the same name, and the other way round.
+func (h *ComposerHandler) releaseTimeStored(packageName, version string) bool {
+	if h.proxy.DB == nil || isDevVersion(version) {
+		return false
+	}
+	_, routed := h.routes.match(packageName)
+	return !routed
+}
+
+// serveCachedRelease serves a tagged release's archive from the cache
+// without looking up its dist in the metadata, and reports whether it wrote a
+// response. The archive was only cached under its name after that name was
+// checked against the metadata, and the cache verifies it against the digest
+// recorded then. Cooldown is checked against the publish time recorded when
+// the dist was first resolved; without one, as for an archive cached by an
+// older proxy, it returns false and the caller takes the metadata path, which
+// records it. Requests with a query string, which pick a commit, always take
+// that path.
+func (h *ComposerHandler) serveCachedRelease(w http.ResponseWriter, r *http.Request, packageName, version, filename string) bool {
+	if !h.releaseTimeStored(packageName, version) {
+		return false
+	}
+	if h.proxy.Cooldown != nil && h.proxy.Cooldown.Enabled() {
+		ver, err := h.proxy.DB.GetVersionByPURL(canonicalVersionPURL("composer", packageName, version))
+		if err != nil || ver == nil || !ver.PublishedAt.Valid {
+			return false
+		}
+		if !h.proxy.Cooldown.IsAllowed("composer", canonicalPackagePURL("composer", packageName), ver.PublishedAt.Time) {
+			h.proxy.Logger.Info("cooldown: withholding composer archive",
+				"package", packageName, "version", version)
+			http.Error(w, "version not found", http.StatusNotFound)
+			return true
+		}
+	}
+	cached, err := h.proxy.GetCachedArtifact(r.Context(), "composer", packageName, version, filename)
+	if err != nil {
+		h.proxy.serveArtifactError(w, err, "failed to read cached package")
+		return true
+	}
+	if cached == nil {
+		return false
+	}
+	ServeArtifactRequest(w, r, cached)
+	return true
+}
+
+// recordPublishTime stores the publish time a release's metadata lists, for
+// serveCachedRelease. It is stored whether or not cooldown is enabled, so
+// enabling it later does not send cached archives back to the metadata.
+func (h *ComposerHandler) recordPublishTime(packageName, version string, published []byte) {
+	if !h.releaseTimeStored(packageName, version) {
+		return
+	}
+	publishedAt, ok := composerPublishTime(published)
+	if !ok {
+		return
+	}
+	if err := h.proxy.DB.SetVersionPublishedAt(canonicalVersionPURL("composer", packageName, version),
+		canonicalPackagePURL("composer", packageName), publishedAt); err != nil {
+		h.proxy.Logger.Warn("failed to store composer publish time",
+			"package", packageName, "version", version, "error", err)
+	}
 }
 
 // discardOtherCommit clears a cached branch archive named for commit that was
