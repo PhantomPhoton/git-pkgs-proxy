@@ -1,0 +1,252 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	gomodule "golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
+	"golang.org/x/sync/errgroup"
+)
+
+// Go cooldown measures a version by the Time in its .info, which the module
+// proxy takes from the commit the version points at. That is when the code
+// was committed, not when the version was tagged or first fetched.
+//
+// Versions in cooldown are left out of @v/list and @latest, and their .info,
+// .mod and .zip are answered with 403. The go command falls back to the next
+// GOPROXY entry on 404 and 410, so with GOPROXY=proxy,direct a 404 would let
+// it fetch the version directly.
+
+// goInfoFetchLimit bounds the .info requests made at once to filter a list.
+const goInfoFetchLimit = 8
+
+const errGoCooldown = "version is in cooldown"
+
+// goInfo is the JSON served for a version's .info and for @latest.
+type goInfo struct {
+	Version string    `json:"Version"`
+	Time    time.Time `json:"Time"`
+}
+
+func (h *GoHandler) cooldownEnabled() bool {
+	return h.proxy.Cooldown != nil && h.proxy.Cooldown.Enabled()
+}
+
+func (h *GoHandler) allowedAt(module string, published time.Time) bool {
+	if published.IsZero() {
+		return true
+	}
+	return h.proxy.Cooldown.IsAllowed("golang", canonicalPackagePURL("golang", module), published)
+}
+
+// writeGoMetadataError answers a failed upstream metadata fetch.
+func (h *GoHandler) writeGoMetadataError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrUpstreamNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
+	h.proxy.Logger.Error("go metadata fetch failed", "error", err)
+	http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
+}
+
+func (h *GoHandler) fetchGoMetadata(ctx context.Context, escapedModule, module, rest string) ([]byte, error) {
+	body, _, err := h.proxy.FetchOrCacheMetadata(ctx, "golang", module+"/"+rest, h.upstreamURL+"/"+escapedModule+"/"+rest, "*/*")
+	return body, err
+}
+
+// storesGoTimes reports whether publish times for module can be kept in the
+// versions table. Its rows are keyed by PURL, which lowercases golang names,
+// so modules that differ only in case would share them; such modules read
+// their times from the metadata cache instead.
+func (h *GoHandler) storesGoTimes(module string) bool {
+	return h.proxy.DB != nil && module == strings.ToLower(module)
+}
+
+// publishTime returns a version's time from the versions table, or from its
+// .info, which is then stored. A version whose time can't be read gets the
+// zero time and is let through, as in the other ecosystems.
+func (h *GoHandler) publishTime(ctx context.Context, escapedModule, module, version string) time.Time {
+	versionPURL := canonicalVersionPURL("golang", module, version)
+	if h.storesGoTimes(module) {
+		if ver, err := h.proxy.DB.GetVersionByPURL(versionPURL); err == nil && ver != nil && ver.PublishedAt.Valid {
+			return ver.PublishedAt.Time
+		}
+	}
+
+	escapedVersion, err := gomodule.EscapeVersion(version)
+	if err != nil {
+		return time.Time{}
+	}
+	body, err := h.fetchGoMetadata(ctx, escapedModule, module, "@v/"+escapedVersion+".info")
+	if err != nil {
+		h.proxy.Logger.Warn("cooldown: could not fetch go version info",
+			"module", module, "version", version, "error", err)
+		return time.Time{}
+	}
+	var info goInfo
+	if err := json.Unmarshal(body, &info); err != nil || info.Time.IsZero() {
+		return time.Time{}
+	}
+	h.storePublishTime(module, version, info.Time)
+	return info.Time
+}
+
+func (h *GoHandler) storePublishTime(module, version string, published time.Time) {
+	if !h.storesGoTimes(module) {
+		return
+	}
+	if err := h.proxy.DB.SetVersionPublishedAt(canonicalVersionPURL("golang", module, version), canonicalPackagePURL("golang", module), published); err != nil {
+		h.proxy.Logger.Warn("cooldown: could not store go publish time",
+			"module", module, "version", version, "error", err)
+	}
+}
+
+// versionInCooldown reports whether an exact version is still in cooldown.
+func (h *GoHandler) versionInCooldown(ctx context.Context, escapedModule, module, version string) bool {
+	if !h.cooldownEnabled() {
+		return false
+	}
+	return !h.allowedAt(module, h.publishTime(ctx, escapedModule, module, version))
+}
+
+func (h *GoHandler) refuseCooldown(w http.ResponseWriter, module, version string) {
+	h.proxy.Logger.Info("cooldown: withholding go module version", "module", module, "version", version)
+	http.Error(w, errGoCooldown+": "+canonicalVersionPURL("golang", module, version), http.StatusForbidden)
+}
+
+// allowedVersions returns the listed versions of module that are out of
+// cooldown, in their upstream order.
+func (h *GoHandler) allowedVersions(ctx context.Context, escapedModule, module string) ([]string, error) {
+	body, err := h.fetchGoMetadata(ctx, escapedModule, module, "@v/list")
+	if err != nil {
+		return nil, err
+	}
+	var versions []string
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if v := strings.TrimSpace(line); v != "" {
+			versions = append(versions, v)
+		}
+	}
+
+	keep := make([]bool, len(versions))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(goInfoFetchLimit)
+	for i, v := range versions {
+		g.Go(func() error {
+			keep[i] = h.allowedAt(module, h.publishTime(gctx, escapedModule, module, v))
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	allowed := versions[:0]
+	for i, v := range versions {
+		if keep[i] {
+			allowed = append(allowed, v)
+		} else {
+			h.proxy.Logger.Info("cooldown: filtering go module version", "module", module, "version", v)
+		}
+	}
+	return allowed, nil
+}
+
+// serveCooldownList serves @v/list without versions in cooldown.
+func (h *GoHandler) serveCooldownList(w http.ResponseWriter, r *http.Request, escapedModule, module string) {
+	allowed, err := h.allowedVersions(r.Context(), escapedModule, module)
+	if err != nil {
+		h.writeGoMetadataError(w, err)
+		return
+	}
+	w.Header().Set(headerContentType, "text/plain; charset=utf-8")
+	if len(allowed) > 0 {
+		_, _ = w.Write([]byte(strings.Join(allowed, "\n") + "\n"))
+	}
+}
+
+// serveCooldownInfo serves a .info, refusing it when the version it names is
+// in cooldown. rest is the request after /@v/: an escaped version or a query
+// such as a branch name, followed by .info.
+func (h *GoHandler) serveCooldownInfo(w http.ResponseWriter, r *http.Request, escapedModule, module, rest string) {
+	body, err := h.fetchGoMetadata(r.Context(), escapedModule, module, "@v/"+rest)
+	if err != nil {
+		h.writeGoMetadataError(w, err)
+		return
+	}
+	var info goInfo
+	if err := json.Unmarshal(body, &info); err == nil && info.Version != "" {
+		if !h.allowedAt(module, info.Time) {
+			h.refuseCooldown(w, module, info.Version)
+			return
+		}
+		if !info.Time.IsZero() && semver.IsValid(info.Version) {
+			h.storePublishTime(module, info.Version, info.Time)
+		}
+	}
+	w.Header().Set(headerContentType, contentTypeJSON)
+	_, _ = w.Write(body)
+}
+
+// serveCooldownLatest serves @latest. When upstream's answer is in cooldown,
+// it serves the newest listed version out of cooldown instead: the highest
+// release, or else the highest pre-release, which is how the go command
+// picks from a list.
+func (h *GoHandler) serveCooldownLatest(w http.ResponseWriter, r *http.Request, escapedModule, module string) {
+	body, err := h.fetchGoMetadata(r.Context(), escapedModule, module, "@latest")
+	if err != nil {
+		h.writeGoMetadataError(w, err)
+		return
+	}
+	var info goInfo
+	if err := json.Unmarshal(body, &info); err != nil || h.allowedAt(module, info.Time) {
+		w.Header().Set(headerContentType, contentTypeJSON)
+		_, _ = w.Write(body)
+		return
+	}
+
+	allowed, err := h.allowedVersions(r.Context(), escapedModule, module)
+	if err != nil {
+		h.writeGoMetadataError(w, err)
+		return
+	}
+	best := newestGoVersion(allowed)
+	if best == "" {
+		h.refuseCooldown(w, module, info.Version)
+		return
+	}
+	escapedVersion, err := gomodule.EscapeVersion(best)
+	if err != nil {
+		h.refuseCooldown(w, module, info.Version)
+		return
+	}
+	h.serveCooldownInfo(w, r, escapedModule, module, escapedVersion+".info")
+}
+
+// newestGoVersion returns the highest release in versions, or the highest
+// pre-release when there is no release.
+func newestGoVersion(versions []string) string {
+	var release, prerelease string
+	for _, v := range versions {
+		if !semver.IsValid(v) {
+			continue
+		}
+		if semver.Prerelease(v) == "" {
+			if release == "" || semver.Compare(v, release) > 0 {
+				release = v
+			}
+		} else if prerelease == "" || semver.Compare(v, prerelease) > 0 {
+			prerelease = v
+		}
+	}
+	if release != "" {
+		return release
+	}
+	return prerelease
+}
