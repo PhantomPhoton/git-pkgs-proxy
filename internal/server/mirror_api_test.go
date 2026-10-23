@@ -43,7 +43,14 @@ func setupMirrorAPI(t *testing.T) *MirrorAPIHandler {
 	proxy := handler.NewProxy(db, store, fetcher, resolver, logger)
 
 	m := mirror.New(proxy, db, store, logger, 1)
-	js := mirror.NewJobStore(context.Background(), m)
+	// Jobs are stopped and waited for before the database and directories
+	// are removed.
+	ctx, cancel := context.WithCancel(context.Background())
+	js := mirror.NewJobStore(ctx, m)
+	t.Cleanup(func() {
+		cancel()
+		js.Wait()
+	})
 	return NewMirrorAPIHandler(js)
 }
 
