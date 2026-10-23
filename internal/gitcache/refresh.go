@@ -77,9 +77,13 @@ func (c *Cache) ensureFresh(ctx context.Context, rp *repo, repoURL string) error
 		}
 	}
 
-	timer := time.NewTimer(c.opts.RefreshWait)
-	defer timer.Stop()
-	refChecked, timeout := call.checked, timer.C
+	timeout := c.opts.refreshWaitOver
+	if timeout == nil {
+		timer := time.NewTimer(c.opts.RefreshWait)
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	refChecked := call.checked
 	for {
 		select {
 		case <-refChecked:
@@ -95,6 +99,17 @@ func (c *Cache) ensureFresh(ctx context.Context, rp *repo, repoURL string) error
 			}
 			return call.err
 		case <-timeout:
+			// select picks at random when the check finished just as the
+			// wait ran out; a check found new commits in time still counts.
+			select {
+			case <-refChecked:
+				refChecked = nil
+				if call.fetching {
+					timeout = nil
+					continue
+				}
+			default:
+			}
 			c.logger.Info("git cache: upstream check still running, serving cached copy",
 				"repository", rp.key, "checked", checked)
 			return nil

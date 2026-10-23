@@ -233,19 +233,42 @@ func TestSlowUpstreamServesCachedCopyAfterRefreshWait(t *testing.T) {
 }
 
 // TestSlowFetchAfterPushIsWaitedFor has the upstream answer the ref check at
-// once and the fetch after a push take longer than RefreshWait: a clone
-// still gets the pushed commit. RefreshWait leaves the check time to finish
-// on a slow machine.
+// once and the fetch after a push still run when RefreshWait is over: a
+// clone still gets the pushed commit.
 func TestSlowFetchAfterPushIsWaitedFor(t *testing.T) {
 	upstream := newFakeUpstream(t)
 	work := upstream.newRepo("repo")
-	tc := newTestCache(t, upstream.server.URL, func(o *Options) { o.RefreshWait = 2 * time.Second })
+	waitOver := make(chan time.Time)
+	tc := newTestCache(t, upstream.server.URL, func(o *Options) { o.refreshWaitOver = waitOver })
 	tc.clone(t, "repo")
 	head := upstream.commit(work, "second")
 	runGit(t, work, "push", "--quiet", "origin", "main")
 
-	upstream.delayFetches.Store(int64(4 * time.Second))
-	if got := runGit(t, tc.clone(t, "repo"), "rev-parse", "HEAD"); got != head {
+	arrived, release := upstream.holdFetches()
+	defer release()
+	dir := filepath.Join(t.TempDir(), "clone")
+	cloned := make(chan error, 1)
+	go func() {
+		out, err := tryGit(t, "", "clone", "--quiet", tc.url("repo"), dir)
+		if err != nil {
+			err = fmt.Errorf("%w\n%s", err, out)
+		}
+		cloned <- err
+	}()
+	// The fetch starts only after the check found the push.
+	select {
+	case <-arrived:
+	case err := <-cloned:
+		t.Fatalf("clone finished before the fetch started: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the fetch after the push never reached the upstream")
+	}
+	close(waitOver)
+	release()
+	if err := <-cloned; err != nil {
+		t.Fatal(err)
+	}
+	if got := runGit(t, dir, "rev-parse", "HEAD"); got != head {
 		t.Errorf("HEAD = %s, want the pushed %s", got, head)
 	}
 }
