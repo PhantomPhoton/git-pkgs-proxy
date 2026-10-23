@@ -1,14 +1,18 @@
 package handler
 
 import (
+	"compress/gzip"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"fmt"
 	"hash"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -33,9 +37,10 @@ type mavenCooldownUpstream struct {
 	times       map[string]time.Time
 	pomStatus   map[string]int
 
-	mu    sync.Mutex
-	poms  map[string]int
-	heads int
+	mu         sync.Mutex
+	poms       map[string]int
+	heads      int
+	userAgents []string
 }
 
 func newMavenCooldownUpstream(t *testing.T) *mavenCooldownUpstream {
@@ -83,11 +88,15 @@ func (u *mavenCooldownUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if strings.HasSuffix(file, ".module") {
+		w.Header().Set(headerLastModified, published.UTC().Format(http.TimeFormat))
+	}
 	if strings.HasSuffix(file, ".pom") {
 		u.mu.Lock()
 		u.poms[version]++
 		if r.Method == http.MethodHead {
 			u.heads++
+			u.userAgents = append(u.userAgents, r.UserAgent())
 		}
 		u.mu.Unlock()
 		w.Header().Set(headerLastModified, published.UTC().Format(http.TimeFormat))
@@ -306,6 +315,82 @@ func TestMavenCooldownPOMDownloadCarriesItsTime(t *testing.T) {
 	ver, _ := proxy.DB.GetVersionByPURL(canonicalVersionPURL("maven", "com.example:lib", "2.1"))
 	if ver == nil || !ver.PublishedAt.Valid || !ver.PublishedAt.Time.Equal(u.times["2.1"].Truncate(time.Second)) {
 		t.Errorf("stored time of 2.1 = %v, want %v", ver, u.times["2.1"])
+	}
+}
+
+// TestMavenCooldownModuleDownloadCarriesItsTime checks that a Gradle
+// .module fetched before the .pom gives the version's time as the .pom
+// would.
+func TestMavenCooldownModuleDownloadCarriesItsTime(t *testing.T) {
+	u := newMavenCooldownUpstream(t)
+	h, _ := newMavenCooldownHandler(t, u)
+
+	if w := getMaven(h, mavenTestDir+"2.1/lib-2.1.module"); w.Code != http.StatusForbidden {
+		t.Errorf("2.1 .module: status = %d, want 403", w.Code)
+	}
+	if w := getMaven(h, mavenTestDir+"1.0/lib-1.0.module"); w.Code != http.StatusOK {
+		t.Errorf("1.0 .module: status = %d, want 200", w.Code)
+	}
+	if w := getMaven(h, mavenTestDir+"1.0/lib-1.0.jar"); w.Code != http.StatusOK {
+		t.Errorf("1.0 .jar: status = %d, want 200", w.Code)
+	}
+	if n := u.totalPOMRequests(); n != 0 {
+		t.Errorf("pom requests = %d, want 0", n)
+	}
+}
+
+// TestMavenCooldownTimeRequestsNameTheProxy checks the User-Agent of the
+// HEAD requests for publish times: Maven Central asks tools to name
+// themselves rather than send an HTTP library's default.
+func TestMavenCooldownTimeRequestsNameTheProxy(t *testing.T) {
+	u := newMavenCooldownUpstream(t)
+	h, _ := newMavenCooldownHandler(t, u)
+
+	getMaven(h, mavenTestDir+"maven-metadata.xml")
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if len(u.userAgents) == 0 {
+		t.Fatal("no HEAD requests")
+	}
+	for _, ua := range u.userAgents {
+		if ua != mavenTimeUserAgent {
+			t.Errorf("User-Agent = %q, want %q", ua, mavenTimeUserAgent)
+		}
+	}
+}
+
+// TestMavenCooldownMetadataServedLikeOtherRewrites checks that filtered
+// metadata is gzip-compressed for clients that accept it, as the other
+// ecosystems' rewritten metadata is.
+func TestMavenCooldownMetadataServedLikeOtherRewrites(t *testing.T) {
+	u := newMavenCooldownUpstream(t)
+	// Enough versions that the document compresses.
+	for i := range 50 {
+		v := fmt.Sprintf("0.%d", i)
+		u.versions = append([]string{v}, u.versions...)
+		u.times[v] = time.Now().Add(-100 * 24 * time.Hour)
+	}
+	h, proxy := newMavenCooldownHandler(t, u)
+	// The server always sets up the rewrite cache, which keeps the gzip copy.
+	proxy.SetMetadataRewriteCacheSize(1 << 20)
+
+	req := httptest.NewRequest(http.MethodGet, mavenTestDir+"maven-metadata.xml", nil)
+	req.Header.Set(headerAcceptEncoding, "gzip")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Header().Get(headerContentEncoding) != "gzip" {
+		t.Fatalf("status = %d, Content-Encoding %q; want gzip", w.Code, w.Header().Get(headerContentEncoding))
+	}
+	if ct := w.Header().Get(headerContentType); !strings.Contains(ct, "xml") {
+		t.Errorf("Content-Type = %q, want XML", ct)
+	}
+	zr, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(zr)
+	if versions := mavenMetadataVersions(t, string(body)); slices.Contains(versions, "2.1") {
+		t.Errorf("2.1 listed in the gzip body: %v", versions)
 	}
 }
 

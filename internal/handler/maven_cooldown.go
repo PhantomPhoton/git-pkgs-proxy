@@ -37,6 +37,10 @@ import (
 
 const errMavenCooldown = "version is in cooldown"
 
+// mavenTimeUserAgent is the User-Agent of publish-time requests, the one
+// the artifact fetcher sends.
+const mavenTimeUserAgent = "git-pkgs-proxy/1.0"
+
 const (
 	mavenMetadataFile = "maven-metadata.xml"
 	mavenSnapshot     = "-SNAPSHOT"
@@ -130,16 +134,19 @@ func (h *MavenHandler) publishTime(ctx context.Context, source mavenSource, arti
 }
 
 // cooldownFromDownload returns a context that stores the publish time of a
-// version from the download of its .pom, and whether the cooldown check is
-// to run after the download. It does so only for the .pom of a version
-// whose time is not stored yet; for anything else the check runs before.
+// version from the download of its .pom or Gradle .module, and whether the
+// cooldown check is to run after the download. It does so only for those
+// files of a version whose time is not stored yet; for anything else the
+// check runs before. Both files are deployed with the version, and
+// whichever a client fetches first gives its time.
 func (h *MavenHandler) cooldownFromDownload(ctx context.Context, source mavenSource, urlPath, version string) (context.Context, bool) {
 	if !h.cooldownEnabled() || strings.HasSuffix(version, mavenSnapshot) {
 		return ctx, false
 	}
 	artifactDir := path.Dir(path.Dir(urlPath))
 	group, artifact, ok := mavenCoordinates(artifactDir)
-	if !ok || !usableMavenVersion(version) || path.Base(urlPath) != artifact+"-"+version+".pom" {
+	if base := artifact + "-" + version; !ok || !usableMavenVersion(version) ||
+		(path.Base(urlPath) != base+".pom" && path.Base(urlPath) != base+".module") {
 		return ctx, false
 	}
 	versionPURL, packagePURL, store := h.mavenTimeKey(source, group, artifact, version)
@@ -166,6 +173,9 @@ func (h *MavenHandler) pomLastModified(ctx context.Context, pomURL string) (publ
 	if err != nil {
 		return time.Time{}, false, err
 	}
+	// Name the proxy as its artifact downloads do; Maven Central asks
+	// tools not to send an HTTP library's default.
+	req.Header.Set("User-Agent", mavenTimeUserAgent)
 	resp, err := h.proxy.HTTPClient.Do(req)
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("reading pom time: %w", err)
@@ -258,10 +268,13 @@ func (h *MavenHandler) serveCooldownMetadata(w http.ResponseWriter, r *http.Requ
 
 	switch {
 	case suffix == "":
+		// The metadata cache records JSON when an upstream sent no type,
+		// and maven-metadata.xml is always XML.
 		if contentType == "" || contentType == contentTypeJSON {
 			contentType = "text/xml"
 		}
-		serveMavenMetadata(w, r, m, contentType)
+		markStale(w, h.proxy.lookupCachedMeta("maven", cacheKey).stale)
+		serveRewrittenMetadataAs(w, r, m, contentType)
 	case mavenChecksums[suffix] != nil:
 		sum := mavenChecksums[suffix]()
 		_, _ = sum.Write(m.body)
@@ -274,21 +287,6 @@ func (h *MavenHandler) serveCooldownMetadata(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "not found", http.StatusNotFound)
 	}
 	return true
-}
-
-// serveMavenMetadata writes filtered metadata with its validators, or 304
-// when they show the client's copy is current.
-func serveMavenMetadata(w http.ResponseWriter, r *http.Request, m rewrittenMetadata, contentType string) {
-	w.Header().Set(headerETag, m.etag)
-	if !m.lastModified.IsZero() {
-		w.Header().Set(headerLastModified, m.lastModified.UTC().Format(http.TimeFormat))
-	}
-	if notModified(r, m.etag, m.lastModified) {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	w.Header().Set(headerContentType, contentType)
-	_, _ = w.Write(m.body)
 }
 
 // filterMetadata removes versions in cooldown from an artifact's
