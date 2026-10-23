@@ -49,7 +49,7 @@ func (s *Server) startGradleBuildCacheEviction(ctx context.Context) {
 
 	sweep()
 
-	go func() {
+	s.background.Go(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -61,7 +61,7 @@ func (s *Server) startGradleBuildCacheEviction(ctx context.Context) {
 				sweep()
 			}
 		}
-	}()
+	})
 }
 
 func sweepGradleBuildCache(
