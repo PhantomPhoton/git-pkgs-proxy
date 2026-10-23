@@ -98,7 +98,7 @@ func (h *NPMHandler) serveLocalMetadata(w http.ResponseWriter, r *http.Request, 
 // When the upstream does not know the package, the packument holds only the
 // pushed versions.
 func (h *NPMHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.Request, packageName, upstreamURL, accept, metadataCacheKey string, local []npmLocalEntry) {
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), "npm", metadataCacheKey, upstreamURL, accept)
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "npm", metadataCacheKey, upstreamURL, accept, h.packumentValidator())
 	var out []byte
 	var err error
 	switch {

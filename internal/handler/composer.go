@@ -169,7 +169,7 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), "composer", cacheKey, upstreamURL, contentTypeJSON)
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "composer", cacheKey, upstreamURL, contentTypeJSON, nil)
 	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -753,7 +753,7 @@ func (h *ComposerHandler) cachedDist(ctx context.Context, files []composerMetada
 		return composerDist{}, "", false
 	}
 	for _, f := range files {
-		doc := h.proxy.fetchMetadataDocument(ctx, "composer", f.cacheKey, f.url, contentTypeJSON)
+		doc := h.proxy.fetchMetadataDocument(ctx, "composer", f.cacheKey, f.url, contentTypeJSON, nil)
 		if doc.err != nil {
 			continue
 		}

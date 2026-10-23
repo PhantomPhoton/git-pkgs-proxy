@@ -133,7 +133,7 @@ func (h *ChefHandler) serveDocument(w http.ResponseWriter, r *http.Request, docu
 		return
 	}
 
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), chefEcosystem, cacheKey, upstreamURL, contentTypeJSON)
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), chefEcosystem, cacheKey, upstreamURL, contentTypeJSON, nil)
 	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
