@@ -981,6 +981,21 @@ Names and versions are compared the way each ecosystem treats them:
 - NuGet ids and versions ignore case.
 - A RubyGems entry also covers that version's platform gems:
   `pkg:gem/nokogiri@1.16.0` denies `nokogiri-1.16.0-x86_64-linux.gem`.
+- Composer versions ignore a leading `v`, which Packagist keeps from the tag:
+  `pkg:composer/symfony/console@6.1.7` also covers `v6.1.7`.
+- Go versions are matched as written, `pkg:golang/example.com/mod@v1.0.0-RC1`,
+  though download URLs escape uppercase letters (`v1.0.0-!r!c1`).
+- A Swift entry names the registry scope and package, ignoring case:
+  `pkg:swift/apple/swift-nio@2.62.0`. The stored form,
+  `pkg:generic/swift-registry/apple.swift-nio@2.62.0`, works too.
+- An OCI entry names the repository as it is pulled through the proxy and a
+  digest or tag: `pkg:oci/library/alpine@sha256:<digest>` refuses the blob or
+  manifest with that digest, including a manifest a tag resolves to, and
+  `pkg:oci/library/alpine@3.19` refuses pulling that tag. Repositories on a
+  named upstream keep their prefix, as in `pkg:oci/upstream/ghcr/org/image@...`.
+  An entry covers only the digest it names: denying an image index does not
+  deny the platform manifests and layers it lists to a client that requests
+  them by digest directly.
 - A conda entry covers the package in every channel. Add a `channel` qualifier,
   such as `pkg:conda/numpy@1.26.4?channel=conda-forge`, to deny it in one
   channel only.

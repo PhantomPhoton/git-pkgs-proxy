@@ -118,6 +118,20 @@ func (id identity) channelKey() string {
 
 var pypiSeparators = regexp.MustCompile(`[-_.]+`)
 
+// swiftRegistryIdentity returns the registry scope and name of a Swift
+// package. A source coordinate such as pkg:swift/github.com/apple/swift-nio
+// names no registry identity.
+func swiftRegistryIdentity(pkg *purl.PURL) (scope, name string, ok bool) {
+	switch {
+	case pkg.Type == "swift" && pkg.Namespace != "" && !strings.ContainsAny(pkg.Namespace, "./"):
+		return pkg.Namespace, pkg.Name, true
+	case pkg.Type == "generic" && strings.EqualFold(pkg.Namespace, "swift-registry"):
+		scope, name, found := strings.Cut(pkg.Name, ".")
+		return scope, name, found && scope != "" && name != ""
+	}
+	return "", "", false
+}
+
 func identify(pkg *purl.PURL) identity {
 	namespace, name, version := pkg.Namespace, pkg.Name, pkg.Version
 	var channel string
@@ -138,6 +152,27 @@ func identify(pkg *purl.PURL) identity {
 		}
 		if i := strings.LastIndex(name, "/"); i >= 0 {
 			channel, name = name[:i], name[i+1:]
+		}
+	case "composer":
+		// Packagist keeps a tag's leading v ("v6.1.7"); Composer treats it
+		// as the same version.
+		if len(version) > 1 && (version[0] == 'v' || version[0] == 'V') && version[1] >= '0' && version[1] <= '9' {
+			version = version[1:]
+		}
+	case "oci":
+		// Handlers name the repository as one name, library%2Falpine;
+		// entries write it as a path, library/alpine.
+		if namespace != "" {
+			name, namespace = namespace+"/"+name, ""
+		}
+	case "swift", "generic":
+		// Swift registry archives are stored as
+		// pkg:generic/swift-registry/{scope}.{name}; entries may write
+		// pkg:swift/{scope}/{name}. Registry identities ignore case.
+		if scope, pkgName, ok := swiftRegistryIdentity(pkg); ok {
+			namespace, name = strings.ToLower(scope), strings.ToLower(pkgName)
+			key := purl.New("swift", namespace, name, "", nil).String()
+			return identity{key: key, version: version}
 		}
 	}
 	key := purl.New(pkg.Type, namespace, name, "", nil).String()

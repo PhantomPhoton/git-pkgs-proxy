@@ -30,6 +30,12 @@ func TestGemParseFilename(t *testing.T) {
 		{"google-protobuf-3.25.3-arm64-darwin-23.gem", "google-protobuf", "3.25.3-arm64-darwin-23"},
 		{"nokogiri-1.16.0-x64-mingw-ucrt.gem", "nokogiri", "1.16.0-x64-mingw-ucrt"},
 		{"rake-13.1.0.pre.1.gem", "rake", "13.1.0.pre.1"},
+		{"devise-2fa-1.0.0.gem", "devise-2fa", "1.0.0"},
+		{"devise-2fa-1.0.0-java.gem", "devise-2fa", "1.0.0-java"},
+		{"foo-2-1.0.0.gem", "foo-2", "1.0.0"},
+		{"foo-2-1.gem", "foo-2", "1"},
+		{"foo-2-x86_64-linux.gem", "foo", "2-x86_64-linux"},
+		{"odd-1_0.gem", "odd", "1_0"},
 		{"no-version.gem", "", ""},
 		{"invalid", "", ""},
 	}
