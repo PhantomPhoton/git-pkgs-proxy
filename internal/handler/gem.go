@@ -1,11 +1,13 @@
 package handler
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -208,48 +210,66 @@ func (h *GemHandler) fetchCompactIndex(r *http.Request, name string) (*http.Resp
 	if err != nil {
 		return nil, err
 	}
-	for _, hdr := range []string{"Accept", headerAcceptEncoding, "If-None-Match", "If-Modified-Since"} {
-		if v := r.Header.Get(hdr); v != "" {
-			req.Header.Set(hdr, v)
-		}
+	// Only Accept is passed on. The client's Accept-Encoding would turn off
+	// the transport's transparent decompression and leave a gzip body to
+	// filter, and its validators belong to the filtered copy it was served,
+	// not to upstream's file.
+	if v := r.Header.Get(headerAccept); v != "" {
+		req.Header.Set(headerAccept, v)
 	}
 	return h.proxy.HTTPClient.Do(req)
 }
 
-// writeFilteredIndex writes the compact index response with cooldown-filtered versions removed.
+// gemFilteredIndexDroppedHeaders describe upstream's file as a whole, so
+// they are wrong for a copy with versions removed. Bundler checks the digest
+// headers against the body it receives.
+var gemFilteredIndexDroppedHeaders = []string{
+	headerContentLength, headerContentEncoding, headerETag, headerLastModified,
+	"Digest", "Repr-Digest", "Content-Digest", "Accept-Ranges", "Content-Range",
+}
+
+// writeFilteredIndex writes the compact index response with cooldown-filtered
+// versions removed. The body is read in full first, so a read error or an
+// oversized index answers 502 instead of a truncated 200.
 func (h *GemHandler) writeFilteredIndex(w http.ResponseWriter, resp *http.Response, name string, filtered map[string]bool) {
+	body, err := h.proxy.ReadMetadata(resp.Body)
+	if err != nil {
+		h.proxy.Logger.Error("failed to read gem compact index", "gem", name, "error", err)
+		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
+		return
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(body))
+	for rest := body; len(rest) > 0; {
+		line, tail, _ := bytes.Cut(rest, []byte("\n"))
+		rest = tail
+
+		version := line
+		if spaceIdx := bytes.IndexByte(line, ' '); spaceIdx > 0 {
+			version = line[:spaceIdx]
+		}
+		if filtered[string(version)] {
+			h.proxy.Logger.Info("cooldown: filtering gem version",
+				"gem", name, "version", string(version))
+			continue
+		}
+
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+
 	for k, vv := range resp.Header {
-		if strings.EqualFold(k, headerContentLength) {
-			continue // length will change after filtering
+		if slices.ContainsFunc(gemFilteredIndexDroppedHeaders, func(d string) bool { return strings.EqualFold(k, d) }) {
+			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
+	w.Header().Set(headerContentLength, strconv.Itoa(out.Len()))
 	w.WriteHeader(http.StatusOK)
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if line == "---" {
-			_, _ = fmt.Fprintln(w, line)
-			continue
-		}
-
-		version := line
-		if spaceIdx := strings.IndexByte(line, ' '); spaceIdx > 0 {
-			version = line[:spaceIdx]
-		}
-
-		if filtered[version] {
-			h.proxy.Logger.Info("cooldown: filtering gem version",
-				"gem", name, "version", version)
-			continue
-		}
-
-		_, _ = fmt.Fprintln(w, line)
-	}
+	_, _ = w.Write(out.Bytes())
 }
 
 // gemVersion represents a version entry from the RubyGems versions API.

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -104,6 +105,117 @@ func TestGemCompactIndexCooldown(t *testing.T) {
 	}
 	if !strings.HasPrefix(body, "---\n") {
 		t.Error("expected compact index header to be preserved")
+	}
+}
+
+// gemCooldownUpstream serves index as /info/testgem, gzipped when the
+// request accepts gzip as rubygems.org does, with 1.0.0 published a week ago
+// and 2.0.0 an hour ago.
+func gemCooldownUpstream(t *testing.T, index string, headers http.Header) *httptest.Server {
+	t.Helper()
+	now := time.Now()
+	versionsJSON, _ := json.Marshal([]gemVersion{
+		{Number: "1.0.0", Platform: "ruby", CreatedAt: now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)},
+		{Number: "2.0.0", Platform: "ruby", CreatedAt: now.Add(-time.Hour).Format(time.RFC3339)},
+	})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/info/testgem":
+			for k, vv := range headers {
+				w.Header()[k] = vv
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				_, _ = w.Write([]byte(index))
+				return
+			}
+			w.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(w)
+			_, _ = gz.Write([]byte(index))
+			_ = gz.Close()
+		case "/api/v1/versions/testgem.json":
+			_, _ = w.Write(versionsJSON)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	return upstream
+}
+
+func TestGemCompactIndexCooldownClientAcceptsGzip(t *testing.T) {
+	index := "---\n1.0.0 dep1:>= 1.0|checksum:abc123\n2.0.0 dep1:>= 1.0|checksum:def456\n"
+	upstream := gemCooldownUpstream(t, index, http.Header{
+		"Etag":        {`"upstream"`},
+		"Repr-Digest": {"sha-256=:upstream:"},
+	})
+
+	proxy := testProxy()
+	proxy.Cooldown = &cooldown.Config{Default: "3d"}
+	h := &GemHandler{proxy: proxy, upstreamURL: upstream.URL}
+
+	// Bundler sends Accept-Encoding: gzip by default.
+	req := httptest.NewRequest(http.MethodGet, "/info/testgem", nil)
+	req.Header.Set("Accept-Encoding", "gzip;q=1.0,deflate;q=0.6,identity;q=0.3")
+	req.SetPathValue("name", "testgem")
+	w := httptest.NewRecorder()
+	h.handleCompactIndex(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if ce := w.Header().Get("Content-Encoding"); ce != "" {
+		t.Errorf("Content-Encoding = %q, want none", ce)
+	}
+	want := "---\n1.0.0 dep1:>= 1.0|checksum:abc123\n"
+	if got := w.Body.String(); got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+	for _, hdr := range []string{"ETag", "Repr-Digest"} {
+		if v := w.Header().Get(hdr); v != "" {
+			t.Errorf("%s = %q, upstream's value must not describe the filtered index", hdr, v)
+		}
+	}
+}
+
+func TestGemCompactIndexCooldownLongLine(t *testing.T) {
+	// A version line longer than bufio.Scanner's 64 KB default used to end
+	// the response early with a 200.
+	long := "1.0.0 " + strings.Repeat("dep:>= 1.0,", 10_000) + "|checksum:abc"
+	index := "---\n" + long + "\n2.0.0 |checksum:def\n3.0.0 |checksum:ghi\n"
+	upstream := gemCooldownUpstream(t, index, nil)
+
+	proxy := testProxy()
+	proxy.Cooldown = &cooldown.Config{Default: "3d"}
+	h := &GemHandler{proxy: proxy, upstreamURL: upstream.URL}
+
+	req := httptest.NewRequest(http.MethodGet, "/info/testgem", nil)
+	req.SetPathValue("name", "testgem")
+	w := httptest.NewRecorder()
+	h.handleCompactIndex(w, req)
+
+	want := "---\n" + long + "\n3.0.0 |checksum:ghi\n"
+	if w.Code != http.StatusOK || w.Body.String() != want {
+		t.Fatalf("status = %d, body of %d bytes; want 200 with %d bytes", w.Code, w.Body.Len(), len(want))
+	}
+}
+
+func TestGemCompactIndexCooldownOversizedIndex(t *testing.T) {
+	index := "---\n1.0.0 |checksum:abc\n" + strings.Repeat("9.9.9 |checksum:zzz\n", 100)
+	upstream := gemCooldownUpstream(t, index, nil)
+
+	proxy := testProxy()
+	proxy.Cooldown = &cooldown.Config{Default: "3d"}
+	proxy.MetadataMaxSize = 256
+	h := &GemHandler{proxy: proxy, upstreamURL: upstream.URL}
+
+	req := httptest.NewRequest(http.MethodGet, "/info/testgem", nil)
+	req.SetPathValue("name", "testgem")
+	w := httptest.NewRecorder()
+	h.handleCompactIndex(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadGateway)
 	}
 }
 
