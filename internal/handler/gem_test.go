@@ -49,6 +49,31 @@ func TestGemParseFilename(t *testing.T) {
 	}
 }
 
+func TestGemDownloadRefusesLongFilename(t *testing.T) {
+	// Every "-1-" could start a version, and each try reads to the "!" at
+	// the end before failing, so parsing this used to take minutes.
+	filename := strings.Repeat("-1-aaaaaa", 100_000) + "!.gem"
+
+	h := &GemHandler{proxy: testProxy(), upstreamURL: "http://upstream.invalid"}
+	req := httptest.NewRequest(http.MethodGet, "/gems/x", nil)
+	req.SetPathValue("filename", "x"+filename)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.handleDownload(w, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("parsing a long gem filename did not finish within 5s")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
 func TestGemCompactIndexCooldown(t *testing.T) {
 	now := time.Now()
 	oldTime := now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)
