@@ -1387,7 +1387,7 @@ func (p *Proxy) cachedMetadataState(ctx context.Context, ecosystem, cacheKey str
 		return nil, nil
 	}
 	entry, _ := p.DB.GetMetadataCache(ecosystem, cacheKey)
-	entry = p.dropLegacyMetadataEntry(ecosystem, cacheKey, entry)
+	entry = p.migrateLegacyMetadataEntry(ctx, ecosystem, cacheKey, entry)
 	if entry != nil && p.MetadataTTL > 0 && entry.FetchedAt.Valid && time.Since(entry.FetchedAt.Time) < p.MetadataTTL {
 		data, ct, err := p.readCachedMetadata(ctx, entry, validate)
 		if err == nil {
