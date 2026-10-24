@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -132,9 +131,10 @@ func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(protoResp.Body)
+	body, err := h.proxy.ReadMetadata(protoResp.Body)
 	if err != nil {
-		http.Error(w, "failed to read response", http.StatusInternalServerError)
+		h.proxy.Logger.Error("failed to read hex package", "name", name, "error", err)
+		http.Error(w, "failed to read response", http.StatusBadGateway)
 		return
 	}
 
@@ -224,8 +224,12 @@ func (h *HexHandler) fetchFilteredVersions(r *http.Request, name string) (map[st
 		return nil, fmt.Errorf("hex API returned %d", resp.StatusCode)
 	}
 
+	body, err := h.proxy.ReadMetadata(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	var pkg hexPackageAPI
-	if err := json.NewDecoder(resp.Body).Decode(&pkg); err != nil {
+	if err := json.Unmarshal(body, &pkg); err != nil {
 		return nil, err
 	}
 
@@ -253,12 +257,12 @@ func (h *HexHandler) fetchFilteredVersions(r *http.Request, name string) (map[st
 // filters releases from the Package payload, and re-encodes as gzipped protobuf
 // (without the original signature since the payload has changed).
 func (h *HexHandler) filterSignedPackage(gzippedData []byte, filteredVersions map[string]bool) ([]byte, error) {
-	// Decompress gzip
+	// Decompress gzip, with the metadata limit applied to the decompressed size
 	gr, err := gzip.NewReader(bytes.NewReader(gzippedData))
 	if err != nil {
 		return nil, err
 	}
-	signed, err := io.ReadAll(gr)
+	signed, err := h.proxy.ReadMetadata(gr)
 	if err != nil {
 		return nil, err
 	}

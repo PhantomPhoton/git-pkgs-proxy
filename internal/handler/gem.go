@@ -301,8 +301,12 @@ func (h *GemHandler) fetchFilteredVersions(r *http.Request, name string) (map[st
 		return nil, fmt.Errorf("versions API returned %d", resp.StatusCode)
 	}
 
+	body, err := h.proxy.ReadMetadata(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	var versions []gemVersion
-	if err := json.NewDecoder(resp.Body).Decode(&versions); err != nil {
+	if err := json.Unmarshal(body, &versions); err != nil {
 		return nil, err
 	}
 
