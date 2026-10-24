@@ -785,6 +785,16 @@ type UpstreamConfig struct {
 	// Example: {"apache": ["dist/(?P<name>maven)/maven-3/(?P<version>[^/]+)/binaries/(?P<file>[^/]+)"]}.
 	GenericArtifacts map[string][]string `json:"generic_artifacts" yaml:"generic_artifacts"`
 
+	// GenericPaths maps a Generic upstream name to the paths it may serve,
+	// as patterns for the request path after /generic/{name}/ with the same
+	// syntax as GitUpstream.Repos: path.Match, where a pattern ending in
+	// "/**" also matches every path nested below its prefix. Other paths
+	// answer 404. Empty serves every path. Required when upstream.auth has
+	// credentials for the upstream, since everyone who can reach the proxy
+	// can use them for any path otherwise.
+	// Example: {"github-api": ["repos/*/*/releases/**"]}.
+	GenericPaths map[string][]string `json:"generic_paths" yaml:"generic_paths"`
+
 	// Git maps names to Git servers, served read-only at /git/{name}/{repo}
 	// from a local cache of bare repositories. See GitUpstream.
 	// Example: {"github": {"url": "https://github.com"}}.
@@ -863,6 +873,9 @@ func (u *UpstreamConfig) Validate() error {
 	if err := u.validateGenericArtifacts(); err != nil {
 		return err
 	}
+	if err := u.validateGenericPaths(); err != nil {
+		return err
+	}
 	if err := u.validateGitUpstreams(); err != nil {
 		return err
 	}
@@ -900,6 +913,51 @@ func (u *UpstreamConfig) validateGenericArtifacts() error {
 		}
 	}
 	return nil
+}
+
+// validateGenericPaths checks upstream.generic_paths patterns. An upstream that
+// upstream.auth has credentials for must list its paths, so configuring a
+// token does not let everyone who can reach the proxy send any request with
+// it, mirroring the repos rule for upstream.git.
+func (u *UpstreamConfig) validateGenericPaths() error {
+	for name, patterns := range u.GenericPaths {
+		if _, found := u.Generic[name]; !found {
+			return fmt.Errorf("invalid upstream.generic_paths name %q: no upstream.generic entry", name)
+		}
+		for _, pattern := range patterns {
+			if _, err := path.Match(strings.TrimSuffix(pattern, "/**"), ""); pattern == "" || err != nil {
+				return fmt.Errorf("invalid upstream.generic_paths.%s pattern %q", name, pattern)
+			}
+		}
+	}
+	for name, upstreamURL := range u.Generic {
+		if len(u.GenericPaths[name]) == 0 && u.HasAuthWithin(upstreamURL) {
+			return fmt.Errorf("upstream.generic.%s needs upstream.generic_paths.%s: upstream.auth has credentials for %s, "+
+				"and everyone who can reach the proxy could send any request with them", name, name, upstreamURL)
+		}
+	}
+	return nil
+}
+
+// GenericPathAllowed reports whether p, a request path after
+// /generic/{name}/, matches one of an upstream's upstream.generic_paths
+// patterns. No patterns allow every path. With patterns, a path holding a
+// character the upstream could read as the end of the path or as a different
+// path ('%', '?', '#' or a backslash) is refused, so the path that matched is
+// the one the upstream sees.
+func GenericPathAllowed(patterns []string, p string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	if strings.ContainsAny(p, `%?#\`) {
+		return false
+	}
+	for _, pattern := range patterns {
+		if matchRepoPattern(pattern, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateUpstream checks the upstream block, including the one setting in

@@ -646,3 +646,47 @@ func TestGenericHandler_UpstreamNamedHostedWhileHostingIsOff(t *testing.T) {
 		t.Errorf("status = %d, body %q, want the upstream response", w.Code, w.Body)
 	}
 }
+
+func TestGenericHandler_ServesOnlyConfiguredPaths(t *testing.T) {
+	var requested []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.RequestURI())
+		_, _ = io.WriteString(w, "from upstream "+r.URL.Path)
+	}))
+	t.Cleanup(upstream.Close)
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(upstream.Client()), fetch.WithMaxRetries(0))
+	proxy.Fetcher = fetcher
+	t.Cleanup(func() { _ = fetcher.Close() })
+
+	h := NewGenericHandler(proxy, map[string]string{"github-api": upstream.URL, "open": upstream.URL}).
+		WithPaths(map[string][]string{"github-api": {"repos/*/*/releases/**", "rate_limit"}})
+
+	for _, target := range []string{
+		"/github-api/repos/jqlang/jq/releases/tags/jq-1.7.1",
+		"/github-api/rate_limit",
+		"/open/user/repos",
+	} {
+		if w := serveGenericRequest(h, target); w.Code != http.StatusOK {
+			t.Errorf("GET %s: status = %d, want 200: %s", target, w.Code, w.Body.String())
+		}
+	}
+
+	served := len(requested)
+	for _, target := range []string{
+		"/github-api/user/repos",
+		"/github-api/repos/acme/private/contents/secret.txt",
+		"/github-api/repos/jqlang/jq/releases",
+		"/github-api/repos/jqlang/jq%3F/releases/x",
+		"/github-api/repos/jqlang/jq/releases/%2575ser",
+		"/github-api/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
+	} {
+		if w := serveGenericRequest(h, target); w.Code != http.StatusNotFound {
+			t.Errorf("GET %s: status = %d, want 404", target, w.Code)
+		}
+	}
+	if len(requested) != served {
+		t.Errorf("upstream saw %v for paths outside generic_paths", requested[served:])
+	}
+}

@@ -405,6 +405,13 @@ upstream:
   generic:
     github: "https://github.com"
     github-api: "https://api.github.com"
+  # Paths each upstream may serve. Required for an upstream that
+  # upstream.auth has credentials for.
+  generic_paths:
+    github-api:
+      - "repos/*/*/releases"
+      - "repos/*/*/releases/**"
+      - "repos/*/*/tags"
   auth:
     # Optional: raise the GitHub API rate limit. Scoped to this host only,
     # so the token is never sent to the object store GitHub redirects to.
@@ -414,6 +421,19 @@ upstream:
 ```
 
 Only configured upstreams are reachable, so this is not an open HTTP proxy.
+`generic_paths` limits an upstream to the paths after `/generic/{name}/` that
+its patterns match; any other path answers 404. The patterns use the syntax of
+`upstream.git` `repos`: `path.Match`, where `*` does not cross a `/`, and a
+pattern ending in `/**` also matches every path nested below its prefix. A
+path containing `%`, `?`, `#` or a backslash is refused for an upstream with
+`generic_paths`. An upstream without `generic_paths` serves every path.
+
+When `upstream.auth` has credentials for a generic upstream, `generic_paths`
+is required and the proxy refuses to start without it: everyone who can reach
+the proxy can send requests with those credentials, so list only the paths
+they need. For GitHub, use a fine-grained personal access token limited to
+public repositories with read-only access; it raises the rate limit like any
+other token but cannot read anything private, even through an allowed path.
 Paths shaped like `{owner}/{repo}/releases/download/{tag}/{asset}` are
 version-pinned GitHub release assets: they are stored in the artifact cache
 and served from it without revalidation, including while the upstream is
@@ -728,11 +748,10 @@ without `repos` serves every repository on it, and a repository outside
 `repos` is required: everyone who can reach the proxy can read every
 repository it serves, so list only those they may read. Per-client
 permissions are not supported. `upstream.auth` matches credentials by URL, so
-they are sent by every route to that host, not only `/git`. With a token for
-`https://github.com`, a `generic` upstream at the same URL, such as the one
-the mise setup in the README uses, sends it for any path and checks no
-`repos`, so `/generic/github/acme/private.git/info/refs?service=git-upload-pack`
-would list a private repository's refs to anyone.
+they are sent by every route to that host, not only `/git`. A `generic`
+upstream at the same URL, such as the one the mise setup in the README uses,
+checks `generic_paths` instead of `repos`, and needs them too; keep Git paths
+like `{owner}/{repo}.git/info/refs` out of its patterns.
 
 Every request for a repository's refs checks the upstream's branches and tags,
 and fetches only when they changed, so a clone right after a push sees the new
