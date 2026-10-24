@@ -64,6 +64,13 @@ func imageRef(pv PackageVersion) (handler.ImageRef, []handler.Platform, error) {
 		ref.References = []string{pv.Version}
 	}
 	repositoryURL := pv.Qualifiers["repository_url"]
+	if pv.Ecosystem == "docker" && repositoryURL == "" {
+		host, repository, found := strings.Cut(pv.Name, "/")
+		if found && (strings.ContainsAny(host, ".:") || host == "localhost") {
+			ref.Registry = host
+			ref.Name = repository
+		}
+	}
 	if pv.Ecosystem == "oci" {
 		if repositoryURL == "" {
 			return ref, nil, errors.New("pkg:oci needs a repository_url qualifier")
@@ -96,8 +103,6 @@ func (m *Mirror) mirrorImage(ctx context.Context, pv PackageVersion, tracker *pr
 		tracker.addError(pv.Ecosystem, pv.Name, pv.Version, err.Error())
 		m.logger.Warn("mirror failed", "ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "error", err)
 	}
-	// pv.String keeps the namespace separator, which MakeString escapes for
-	// docker names.
 	if m.proxy != nil && m.proxy.Denylist.Denied(pv.String()) {
 		fail(fmt.Errorf("%w: %s", handler.ErrVersionDenied, pv))
 		return
