@@ -18,6 +18,7 @@ import (
 
 	"github.com/git-pkgs/artifacts"
 	"github.com/git-pkgs/cooldown"
+	"github.com/git-pkgs/integrity"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
 	"github.com/git-pkgs/proxy/internal/metrics"
@@ -1921,15 +1922,69 @@ func (p *Proxy) GetOrFetchArtifactFromURLWithHeaders(ctx context.Context, ecosys
 	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, headers, "", "")
 }
 
-// GetOrFetchArtifactFromURLWithDigest retrieves an artifact and verifies its
-// SHA-256 digest before adding a newly fetched response to the cache.
-// Non-sha256 digests are proxied without verification.
-func (p *Proxy) GetOrFetchArtifactFromURLWithDigest(ctx context.Context, ecosystem, name, version, filename, downloadURL, digest string) (*CacheResult, error) {
-	upstreamHash, _ := strings.CutPrefix(digest, "sha256:")
-	if upstreamHash == digest {
-		upstreamHash = ""
+// GetOrFetchArtifactFromURLWithDigest retrieves an artifact and verifies a
+// newly fetched response against expected, an OCI-style digest such as
+// "sha256:<hex>" or "sha512:<hex>", before serving or caching it. A digest
+// whose algorithm can't be verified is refused with ErrUnsupportedDigest
+// rather than fetched unverified. An empty expected fetches without
+// verification.
+func (p *Proxy) GetOrFetchArtifactFromURLWithDigest(ctx context.Context, ecosystem, name, version, filename, downloadURL, expected string) (*CacheResult, error) {
+	if expected == "" {
+		return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, "", "")
 	}
-	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, upstreamHash, "")
+	upstreamHash, declared, err := digestChecks(expected)
+	if err != nil {
+		return nil, err
+	}
+	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, upstreamHash, declared)
+}
+
+// ErrUnsupportedDigest is returned for a digest whose algorithm or encoding
+// the proxy can't verify.
+var ErrUnsupportedDigest = errors.New("unsupported digest")
+
+// digestChecks turns an OCI-style digest into the checks the artifact fetch
+// runs: the hex of a sha256 digest, which is also how cached artifacts are
+// keyed, or for another algorithm the integrity string verifyIntegrity
+// checks.
+func digestChecks(expected string) (upstreamHash, declared string, _ error) {
+	// The sha256 hex is compared as given, ignoring case; a malformed one
+	// fails as a mismatch once the body has been hashed.
+	if hash, ok := strings.CutPrefix(expected, "sha256:"); ok {
+		return hash, "", nil
+	}
+	d, err := digest.Parse(expected)
+	if err != nil {
+		return "", "", fmt.Errorf("%w %q: %w", ErrUnsupportedDigest, expected, err)
+	}
+	var algorithm integrity.Algorithm
+	switch d.Algorithm() {
+	case digest.SHA384:
+		algorithm = integrity.SHA384
+	case digest.SHA512:
+		algorithm = integrity.SHA512
+	default:
+		return "", "", fmt.Errorf("%w %q", ErrUnsupportedDigest, expected)
+	}
+	sum, err := integrity.ParseHex(algorithm, d.Encoded())
+	if err != nil {
+		return "", "", fmt.Errorf("%w %q: %w", ErrUnsupportedDigest, expected, err)
+	}
+	return "", sum.SRI(), nil
+}
+
+// verifyDigest checks body against expected, an OCI-style digest. A digest
+// whose algorithm can't be computed is an ErrUnsupportedDigest, and one that
+// doesn't match is an ErrArtifactDigestMismatch.
+func verifyDigest(expected string, body []byte) error {
+	d, err := digest.Parse(expected)
+	if err != nil {
+		return fmt.Errorf("%w %q: %w", ErrUnsupportedDigest, expected, err)
+	}
+	if actual := d.Algorithm().FromBytes(body); actual != d {
+		return fmt.Errorf("%w: expected %s, got %s", ErrArtifactDigestMismatch, d, actual)
+	}
+	return nil
 }
 
 // GetOrFetchArtifactFromURLWithIntegrity retrieves an artifact and verifies a
