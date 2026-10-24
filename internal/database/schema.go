@@ -92,6 +92,13 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	started_at DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS fetch_leases (
+	key TEXT NOT NULL PRIMARY KEY,
+	owner TEXT NOT NULL,
+	expires_at DATETIME NOT NULL,
+	failed BOOLEAN NOT NULL DEFAULT FALSE
+);
+
 CREATE TABLE IF NOT EXISTS vulnerabilities (
 	id INTEGER PRIMARY KEY,
 	vuln_id TEXT NOT NULL,
@@ -219,6 +226,13 @@ CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queu
 CREATE TABLE IF NOT EXISTS job_runs (
 	name TEXT NOT NULL PRIMARY KEY,
 	started_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fetch_leases (
+	key TEXT NOT NULL PRIMARY KEY,
+	owner TEXT NOT NULL,
+	expires_at TIMESTAMP NOT NULL,
+	failed BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
@@ -432,6 +446,7 @@ var migrations = []migration{
 	{"013_add_artifact_manifest", migrateAddArtifactManifest},
 	{"014_add_metadata_last_accessed", migrateAddMetadataLastAccessed},
 	{"015_add_job_runs", migrateAddJobRuns},
+	{"016_add_fetch_leases", migrateAddFetchLeases},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -744,6 +759,25 @@ func migrateAddJobRuns(db *DB) error {
 	)`, ts)
 	if _, err := db.Exec(query); err != nil {
 		return fmt.Errorf("creating job_runs table: %w", err)
+	}
+	return nil
+}
+
+// migrateAddFetchLeases creates the table instances sharing a Postgres
+// database use to fetch each cache miss from upstream only once.
+func migrateAddFetchLeases(db *DB) error {
+	ts := sqliteDatetime
+	if db.dialect == DialectPostgres {
+		ts = postgresTimestamp
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS fetch_leases (
+		key TEXT NOT NULL PRIMARY KEY,
+		owner TEXT NOT NULL,
+		expires_at %s NOT NULL,
+		failed BOOLEAN NOT NULL DEFAULT FALSE
+	)`, ts)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating fetch_leases table: %w", err)
 	}
 	return nil
 }
