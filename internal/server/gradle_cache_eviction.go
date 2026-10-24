@@ -50,7 +50,7 @@ func (s *Server) startGradleBuildCacheEviction(ctx context.Context) {
 	sweep := func() { s.runExclusive(ctx, "gradle-cache-eviction", sweepOnce) }
 	sweep()
 
-	go func() {
+	s.background.Go(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -62,7 +62,7 @@ func (s *Server) startGradleBuildCacheEviction(ctx context.Context) {
 				sweep()
 			}
 		}
-	}()
+	})
 }
 
 func sweepGradleBuildCache(

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -66,11 +67,18 @@ func TestRelayOnlyForwardsFetchRequests(t *testing.T) {
 // rather than downloaded in full and thrown away.
 func TestRelayStopsAtLimit(t *testing.T) {
 	const size, limit = 4 << 20, 64 << 10
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
 		_, _ = io.Copy(w, io.LimitReader(zeros{}, size))
 	}))
 	defer upstream.Close()
-	rl := newTestRelay(t)
+	var logs strings.Builder
+	var logMu sync.Mutex
+	rl, err := newRelay(&http.Client{}, slog.New(slog.NewTextHandler(lockedWriter{&logMu, &logs}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rl.close() })
 	base, route, unregister := rl.register(upstream.URL+"/repo", limit, nil)
 	defer unregister()
 
@@ -84,8 +92,21 @@ func TestRelayStopsAtLimit(t *testing.T) {
 		t.Errorf("read %d bytes without an error", n)
 	}
 	if !route.exceeded.Load() || route.relayed.Load() > size/2 {
-		t.Errorf("exceeded %v after relaying %d of %d bytes", route.exceeded.Load(), route.relayed.Load(), size)
+		logMu.Lock()
+		defer logMu.Unlock()
+		t.Errorf("exceeded %v after relaying %d of %d bytes; relay log:\n%s", route.exceeded.Load(), route.relayed.Load(), size, logs.String())
 	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 type zeros struct{}
