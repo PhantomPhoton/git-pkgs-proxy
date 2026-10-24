@@ -163,8 +163,11 @@ func TestHandleBrowseFile(t *testing.T) {
 			if got := w.Header().Get("Content-Type"); got != file.contentType {
 				t.Errorf("Content-Type = %q, want %q", got, file.contentType)
 			}
-			if got := w.Header().Get("Content-Security-Policy"); got != "sandbox" {
-				t.Errorf("Content-Security-Policy = %q, want sandbox", got)
+			if got, want := w.Header().Get("Content-Security-Policy"), "sandbox; frame-ancestors 'none'"; got != want {
+				t.Errorf("Content-Security-Policy = %q, want %q", got, want)
+			}
+			if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
+				t.Errorf("X-Frame-Options = %q, want DENY", got)
 			}
 			if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 				t.Errorf("X-Content-Type-Options = %q, want nosniff", got)

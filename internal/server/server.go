@@ -343,6 +343,7 @@ func (s *Server) serve(listener net.Listener) error {
 	// Web UI. Mounted under /ui so a reverse proxy can apply different
 	// access rules to it than to the package endpoints above (#123).
 	r.Route("/ui", func(ui chi.Router) {
+		ui.Use(denyFraming)
 		ui.Mount("/static", http.StripPrefix("/ui/static/", staticHandler()))
 		ui.Get("/", s.handleRoot)
 		ui.Get("/analytics", s.handleAnalytics)
