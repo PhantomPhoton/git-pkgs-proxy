@@ -96,6 +96,7 @@ func TestNPMHandlerUsesConfiguredUpstream(t *testing.T) {
 			Body:        io.NopCloser(strings.NewReader("package")),
 			ContentType: "application/gzip",
 		}
+		serveEmptyPackuments(proxy)
 		h := NewNPMHandler(proxy, "http://proxy.test", "https://npm.example.test/root/")
 
 		req := httptest.NewRequest(http.MethodGet, "/testpkg/-/testpkg-1.0.0.tgz", nil)
@@ -117,6 +118,7 @@ func TestNPMHandlerUsesConfiguredUpstream(t *testing.T) {
 			Body:        io.NopCloser(strings.NewReader("package")),
 			ContentType: "application/gzip",
 		}
+		serveEmptyPackuments(proxy)
 		h := NewNPMHandler(proxy, "http://proxy.test", "https://npm.example.test/root/")
 
 		req := httptest.NewRequest(http.MethodGet, "/@scope/name/-/name-1.0.0.tgz", nil)
@@ -693,6 +695,7 @@ func TestNPMDownloadErrorResponsesAreJSON(t *testing.T) {
 				ContentType: "application/octet-stream",
 			}
 
+			serveEmptyPackuments(proxy)
 			h := NewNPMHandler(proxy, "http://proxy.test", "http://upstream.invalid")
 			srv := httptest.NewServer(h.Routes())
 			defer srv.Close()
@@ -1053,6 +1056,7 @@ func TestNPMTarballStillRoutesToDownload(t *testing.T) {
 		Body:        io.NopCloser(strings.NewReader("package")),
 		ContentType: "application/gzip",
 	}
+	serveEmptyPackuments(proxy)
 	h := NewNPMHandler(proxy, "http://proxy.test", "https://npm.example.test")
 
 	w := serveNPM(t, h, http.MethodGet, "/lodash/-/lodash-4.17.21.tgz", nil, nil)

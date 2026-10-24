@@ -190,10 +190,15 @@ func TestNPMRoutedDownloadWithoutMetadataStaysOnRoute(t *testing.T) {
 	}
 	h := newRoutedNPMHandler(proxy, public, private)
 
-	serveNPM(t, h, http.MethodGet, "/@example/widgets/-/widgets-1.0.0.tgz", nil, nil)
+	w := serveNPM(t, h, http.MethodGet, "/@example/widgets/-/widgets-1.0.0.tgz", nil, nil)
 
-	if !strings.HasPrefix(artifactFetcher.fetchedURL, private.URL+"/registry/") {
-		t.Errorf("fetched URL = %q, want one on the route %q", artifactFetcher.fetchedURL, private.URL+"/registry/")
+	// Without the route's metadata the tarball can't be verified, so it is
+	// not fetched at all, and in particular not from the default registry.
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", w.Code)
+	}
+	if artifactFetcher.fetchedURL != "" {
+		t.Errorf("fetched URL = %q, want none", artifactFetcher.fetchedURL)
 	}
 }
 

@@ -92,12 +92,9 @@ func npmContentAddressedRegistry(t *testing.T, metadataCalls, tarballCalls *atom
 }
 
 func TestNPMTarballMetadataFallback(t *testing.T) {
-	for _, body := range []string{`{"versions":{}}`, `{"versions":{"1.0.0":{"dist":{}}}}`, `not json`, "unavailable"} {
+	for _, body := range []string{`{"versions":{}}`, `{"versions":{"1.0.0":{"dist":{}}}}`} {
 		t.Run(body, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if body == "unavailable" {
-					w.WriteHeader(http.StatusServiceUnavailable)
-				}
 				_, _ = io.WriteString(w, body)
 			}))
 			t.Cleanup(upstream.Close)
@@ -106,12 +103,10 @@ func TestNPMTarballMetadataFallback(t *testing.T) {
 			p.MetadataTTL = time.Hour
 			fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader("package"))}
 			h := NewNPMHandler(p, "http://proxy.test", upstream.URL)
-			if body != "unavailable" {
-				if _, _, err := p.FetchOrCacheMetadata(t.Context(), "npm", "@example/widget", upstream.URL); err != nil {
-					t.Fatal(err)
-				}
-				upstream.Close()
+			if _, _, err := p.FetchOrCacheMetadata(t.Context(), "npm", "@example/widget", upstream.URL); err != nil {
+				t.Fatal(err)
 			}
+			upstream.Close()
 			response := httptest.NewRecorder()
 			h.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/@example/widget/-/widget-1.0.0.tgz", nil))
 			if response.Code != http.StatusOK {
@@ -122,6 +117,60 @@ func TestNPMTarballMetadataFallback(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNPMTarballWithoutMetadataIsNotFetched checks that a tarball whose
+// packument can't be read, so its integrity is unknown, is neither fetched
+// nor cached.
+func TestNPMTarballWithoutMetadataIsNotFetched(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		limit  int64
+	}{
+		{name: "unavailable", status: http.StatusServiceUnavailable, body: "unavailable"},
+		{name: "over metadata_max_size", status: http.StatusOK, body: `{"versions":{"1.0.0":{"dist":{"integrity":"` + sha512SRI("package") + `"}}}}`, limit: 16},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(upstream.Close)
+			p, _, _, fetcher := setupTestProxy(t)
+			if tc.limit > 0 {
+				p.MetadataMaxSize = tc.limit
+			}
+			fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader("tampered"))}
+			h := NewNPMHandler(p, "http://proxy.test", upstream.URL)
+
+			response := httptest.NewRecorder()
+			h.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/@example/widget/-/widget-1.0.0.tgz", nil))
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502: %s", response.Code, response.Body.String())
+			}
+			if fetcher.fetchedURL != "" {
+				t.Errorf("fetched %q without the metadata to verify it", fetcher.fetchedURL)
+			}
+			cached, err := p.GetCachedArtifact(t.Context(), "npm", "@example/widget", "1.0.0", "widget-1.0.0.tgz")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cached != nil {
+				_ = cached.Reader.Close()
+				t.Error("tarball was cached without verification")
+			}
+		})
+	}
+}
+
+// serveEmptyPackuments answers every metadata request with a packument that
+// lists no versions, for tests about the tarball download itself.
+func serveEmptyPackuments(p *Proxy) {
+	p.HTTPClient = &http.Client{Transport: pypiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return pypiHTTPResponse(r, "application/json", `{"versions":{}}`), nil
+	})}
 }
 
 func TestNPMTarballRejectsUnsafeMetadataURL(t *testing.T) {
