@@ -152,14 +152,16 @@ func (rl *relay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, &routeReader{ctx: r.Context(), r: resp.Body, route: route}); err != nil {
-		if route.exceeded.Load() || route.full.Load() {
-			// Cut the connection so git fails rather than keeping a pack
-			// that merely looks short.
-			panic(http.ErrAbortHandler)
+		if r.Context().Err() != nil {
+			// git went away; there is no one to tell.
+			return
 		}
-		if !errors.Is(err, context.Canceled) {
+		if !route.exceeded.Load() && !route.full.Load() {
 			rl.logger.Warn("git relay: copying upstream response", "upstream", route.repoURL, "error", err)
 		}
+		// Cut the connection so git fails rather than taking a response
+		// that ended early for one that is complete.
+		panic(http.ErrAbortHandler)
 	}
 }
 

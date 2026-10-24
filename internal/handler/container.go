@@ -397,6 +397,10 @@ func (h *ContainerHandler) handleBlobDownload(w http.ResponseWriter, r *http.Req
 
 	filename := digest
 	cached, err := h.proxy.GetCachedArtifact(r.Context(), "oci", cacheName, digest, filename)
+	if errors.Is(err, ErrVersionDenied) {
+		h.containerError(w, http.StatusForbidden, "DENIED", err.Error())
+		return
+	}
 	if err != nil {
 		h.proxy.Logger.Error("failed to check blob cache", "error", err)
 		h.containerError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to check blob cache")
@@ -471,14 +475,17 @@ func (h *ContainerHandler) handleManifest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	registryURL, upstreamName, _, ok := h.registryForRequest(r, name)
+	registryURL, upstreamName, cacheName, ok := h.registryForRequest(r, name)
 	if !ok {
 		h.containerError(w, http.StatusNotFound, "NAME_UNKNOWN", "unknown upstream registry")
 		return
 	}
 
 	h.proxy.Logger.Info("container manifest request", "name", upstreamName, "reference", reference)
-	h.serveManifest(w, r, registryURL, upstreamName, reference)
+	if h.manifestDenied(w, cacheName, reference) {
+		return
+	}
+	h.serveManifest(w, r, registryURL, upstreamName, cacheName, reference)
 }
 
 // handleTagsList caches tag list responses for offline OCI pulls.

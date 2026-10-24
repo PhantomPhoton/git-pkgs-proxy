@@ -70,8 +70,10 @@ type Options struct {
 	Upstreams map[string]string
 
 	// refCheckTimeout, lowSpeedTime, maxRequestBody and maxUploadPacks
-	// override their defaults in tests.
+	// override their defaults in tests, and refreshWaitOver, when set,
+	// replaces the RefreshWait timer.
 	refCheckTimeout time.Duration
+	refreshWaitOver <-chan time.Time
 	lowSpeedTime    int
 	maxRequestBody  int64
 	maxUploadPacks  int

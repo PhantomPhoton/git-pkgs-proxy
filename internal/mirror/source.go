@@ -24,6 +24,18 @@ func (pv PackageVersion) String() string {
 	return fmt.Sprintf("pkg:%s/%s@%s", pv.Ecosystem, pv.Name, pv.Version)
 }
 
+// handlerEcosystem returns the ecosystem name the proxy's handlers store
+// packages of a PURL type under. purl names gem and composer after their
+// registries, rubygems and packagist; the handlers use the type.
+func handlerEcosystem(purlType string) string {
+	switch purlType {
+	case "gem", "composer":
+		return purlType
+	default:
+		return purl.PURLTypeToEcosystem(purlType)
+	}
+}
+
 // Source produces PackageVersion items for mirroring.
 type Source interface {
 	Enumerate(ctx context.Context, fn func(PackageVersion) error) error
@@ -53,7 +65,7 @@ func (s *PURLSource) Enumerate(ctx context.Context, fn func(PackageVersion) erro
 			return fmt.Errorf("parsing PURL %q: %w", purlStr, err)
 		}
 
-		ecosystem := purl.PURLTypeToEcosystem(p.Type)
+		ecosystem := handlerEcosystem(p.Type)
 		name := p.Name
 		if p.Namespace != "" {
 			name = p.Namespace + "/" + p.Name
@@ -119,9 +131,20 @@ func (s *SBOMSource) extractPURLs() ([]string, error) {
 	var purls []string
 	for _, p := range doc.Packages {
 		for _, ref := range p.ExternalRefs {
-			if ref.Type == "purl" && ref.Locator != "" {
-				purls = append(purls, ref.Locator)
+			if ref.Type != "purl" || ref.Locator == "" {
+				continue
 			}
+			locator := ref.Locator
+			if p.Version != "" {
+				parsed, err := purl.Parse(locator)
+				if err != nil {
+					return nil, fmt.Errorf("parsing PURL %q: %w", locator, err)
+				}
+				if parsed.Version == "" {
+					locator = parsed.WithVersion(p.Version).String()
+				}
+			}
+			purls = append(purls, locator)
 		}
 	}
 	if len(purls) == 0 {

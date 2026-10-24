@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/git-pkgs/proxy/internal/retention"
@@ -22,6 +23,11 @@ const (
 	juliaGeneralRegistryUUID = "23338594-aafe-5451-b93e-139f81909106"
 	juliaArtifactName        = "_artifact"
 	juliaRegistryName        = "_registry"
+
+	// juliaRefreshTimeout bounds a background reload of the name map.
+	juliaRefreshTimeout = 5 * time.Minute
+	// maxJuliaRegistryTomlSize bounds Registry.toml. General's is a few MB.
+	maxJuliaRegistryTomlSize = 64 << 20
 )
 
 var (
@@ -110,7 +116,7 @@ func (h *JuliaHandler) handleRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go h.refreshNamesFromRegistry(uuid, hash)
+	go h.refreshNamesFromRegistry(context.WithoutCancel(r.Context()), uuid, hash)
 
 	ServeArtifactRequest(w, r, result)
 }
@@ -211,24 +217,16 @@ func (h *JuliaHandler) loadNamesFromUpstream(ctx context.Context) error {
 	return h.loadRegistryTarball(ctx, juliaGeneralRegistryUUID, hash)
 }
 
-// fetchGeneralRegistryHash reads /registries and returns the current tree hash
-// for the General registry.
+// fetchGeneralRegistryHash reads /registries, through the metadata cache that
+// also serves it to clients, and returns the current tree hash for the
+// General registry.
 func (h *JuliaHandler) fetchGeneralRegistryHash(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.upstreamURL+"/registries", nil)
+	body, _, err := h.proxy.FetchOrCacheMetadata(ctx, "julia", "registries", h.upstreamURL+"/registries", "*/*")
 	if err != nil {
-		return "", err
-	}
-	resp, err := h.proxy.HTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("upstream /registries returned %d", resp.StatusCode)
+		return "", fmt.Errorf("reading /registries: %w", err)
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(bytes.NewReader(body))
 	for scanner.Scan() {
 		uuid, hash, ok := parseRegistryLine(scanner.Text())
 		if ok && uuid == juliaGeneralRegistryUUID {
@@ -241,21 +239,39 @@ func (h *JuliaHandler) fetchGeneralRegistryHash(ctx context.Context) (string, er
 	return "", fmt.Errorf("general registry not listed in /registries")
 }
 
-// refreshNamesFromRegistry reloads the UUID→name map from a registry tarball
-// that has just been cached. Errors are logged but do not affect the response.
-func (h *JuliaHandler) refreshNamesFromRegistry(uuid, hash string) {
-	if uuid != juliaGeneralRegistryUUID {
+// refreshNamesFromRegistry reloads the UUID→name map after a General registry
+// tarball has been served. Only the hash /registries currently lists replaces
+// the map, so requests for older snapshots neither roll it back nor trigger a
+// download each. One reload runs at a time; a request that finds one running
+// skips its own. Errors are logged but do not affect the response.
+func (h *JuliaHandler) refreshNamesFromRegistry(ctx context.Context, uuid, hash string) {
+	if uuid != juliaGeneralRegistryUUID || h.currentNamesHash() == hash {
 		return
 	}
-	h.mu.RLock()
-	current := h.namesHash
-	h.mu.RUnlock()
-	if current == hash {
+	if !h.loadMu.TryLock() {
 		return
 	}
-	if err := h.loadRegistryTarball(context.Background(), uuid, hash); err != nil {
+	defer h.loadMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, juliaRefreshTimeout)
+	defer cancel()
+	advertised, err := h.fetchGeneralRegistryHash(ctx)
+	if err != nil {
+		h.proxy.Logger.Warn("failed to refresh julia name map", "error", err)
+		return
+	}
+	if advertised != hash || h.currentNamesHash() == hash {
+		return
+	}
+	if err := h.loadRegistryTarball(ctx, uuid, hash); err != nil {
 		h.proxy.Logger.Warn("failed to refresh julia name map", "error", err)
 	}
+}
+
+func (h *JuliaHandler) currentNamesHash() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.namesHash
 }
 
 // loadRegistryTarball downloads a registry tarball and replaces the name map
@@ -312,9 +328,12 @@ func extractRegistryNames(r io.Reader) (map[string]string, error) {
 			continue
 		}
 
-		data, err := io.ReadAll(tr)
+		data, err := io.ReadAll(io.LimitReader(tr, maxJuliaRegistryTomlSize+1))
 		if err != nil {
 			return nil, err
+		}
+		if len(data) > maxJuliaRegistryTomlSize {
+			return nil, fmt.Errorf("registry file Registry.toml exceeds %d bytes", maxJuliaRegistryTomlSize)
 		}
 		return parseRegistryToml(data)
 	}

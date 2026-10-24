@@ -315,6 +315,14 @@ upstream:
   #   archlinux: "https://geo.mirror.pkgbuild.com"
   #   archlinuxarm: "https://<region>.mirror.archlinuxarm.org"
 
+  # Named FreeBSD pkg mirrors (used by /freebsd/{name}/), for ports and
+  # pkgbase repositories alike.
+  # Defaults to {"freebsd": "https://pkg.freebsd.org"} when empty;
+  # configuring any entry replaces that default.
+  # freebsd:
+  #   freebsd: "https://pkg.freebsd.org"
+  #   poudriere: "https://packages.example.com"
+
   # Named generic HTTP upstreams (used by /generic/{name}/). The remaining
   # request path and query are appended to the upstream URL. GitHub release
   # assets ({owner}/{repo}/releases/download/{tag}/{asset}) are cached
@@ -323,6 +331,18 @@ upstream:
   #   github: "https://github.com"
   #   github-api: "https://api.github.com"
   #   apache: "https://archive.apache.org"
+
+  # Paths a generic upstream may serve, as path.Match patterns for the path
+  # after /generic/{name}/; a pattern ending in /** also matches everything
+  # nested below its prefix. Other paths answer 404. Required for an upstream
+  # that upstream.auth has credentials for, such as a GitHub token for
+  # api.github.com; use a fine-grained token with read-only access to public
+  # repositories.
+  # generic_paths:
+  #   github-api:
+  #     - "repos/*/*/releases"
+  #     - "repos/*/*/releases/**"
+  #     - "repos/*/*/tags"
 
   # Version-pinned paths of generic upstreams, cached immutably like GitHub
   # release assets. Each pattern must match the whole path after

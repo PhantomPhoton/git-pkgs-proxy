@@ -113,6 +113,22 @@ func TestMirrorCommandDryRunWhileScanning(t *testing.T) {
 	}
 }
 
+func TestMirrorCommandSBOMComponentVersion(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeScanningMirrorConfig(t, dir)
+	sbomPath := filepath.Join(dir, "bom.json")
+	data := []byte(`{"components":[{"name":"app","version":"1.0","purl":"pkg:docker/ghcr.io/team/app"}]}`)
+	if err := os.WriteFile(sbomPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	output := runMirrorProcess(t, 0, "-config", configPath, "-dry-run", "-sbom", sbomPath)
+	for _, want := range []string{"Would mirror 1 package versions", "pkg:docker/ghcr.io/team/app@1.0"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("dry run missing %q:\n%s", want, output)
+		}
+	}
+}
+
 func TestRefuseUnscannedMirroring(t *testing.T) {
 	m := mirror.New(nil, nil, nil, nil, 1)
 	refuseUnscannedMirroring(m)

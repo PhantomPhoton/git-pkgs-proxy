@@ -18,6 +18,7 @@ import (
 
 	"github.com/git-pkgs/artifacts"
 	"github.com/git-pkgs/cooldown"
+	"github.com/git-pkgs/integrity"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
 	"github.com/git-pkgs/proxy/internal/metrics"
@@ -152,10 +153,14 @@ func (p *Proxy) ReadMetadata(r io.Reader) ([]byte, error) {
 
 // Proxy provides shared functionality for protocol handlers.
 type Proxy struct {
-	DB                  *database.DB
-	Storage             storage.Storage
-	Fetcher             fetch.FetcherInterface
-	Resolver            *fetch.Resolver
+	DB       *database.DB
+	Storage  storage.Storage
+	Fetcher  fetch.FetcherInterface
+	Resolver *fetch.Resolver
+	// RouteFor returns how to fetch a package that doesn't come from the
+	// ecosystem's default upstream, such as an npm package in
+	// upstream.npm_routes, or nil to use Resolver.
+	RouteFor            func(ecosystem, name string) *ArtifactRoute
 	Logger              *slog.Logger
 	Cooldown            CooldownPolicy
 	Denylist            *denylist.Policy
@@ -290,6 +295,9 @@ func (p *Proxy) GetOrFetchArtifact(ctx context.Context, ecosystem, name, version
 		filename = info.Filename
 		if filename == "" {
 			return nil, errors.New("resolved artifact has no filename")
+		}
+		if route := p.routeFor(ecosystem, name); route != nil {
+			filename = route.FilenamePrefix + filename
 		}
 	}
 	if p.StreamArtifacts {
@@ -521,8 +529,29 @@ func (p *Proxy) rejectUnusableCacheRecord(artifact *database.CachedArtifact, ver
 	}
 }
 
+// ArtifactRoute fetches a package from an upstream other than its
+// ecosystem's default one.
+type ArtifactRoute struct {
+	// Resolver finds the package's download URLs on that upstream.
+	Resolver *fetch.Resolver
+	// FilenamePrefix qualifies the artifact filename the way the handler
+	// does for the route, so clients are served what was fetched.
+	FilenamePrefix string
+}
+
+func (p *Proxy) routeFor(ecosystem, name string) *ArtifactRoute {
+	if p.RouteFor == nil {
+		return nil
+	}
+	return p.RouteFor(ecosystem, name)
+}
+
 func (p *Proxy) resolveArtifact(ctx context.Context, ecosystem, name, version string) (*fetch.ArtifactInfo, error) {
-	info, err := p.Resolver.Resolve(ctx, ecosystem, name, version)
+	resolver := p.Resolver
+	if route := p.routeFor(ecosystem, name); route != nil {
+		resolver = route.Resolver
+	}
+	info, err := resolver.Resolve(ctx, ecosystem, name, version)
 	if err != nil {
 		if errors.Is(err, fetch.ErrNotFound) {
 			return nil, ErrUpstreamNotFound
@@ -716,6 +745,10 @@ type inflightFetch struct {
 	done chan struct{}
 	val  fetchedArtifact
 	err  error
+
+	// waiters counts callers that joined the fetch, guarded by fetchMu.
+	// Tests read it to know a caller has joined.
+	waiters int
 }
 
 // coalesceFetch runs commit at most once for concurrent callers sharing key,
@@ -748,7 +781,9 @@ func (p *Proxy) coalesceFetch(ctx context.Context, key string, recheck func() (a
 		p.inFlight = make(map[string]*inflightFetch)
 	}
 	f, joined := p.inFlight[key]
-	if !joined {
+	if joined {
+		f.waiters++
+	} else {
 		f = &inflightFetch{done: make(chan struct{})}
 		p.inFlight[key] = f
 	}
@@ -787,12 +822,49 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	// in between would otherwise be repeated. Serve that record only if its
 	// bytes are still present: a record can outlive them, and refetching is
 	// the same recovery the cache lookup makes.
-	if stored, path, ok := recheck(); ok {
-		if res, err := p.openStoredArtifact(ctx, stored, path); err == nil {
-			f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, nil
-			return res, nil
+	served := func(ctx context.Context) (*CacheResult, bool) {
+		stored, path, ok := recheck()
+		if !ok {
+			return nil, false
 		}
+		res, err := p.openStoredArtifact(ctx, stored, path)
+		if err != nil {
+			return nil, false
+		}
+		f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, nil
+		return res, true
 	}
+	if res, ok := served(ctx); ok {
+		return res, nil
+	}
+
+	// Another instance sharing the database may be fetching the same
+	// artifact. Wait for it to store the artifact rather than fetch it too.
+	// The wait makes no upstream request, so a detached fetch waits past
+	// its client too, bounded by the holder's fetch and the lease expiry;
+	// otherwise callers that joined this one would get its cancellation.
+	waitCtx := ctx
+	if upstreamFetchDetached(ctx) {
+		waitCtx = context.WithoutCancel(ctx)
+	}
+	var waitedFor *CacheResult
+	release, outcome, err := p.awaitFetchLease(waitCtx, metrics.CacheKindArtifact, key, func() bool {
+		res, ok := served(waitCtx)
+		waitedFor = res
+		return ok
+	})
+	if err != nil {
+		f.err = err
+		return nil, err
+	}
+	if outcome == leaseStored {
+		return waitedFor, nil
+	}
+	// With leaseFailed, release is a no-op and this instance fetches on its
+	// own, so a failing upstream costs each instance one attempt in
+	// parallel.
+	failed := true
+	defer func() { release(failed) }()
 
 	commitCtx := ctx
 	if upstreamFetchDetached(ctx) && p.acquireDetachSlot() {
@@ -800,6 +872,7 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		commitCtx = context.WithoutCancel(ctx)
 	}
 	stored, path, err := commit(commitCtx)
+	failed = err != nil
 	f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, err
 	if err != nil {
 		return nil, err
@@ -1307,9 +1380,10 @@ func (p *Proxy) fetchOrCacheMetadata(ctx context.Context, ecosystem, cacheKey, u
 
 // fetchMetadataDocument is FetchOrCacheMetadata for callers that rewrite the
 // document and need to know which one they got: the result carries its
-// digest along with the body.
-func (p *Proxy) fetchMetadataDocument(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept string) metadataResult {
-	return p.lookupMetadata(ctx, ecosystem, cacheKey, upstreamURL, accept, "", nil)
+// digest along with the body. validate, which may be nil, is as for
+// fetchOrCacheMetadata.
+func (p *Proxy) fetchMetadataDocument(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept string, validate func([]byte) error) metadataResult {
+	return p.lookupMetadata(ctx, ecosystem, cacheKey, upstreamURL, accept, "", validate)
 }
 
 // lookupMetadata implements fetchOrCacheMetadata and fetchMetadataDocument.
@@ -1341,7 +1415,38 @@ func (p *Proxy) coalescedMetadataMiss(ctx context.Context, ecosystem, cacheKey, 
 		if hit != nil {
 			return *hit
 		}
-		return p.fetchMetadataFromUpstream(fetchCtx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate, entry)
+		// Another instance sharing the database may be fetching the same
+		// document. Only a stored copy within TTL can be served after
+		// waiting, so without that there is nothing to wait for.
+		release := func(bool) {}
+		if p.CacheMetadata && p.MetadataTTL > 0 {
+			var outcome leaseOutcome
+			var err error
+			release, outcome, err = p.awaitFetchLease(fetchCtx, metrics.CacheKindMetadata, key, func() bool {
+				entry, hit = p.cachedMetadataState(fetchCtx, ecosystem, cacheKey, validate)
+				return hit != nil
+			})
+			if err != nil {
+				return metadataResult{err: err}
+			}
+			switch outcome {
+			case leaseStored:
+				return *hit
+			case leaseFailed:
+				// Serve the stale copy at once, as the holder did, rather
+				// than trying the failing upstream again. Without one, fetch.
+				if entry != nil {
+					if res := p.staleMetadata(fetchCtx, ecosystem, cacheKey, validate, entry, errFetchFailedElsewhere); res.err == nil {
+						return res
+					}
+				}
+			case leaseFetch:
+			}
+		}
+		res := metadataResult{err: errSharedFetchAbandoned}
+		defer func() { release(res.err != nil || res.stale) }()
+		res = p.fetchMetadataFromUpstream(fetchCtx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate, entry)
+		return res
 	})
 	// The fetch ran the first caller's validate. A caller that joined it runs
 	// its own on the shared bytes, since validate may also decode them for it.
@@ -1400,7 +1505,16 @@ func (p *Proxy) fetchMetadataFromUpstream(ctx context.Context, ecosystem, cacheK
 		return metadataResult{body: meta.body, contentType: meta.contentType, contentEncoding: meta.contentEncoding, digest: digest}
 	}
 
-	// Upstream failed -- fall back to cache if available
+	return p.staleMetadata(ctx, ecosystem, cacheKey, validate, entry, err)
+}
+
+// errFetchFailedElsewhere is the upstream error behind a stale copy served
+// because another instance's fetch for it failed.
+var errFetchFailedElsewhere = errors.New("upstream fetch failed on another instance")
+
+// staleMetadata falls back to the cached copy in entry after the upstream
+// fetch failed with err.
+func (p *Proxy) staleMetadata(ctx context.Context, ecosystem, cacheKey string, validate func([]byte) error, entry *database.MetadataCacheEntry, err error) metadataResult {
 	if !p.CacheMetadata || entry == nil {
 		return metadataResult{err: fmt.Errorf("upstream failed and no cached metadata: %w", err)}
 	}
@@ -1772,19 +1886,24 @@ func (p *Proxy) proxyCachedWithEncoding(w http.ResponseWriter, r *http.Request, 
 
 	body, contentType, contentEncoding, err := p.fetchOrCacheMetadata(r.Context(), ecosystem, cacheKey, upstreamURL, acceptEncoding, nil, acceptHeaders...)
 	if err != nil {
-		if errors.Is(err, ErrUpstreamNotFound) {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		if writeUpstreamHeld(w, err) {
-			return
-		}
-		p.Logger.Error("metadata fetch failed", "error", err)
-		http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
+		p.writeMetadataFetchError(w, err)
 		return
 	}
 
 	p.writeMetadataCachedResponseWithEncoding(w, r, ecosystem, cacheKey, body, contentType, contentEncoding)
+}
+
+// writeMetadataFetchError answers a failed metadata fetch.
+func (p *Proxy) writeMetadataFetchError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrUpstreamNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if writeUpstreamHeld(w, err) {
+		return
+	}
+	p.Logger.Error("metadata fetch failed", "error", err)
+	http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 }
 
 // writeMetadataCachedResponse writes a cached metadata response and handles
@@ -1892,15 +2011,69 @@ func (p *Proxy) GetOrFetchArtifactFromURLWithHeaders(ctx context.Context, ecosys
 	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, headers, "", "")
 }
 
-// GetOrFetchArtifactFromURLWithDigest retrieves an artifact and verifies its
-// SHA-256 digest before adding a newly fetched response to the cache.
-// Non-sha256 digests are proxied without verification.
-func (p *Proxy) GetOrFetchArtifactFromURLWithDigest(ctx context.Context, ecosystem, name, version, filename, downloadURL, digest string) (*CacheResult, error) {
-	upstreamHash, _ := strings.CutPrefix(digest, "sha256:")
-	if upstreamHash == digest {
-		upstreamHash = ""
+// GetOrFetchArtifactFromURLWithDigest retrieves an artifact and verifies a
+// newly fetched response against expected, an OCI-style digest such as
+// "sha256:<hex>" or "sha512:<hex>", before serving or caching it. A digest
+// whose algorithm can't be verified is refused with ErrUnsupportedDigest
+// rather than fetched unverified. An empty expected fetches without
+// verification.
+func (p *Proxy) GetOrFetchArtifactFromURLWithDigest(ctx context.Context, ecosystem, name, version, filename, downloadURL, expected string) (*CacheResult, error) {
+	if expected == "" {
+		return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, "", "")
 	}
-	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, upstreamHash, "")
+	upstreamHash, declared, err := digestChecks(expected)
+	if err != nil {
+		return nil, err
+	}
+	return p.getOrFetchArtifactFromURL(ctx, ecosystem, name, version, filename, downloadURL, nil, upstreamHash, declared)
+}
+
+// ErrUnsupportedDigest is returned for a digest whose algorithm or encoding
+// the proxy can't verify.
+var ErrUnsupportedDigest = errors.New("unsupported digest")
+
+// digestChecks turns an OCI-style digest into the checks the artifact fetch
+// runs: the hex of a sha256 digest, which is also how cached artifacts are
+// keyed, or for another algorithm the integrity string verifyIntegrity
+// checks.
+func digestChecks(expected string) (upstreamHash, declared string, _ error) {
+	// The sha256 hex is compared as given, ignoring case; a malformed one
+	// fails as a mismatch once the body has been hashed.
+	if hash, ok := strings.CutPrefix(expected, "sha256:"); ok {
+		return hash, "", nil
+	}
+	d, err := digest.Parse(expected)
+	if err != nil {
+		return "", "", fmt.Errorf("%w %q: %w", ErrUnsupportedDigest, expected, err)
+	}
+	var algorithm integrity.Algorithm
+	switch d.Algorithm() {
+	case digest.SHA384:
+		algorithm = integrity.SHA384
+	case digest.SHA512:
+		algorithm = integrity.SHA512
+	default:
+		return "", "", fmt.Errorf("%w %q", ErrUnsupportedDigest, expected)
+	}
+	sum, err := integrity.ParseHex(algorithm, d.Encoded())
+	if err != nil {
+		return "", "", fmt.Errorf("%w %q: %w", ErrUnsupportedDigest, expected, err)
+	}
+	return "", sum.SRI(), nil
+}
+
+// verifyDigest checks body against expected, an OCI-style digest. A digest
+// whose algorithm can't be computed is an ErrUnsupportedDigest, and one that
+// doesn't match is an ErrArtifactDigestMismatch.
+func verifyDigest(expected string, body []byte) error {
+	d, err := digest.Parse(expected)
+	if err != nil {
+		return fmt.Errorf("%w %q: %w", ErrUnsupportedDigest, expected, err)
+	}
+	if actual := d.Algorithm().FromBytes(body); actual != d {
+		return fmt.Errorf("%w: expected %s, got %s", ErrArtifactDigestMismatch, d, actual)
+	}
+	return nil
 }
 
 // GetOrFetchArtifactFromURLWithIntegrity retrieves an artifact and verifies a
@@ -1924,14 +2097,19 @@ func (p *Proxy) getOrFetchArtifactFromURL(ctx context.Context, ecosystem, name, 
 }
 
 func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (*CacheResult, error) {
-	// Some protocols use qualified cache keys. Check their package identity too.
+	// Some protocols use qualified cache keys. Check their package identity
+	// too, and the cache key itself for those, such as Swift, whose name has
+	// no PURL of its own.
 	if p.versionDenied(ecosystem, name, version) {
 		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, canonicalVersionPURL(ecosystem, name, version))
+	}
+	if p.Denylist.Denied(versionPURL) {
+		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
 	}
 	if p.StreamArtifacts {
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash, declared,
 			func(fetchCtx context.Context) (*fetch.Artifact, error) {
-				return p.Fetcher.FetchWithHeaders(fetchCtx, downloadURL, headers)
+				return p.fetchUpstream(fetchCtx, downloadURL, headers)
 			})
 	}
 	if cached, err := p.getCachedArtifactWithUpstreamHash(ctx, pkgPURL, versionPURL, filename, upstreamHash); err != nil {
@@ -2006,7 +2184,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		"ecosystem", ecosystem, "name", name, "version", version, "url", downloadURL)
 
 	fetchStart := time.Now()
-	artifact, err := p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
+	artifact, err := p.fetchUpstream(ctx, downloadURL, headers)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
 		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
@@ -2018,6 +2196,43 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 	}
 
 	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact)
+}
+
+type upstreamLastModifiedKey struct{}
+
+// WithUpstreamLastModified returns a context under which an artifact fetched
+// from upstream reports its Last-Modified to fn, so a handler can learn a
+// version's publish time from the download itself rather than with a
+// request of its own. fn is not called for a cache hit, or when the
+// response has no usable Last-Modified.
+func WithUpstreamLastModified(ctx context.Context, fn func(time.Time)) context.Context {
+	return context.WithValue(ctx, upstreamLastModifiedKey{}, fn)
+}
+
+// observedFetcher is the part of fetch.Fetcher and its circuit breaker that
+// reports response headers.
+type observedFetcher interface {
+	FetchObservedWithHeaders(ctx context.Context, url string, headers http.Header) (*fetch.ObservedArtifact, error)
+}
+
+// fetchUpstream fetches downloadURL, reporting its Last-Modified when ctx
+// asks for it.
+func (p *Proxy) fetchUpstream(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
+	report, _ := ctx.Value(upstreamLastModifiedKey{}).(func(time.Time))
+	observer, ok := p.Fetcher.(observedFetcher)
+	if report == nil || !ok {
+		return p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
+	}
+	observed, err := observer.FetchObservedWithHeaders(ctx, downloadURL, headers)
+	if err != nil {
+		return nil, err
+	}
+	if observed.Observation != nil {
+		if t, err := http.ParseTime(observed.Observation.Headers.Get(headerLastModified)); err == nil {
+			report(t)
+		}
+	}
+	return observed.Artifact, nil
 }
 
 // streamFromUpstream fetches an artifact when StreamArtifacts is set and hands its

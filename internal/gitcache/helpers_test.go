@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
@@ -95,6 +96,11 @@ type fakeUpstream struct {
 	// delayFetches holds them for that long.
 	stallFetches atomic.Bool
 	delayFetches atomic.Int64
+	// fetchHold, while set, holds git's own upload-pack requests until it
+	// is closed; fetchArrived is closed when the first one arrives.
+	fetchHold    chan struct{}
+	fetchArrived chan struct{}
+	fetchOnce    *sync.Once
 
 	bodiesMu sync.Mutex
 	bodies   []string
@@ -172,6 +178,15 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 		if u.v0Only {
 			r.Header.Del("Git-Protocol")
 		}
+		if r.UserAgent() != gitUserAgent && r.Method == http.MethodPost {
+			u.holdMu.Lock()
+			fetchHold, fetchArrived, fetchOnce := u.fetchHold, u.fetchArrived, u.fetchOnce
+			u.holdMu.Unlock()
+			if fetchHold != nil {
+				fetchOnce.Do(func() { close(fetchArrived) })
+				<-fetchHold
+			}
+		}
 		if delay := u.delayFetches.Load(); delay > 0 && r.UserAgent() != gitUserAgent && r.Method == http.MethodPost {
 			time.Sleep(time.Duration(delay))
 		}
@@ -188,6 +203,24 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 	}))
 	t.Cleanup(u.server.Close)
 	return u
+}
+
+// holdFetches holds git's own upload-pack requests until release is called.
+// arrived is closed when the first one reaches the upstream.
+func (u *fakeUpstream) holdFetches() (arrived <-chan struct{}, release func()) {
+	u.holdMu.Lock()
+	defer u.holdMu.Unlock()
+	hold, first := make(chan struct{}), make(chan struct{})
+	u.fetchHold, u.fetchArrived, u.fetchOnce = hold, first, &sync.Once{}
+	var once sync.Once
+	return first, func() {
+		once.Do(func() {
+			u.holdMu.Lock()
+			u.fetchHold = nil
+			u.holdMu.Unlock()
+			close(hold)
+		})
+	}
 }
 
 func (u *fakeUpstream) holdRequests() func() {
@@ -273,12 +306,20 @@ type testCache struct {
 
 func newTestCache(t *testing.T, upstreamURL string, configure func(*Options)) *testCache {
 	t.Helper()
+	// The cache's log is shown when the test fails.
+	logs := &lockedBuffer{}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("git cache log:\n%s", logs.String())
+		}
+	})
 	opts := Options{
 		Upstreams:   map[string]string{"up": "up"},
 		CacheDir:    t.TempDir(),
 		RefreshWait: 5 * time.Second,
 		StaleMaxAge: time.Hour,
 		Client:      &http.Client{},
+		Logger:      slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	if configure != nil {
 		configure(&opts)
@@ -351,4 +392,22 @@ func (tc *testCache) clone(t *testing.T, repo string, args ...string) string {
 func (tc *testCache) cachedRefs(t *testing.T) string {
 	t.Helper()
 	return runGit(t, filepath.Join(tc.dir, "up", "repo.git"), "for-each-ref", "--format=%(objectname) %(refname)")
+}
+
+// lockedBuffer is a bytes.Buffer safe for concurrent writers.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

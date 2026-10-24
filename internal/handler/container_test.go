@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"crypto/sha512"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/git-pkgs/proxy/internal/database"
 	upstreamhttp "github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries/fetch"
@@ -900,35 +903,79 @@ func TestContainerHandler_ManifestDigestMismatchIsNotCached(t *testing.T) {
 	}
 }
 
-func TestContainerHandler_ManifestNonSHA256DigestReferenceIsProxied(t *testing.T) {
+// TestContainerHandler_ManifestDigestsAreVerified checks that a sha512
+// digest, in the reference or in Docker-Content-Digest, is verified like a
+// sha256 one, and that a digest the proxy can't compute is refused rather
+// than cached unverified.
+func TestContainerHandler_ManifestDigestsAreVerified(t *testing.T) {
 	manifest := `{"schemaVersion":2}`
-	sha512Reference := "sha512:" + strings.Repeat("a", 128)
-	sha512Header := "sha512:" + strings.Repeat("b", 128)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-		w.Header().Set("Docker-Content-Digest", sha512Header)
-		_, _ = io.WriteString(w, manifest)
-	}))
-	defer upstream.Close()
+	sum := sha512.Sum512([]byte(manifest))
+	sha512Digest := "sha512:" + hex.EncodeToString(sum[:])
+	otherSHA512 := "sha512:" + strings.Repeat("b", 128)
+	unsupported := "sha1:" + strings.Repeat("c", 40)
 
-	proxy, _, _, _ := setupTestProxy(t)
-	proxy.HTTPClient = upstream.Client()
-	h := &ContainerHandler{proxy: proxy, registryURL: upstream.URL}
+	tests := []struct {
+		name, reference, header string
+		wantOK                  bool
+	}{
+		{"sha512 reference", sha512Digest, sha512Digest, true},
+		{"sha512 reference without header", sha512Digest, "", true},
+		{"tag with sha512 header", "latest", sha512Digest, true},
+		{"mismatched sha512 reference", otherSHA512, "", false},
+		{"tag with mismatched sha512 header", "latest", otherSHA512, false},
+		{"unsupported reference", unsupported, "", false},
+		{"tag with unsupported header", "latest", unsupported, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+				if tt.header != "" {
+					w.Header().Set("Docker-Content-Digest", tt.header)
+				}
+				_, _ = io.WriteString(w, manifest)
+			}))
+			defer upstream.Close()
 
-	for _, reference := range []string{sha512Reference, "latest"} {
-		t.Run(reference, func(t *testing.T) {
+			proxy, db, _, _ := setupTestProxy(t)
+			proxy.HTTPClient = upstream.Client()
+			h := &ContainerHandler{proxy: proxy, registryURL: upstream.URL}
+			req := httptest.NewRequest(http.MethodGet, "/library/nginx/manifests/"+tt.reference, nil)
 			w := httptest.NewRecorder()
-			h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/library/nginx/manifests/"+reference, nil))
+			h.Routes().ServeHTTP(w, req)
+
+			if !tt.wantOK {
+				if w.Code != http.StatusBadGateway {
+					t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadGateway, w.Body.String())
+				}
+				requireManifestNotCached(t, h, db, upstream.URL, req, tt.reference, tt.header)
+				return
+			}
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
 			}
 			if got := w.Body.String(); got != manifest {
 				t.Errorf("body = %q, want %q", got, manifest)
 			}
-			if got := w.Header().Get("Docker-Content-Digest"); got != sha512Header {
-				t.Errorf("Docker-Content-Digest = %q, want %q", got, sha512Header)
-			}
 		})
+	}
+}
+
+func requireManifestNotCached(t *testing.T, h *ContainerHandler, db *database.DB, upstreamURL string, req *http.Request, keys ...string) {
+	t.Helper()
+	accept := normalizeContainerManifestAccept(containerManifestAccept(req))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		entry, err := db.GetMetadataCache(containerManifestCacheEcosystem,
+			h.containerManifestSharedCacheKey(upstreamURL, "library/nginx", key, accept))
+		if err != nil {
+			t.Fatalf("checking manifest cache: %v", err)
+		}
+		if entry != nil {
+			t.Errorf("manifest was cached under unverified %s", key)
+		}
 	}
 }
 

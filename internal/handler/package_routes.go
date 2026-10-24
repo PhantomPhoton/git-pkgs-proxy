@@ -30,11 +30,10 @@ func newPackageRoutes(patterns map[string]string) packageRoutes {
 	routes := make([]packageRoute, 0, len(patterns))
 	for pattern, upstreamURL := range patterns {
 		upstreamURL = strings.TrimSuffix(upstreamURL, "/")
-		digest := sha256.Sum256([]byte(upstreamURL))
 		routes = append(routes, packageRoute{
 			pattern: strings.ToLower(pattern),
 			url:     upstreamURL,
-			id:      hex.EncodeToString(digest[:])[:routeIDLength],
+			id:      routeID(upstreamURL),
 		})
 	}
 	sort.Slice(routes, func(i, j int) bool {
@@ -44,6 +43,18 @@ func newPackageRoutes(patterns map[string]string) packageRoutes {
 		return routes[i].pattern < routes[j].pattern
 	})
 	return packageRoutes{routes: routes}
+}
+
+// routeID identifies a route's upstream in cache keys and filenames.
+func routeID(upstreamURL string) string {
+	digest := sha256.Sum256([]byte(strings.TrimSuffix(upstreamURL, "/")))
+	return hex.EncodeToString(digest[:])[:routeIDLength]
+}
+
+// RoutedFilenamePrefix returns what the npm and Composer handlers put in
+// front of the artifact filenames of a package routed to routeURL.
+func RoutedFilenamePrefix(routeURL string) string {
+	return routeID(routeURL) + "/"
 }
 
 // match returns the route for a package name, if any pattern matches it.

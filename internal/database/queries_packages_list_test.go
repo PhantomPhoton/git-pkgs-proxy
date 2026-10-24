@@ -218,3 +218,35 @@ func TestListCachedPackages(t *testing.T) {
 		}
 	})
 }
+
+// git-pkgs, and proxy mirror before it used the handler names, wrote
+// "rubygems" where the gem handler writes "gem". Filtering by either name
+// finds both.
+func TestCachedPackageFiltersMatchEcosystemAliases(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		seedArtifact(t, db, "rubygems", "rake", "13.2.1", 100, 1)
+		seedArtifact(t, db, "gem", "rails", "8.0.0", 100, 1)
+		seedArtifact(t, db, "npm", "express", "1.0.0", 100, 1)
+
+		for _, ecosystem := range []string{"gem", "rubygems"} {
+			listed, err := db.ListCachedPackages(ecosystem, "name", 50, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, p := range listed {
+				names = append(names, p.Name)
+			}
+			if len(names) != 2 || names[0] != "rails" || names[1] != "rake" {
+				t.Errorf("ListCachedPackages(%q) = %v, want rails and rake", ecosystem, names)
+			}
+			if count, err := db.CountCachedPackages(ecosystem); err != nil || count != 2 {
+				t.Errorf("CountCachedPackages(%q) = %d, %v, want 2", ecosystem, count, err)
+			}
+			found, err := db.SearchPackages("ra", ecosystem, 50, 0)
+			if err != nil || len(found) != 2 {
+				t.Errorf("SearchPackages(ra, %q) = %d results, %v, want 2", ecosystem, len(found), err)
+			}
+		}
+	})
+}

@@ -317,7 +317,7 @@ func TestStreamArtifactsNPMTarballWithoutFinalChunkIsIncomplete(t *testing.T) {
 	upstream := truncatingUpstream(t,
 		func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, ".tgz") },
 		"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
-		http.NotFound)
+		func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"versions":{}}`) })
 
 	proxy, _, store, _ := setupTestProxy(t)
 	proxy.StreamArtifacts = true

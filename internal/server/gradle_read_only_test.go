@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -43,7 +44,9 @@ func startGradleServer(t *testing.T, readOnly bool) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = proxyServer.Shutdown(ctx)
-		<-startErr
+		if err := <-startErr; !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("server stopped with %v", err)
+		}
 	})
 	return cfg.BaseURL
 }

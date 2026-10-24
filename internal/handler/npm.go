@@ -32,6 +32,11 @@ const (
 	// npmKeysPath serves the registry signing keys `npm audit signatures` reads.
 	npmKeysPath = "/-/npm/v1/keys"
 
+	// npmSearchPath is what `npm search` queries, with the terms in the query
+	// string. npmPingPath is what `npm ping` checks.
+	npmSearchPath = "/-/v1/search"
+	npmPingPath   = "/-/ping"
+
 	// npmSecurityMaxBody caps the audit payload. Buffering it lets an oversized
 	// body be refused before the upstream request starts.
 	npmSecurityMaxBody = 16 << 20
@@ -88,8 +93,19 @@ func (h *NPMHandler) Routes() http.Handler {
 			return
 		}
 
-		if r.URL.Path == npmKeysPath {
+		switch r.URL.Path {
+		case npmKeysPath:
 			h.proxy.ProxyUpstream(w, r, h.upstreamURL+npmKeysPath,
+				[]string{headerAccept, headerAcceptEncoding})
+			return
+		case npmSearchPath, npmPingPath:
+			// Every query has its own answer, so these are relayed uncached
+			// and keep their query string.
+			upstreamURL := h.upstreamURL + r.URL.Path
+			if r.URL.RawQuery != "" {
+				upstreamURL += "?" + r.URL.RawQuery
+			}
+			h.proxy.ProxyUpstream(w, r, upstreamURL,
 				[]string{headerAccept, headerAcceptEncoding})
 			return
 		}
@@ -224,7 +240,11 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), "npm", metadataCacheKey, upstreamURL, accept)
+	var validate func([]byte) error
+	if !versionLookup {
+		validate = h.packumentValidator()
+	}
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "npm", metadataCacheKey, upstreamURL, accept, validate)
 	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			if versionLookup {
@@ -292,11 +312,52 @@ func (h *NPMHandler) packumentAccept() string {
 	return npmAcceptDefault
 }
 
+// errAbbreviatedPackument rejects an abbreviated packument where the full one
+// is needed.
+var errAbbreviatedPackument = errors.New("abbreviated packument where full metadata is required")
+
+// packumentValidator returns the check a packument must pass to be served or
+// cached, or nil when any document will do. Packuments share one cache row
+// whatever format they were fetched in, so one cached in abbreviated form
+// before cooldown or full metadata was turned on would otherwise still be
+// served, and used for the cooldown tarball check, while it stayed fresh or
+// as a stale copy when upstream failed. It has no "time" map, so cooldown
+// would let every version through. Rejecting it makes the lookup fetch the
+// full document instead.
+func (h *NPMHandler) packumentValidator() func([]byte) error {
+	if h.packumentAccept() != contentTypeJSON {
+		return nil
+	}
+	return requireFullPackument
+}
+
+// requireFullPackument rejects an abbreviated packument: one with the
+// top-level "modified" field the abbreviated format carries and no "time"
+// map. A full document without a time map, as some registries serve, is
+// let through as before, and so is anything that is not a JSON object,
+// leaving it to the usual handling.
+func requireFullPackument(body []byte) error {
+	var hasTime, hasModified bool
+	err := forEachJSONMember(body, func(m jsonMember) error {
+		switch key := m.key(body); {
+		case jsonKeyIs(key, "time"):
+			hasTime = true
+		case jsonKeyIs(key, "modified"):
+			hasModified = true
+		}
+		return nil
+	})
+	if err == nil && hasModified && !hasTime {
+		return errAbbreviatedPackument
+	}
+	return nil
+}
+
 // handleFilteredNPMVersionMetadata serves /pkg/<version> and /pkg/<tag> from the
 // filtered packument so cooldown and dist-tags match the root metadata response.
 func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *http.Request, packageName, specifier, accept, registryURL, cacheKey, metadataCacheKey string) {
 	_, packumentPath := npmMetadataPath(packageName)
-	packument, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", cacheKey, registryURL+"/"+packumentPath, accept)
+	packument, _, _, err := h.proxy.fetchOrCacheMetadata(r.Context(), "npm", cacheKey, registryURL+"/"+packumentPath, "", h.packumentValidator(), accept)
 	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
@@ -859,7 +920,7 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	registryURL, cacheKey := h.sourceFor(packageName)
 	metadata := sync.OnceValues(func() ([]byte, error) {
 		upstreamURL := registryURL + "/" + url.PathEscape(packageName)
-		body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", cacheKey, upstreamURL, h.packumentAccept())
+		body, _, _, err := h.proxy.fetchOrCacheMetadata(r.Context(), "npm", cacheKey, upstreamURL, "", h.packumentValidator(), h.packumentAccept())
 		return body, err
 	})
 	if h.versionInCooldown(packageName, version, metadata) {
@@ -894,18 +955,21 @@ func (h *NPMHandler) getTarball(r *http.Request, registryURL, packageName, versi
 	if cached, err := h.proxy.GetCachedArtifact(r.Context(), "npm", packageName, version, cacheFilename); err != nil || cached != nil {
 		return cached, err
 	}
-	downloadURL := fmt.Sprintf("%s/%s/-/%s", registryURL, escapeNPMDownloadPackage(packageName), url.PathEscape(filename))
-	var sri string
+	// The packument says where the tarball is and what it must hash to.
+	// Without it the tarball could not be verified, and an unverified copy
+	// would be cached and served to everyone, so the download fails instead.
 	body, err := metadata()
-	if err == nil {
-		if tarball := npmVersionTarball(body, version); tarball != "" {
-			downloadURL, err = validateTarballURL(tarball, registryURL)
-			if err != nil {
-				return nil, err
-			}
-		}
-		sri = npmVersionIntegrity(body, version)
+	if err != nil {
+		return nil, fmt.Errorf("fetching npm metadata to verify tarball: %w", err)
 	}
+	downloadURL := fmt.Sprintf("%s/%s/-/%s", registryURL, escapeNPMDownloadPackage(packageName), url.PathEscape(filename))
+	if tarball := npmVersionTarball(body, version); tarball != "" {
+		downloadURL, err = validateTarballURL(tarball, registryURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	sri := npmVersionIntegrity(body, version)
 	return h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "npm", packageName, version, cacheFilename, downloadURL, sri)
 }
 

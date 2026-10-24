@@ -228,3 +228,27 @@ func marshalJSON(t *testing.T, v any) []byte {
 	}
 	return data
 }
+
+// The mirror files packages under the ecosystem names the handlers use, so
+// a mirrored package and the same package cached by a client share one name.
+func TestPURLSourceUsesHandlerEcosystemNames(t *testing.T) {
+	source := &PURLSource{PURLs: []string{
+		"pkg:gem/rake@13.2.1",
+		"pkg:composer/psr/log@3.0.2",
+		"pkg:apk/curl@8.14.1-r2",
+		"pkg:npm/left-pad@1.3.0",
+	}}
+
+	var got []string
+	if err := source.Enumerate(context.Background(), func(pv PackageVersion) error {
+		got = append(got, pv.Ecosystem)
+		return nil
+	}); err != nil {
+		t.Fatalf("Enumerate() error = %v", err)
+	}
+
+	want := []string{"gem", "composer", "alpine", "npm"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("ecosystems = %v, want %v", got, want)
+	}
+}

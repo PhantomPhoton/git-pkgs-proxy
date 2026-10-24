@@ -149,7 +149,10 @@ func TestRewrittenMetadataWithoutGzip(t *testing.T) {
 func TestRewrittenMetadataGzipOnlyFromRewriteCache(t *testing.T) {
 	setups := map[string]func(*Proxy){
 		"cache disabled": func(p *Proxy) { p.SetMetadataRewriteCacheSize(0) },
-		"cooldown":       func(p *Proxy) { p.Cooldown = &cooldown.Config{Default: "3d"} },
+		"cooldown without cache": func(p *Proxy) {
+			p.SetMetadataRewriteCacheSize(0)
+			p.Cooldown = &cooldown.Config{Default: "3d"}
+		},
 	}
 	for _, c := range validatorCases {
 		for name, setup := range setups {
@@ -180,7 +183,7 @@ func TestRewriteCache_KeepsGzipCopyOnlyWhenSmaller(t *testing.T) {
 
 	for _, doc := range [][]byte{large, []byte("abc")} {
 		key := rewriteCacheKey("npm", "http://proxy", string(doc[:3]), doc)
-		if _, err := c.rewrite(t.Context(), key, doc, identity); err != nil {
+		if _, err := c.rewrite(t.Context(), key, doc, 0, identity); err != nil {
 			t.Fatal(err)
 		}
 	}

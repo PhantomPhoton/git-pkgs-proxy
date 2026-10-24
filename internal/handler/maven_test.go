@@ -117,3 +117,28 @@ func TestMavenIsChecksumFile(t *testing.T) {
 		}
 	}
 }
+
+func TestMavenIsCoordinateFile(t *testing.T) {
+	h := &MavenHandler{}
+
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"com/google/protobuf/protoc/3.21.0/protoc-3.21.0-linux-x86_64.exe", true},
+		{"com/google/protobuf/protoc/3.21.0/protoc-3.21.0-linux-x86_64.exe.sha1", true},
+		{"org/example/plugin/1.0/plugin-1.0.hpi", true},
+		{"org/example/lib/1.0-SNAPSHOT/lib-1.0-20240101.120000-1.exe", true},
+		{"org/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.exe", true},
+		{"com/google/protobuf/protoc/3.21.0/", false},
+		{"com/google/protobuf/protoc/3.21.0/other-3.21.0.exe", false},
+		{"com/google/protobuf/protoc/3.21.0/protoc-3.20.0.exe", false},
+		{"archetype-catalog.xml", false},
+	}
+
+	for _, tt := range tests {
+		if got := h.isCoordinateFile(tt.path); got != tt.want {
+			t.Errorf("isCoordinateFile(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}

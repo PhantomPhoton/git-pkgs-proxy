@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -125,18 +126,24 @@ func OpenPostgresOrCreate(url string) (*DB, error) {
 		return nil, err
 	}
 
-	var exists bool
-	err = db.Get(&exists, "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'schema_info')")
+	// Instances started together on an empty database would otherwise
+	// create the schema at the same time and fail on each other's tables.
+	err = db.WithLock(context.Background(), schemaLock, func() error {
+		var exists bool
+		if err := db.Get(&exists, "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'schema_info')"); err != nil {
+			return fmt.Errorf("checking schema: %w", err)
+		}
+		if exists {
+			return nil
+		}
+		if err := db.CreateSchema(); err != nil {
+			return fmt.Errorf("creating schema: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("checking schema: %w", err)
-	}
-
-	if !exists {
-		if err := db.CreateSchema(); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("creating schema: %w", err)
-		}
+		return nil, err
 	}
 
 	return db, nil

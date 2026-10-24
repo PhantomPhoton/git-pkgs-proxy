@@ -1322,6 +1322,13 @@ func TestUpstreamAuthForURLMatchesURLComponents(t *testing.T) {
 		{name: "lookalike host rejected", url: "https://registry.example.com.evil.test/package"},
 		{name: "different scheme rejected", url: "http://registry.example.com/package"},
 		{name: "different port rejected", url: "https://registry.example.com:8443/package"},
+		{name: "dot dot segment rejected", url: "https://registry.example.com/private/../package"},
+		{name: "encoded dot dot segment rejected", url: "https://registry.example.com/private/%2e%2e/package"},
+		{name: "double encoded dot dot segment rejected", url: "https://registry.example.com/private/%252e%252e/package"},
+		{name: "dot segment rejected", url: "https://registry.example.com/private/./package"},
+		{name: "dot dot segment with parameter rejected", url: "https://registry.example.com/private/..;/package"},
+		{name: "encoded dot dot segment with parameter rejected", url: "https://registry.example.com/private/%2e%2e;x/package"},
+		{name: "dot dot segment with encoded parameter rejected", url: "https://registry.example.com/private/..%3b/package"},
 	}
 
 	for _, tt := range tests {
@@ -1899,5 +1906,149 @@ func TestGenericUpstreamNamedHosted(t *testing.T) {
 	cfg.Hosted.Token = "secret"
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reserved") {
 		t.Errorf("upstream.generic named hosted with hosting on: %v, want it refused", err)
+	}
+}
+
+func TestValidateFreeBSDUpstreams(t *testing.T) {
+	tests := []struct {
+		name    string
+		freebsd map[string]string
+		wantErr bool
+	}{
+		{"valid", map[string]string{"freebsd": "https://pkg.freebsd.org", "poudriere": "https://packages.example.com"}, false},
+		{"name contains path separator", map[string]string{"freebsd/ports": "https://pkg.freebsd.org"}, true},
+		{"URL is not absolute", map[string]string{"freebsd": "pkg.freebsd.org"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Upstream.FreeBSD = tt.freebsd
+			if err := cfg.Validate(); (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateGenericPaths(t *testing.T) {
+	githubAPI := map[string]string{"github-api": "https://api.github.com"}
+	token := map[string]AuthConfig{"https://api.github.com": {Type: "bearer", Token: "t"}}
+	tests := []struct {
+		name     string
+		upstream UpstreamConfig
+		wantErr  bool
+	}{
+		{name: "public", upstream: UpstreamConfig{Generic: githubAPI}},
+		{name: "credentials without paths", upstream: UpstreamConfig{Generic: githubAPI, Auth: token}, wantErr: true},
+		{
+			name: "credentials for a path under the upstream",
+			upstream: UpstreamConfig{
+				Generic: githubAPI,
+				Auth:    map[string]AuthConfig{"https://api.github.com/repos/acme": {Type: "bearer", Token: "t"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "credentials with paths",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github-api": {"repos/*/*/releases/**"}},
+				Auth:         token,
+			},
+		},
+		{
+			name: "credentials for another host",
+			upstream: UpstreamConfig{
+				Generic: githubAPI,
+				Auth:    map[string]AuthConfig{"https://npm.example": {Type: "bearer", Token: "t"}},
+			},
+		},
+		{
+			name: "paths for an unknown upstream",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github": {"*/*/releases/**"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "bad pattern",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github-api": {"["}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty pattern",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github-api": {""}},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.upstream.Validate(); (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestGenericPathAllowed(t *testing.T) {
+	patterns := []string{"repos/*/*/releases/**", "rate_limit"}
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"repos/jqlang/jq/releases/tags/jq-1.7.1", true},
+		{"repos/jqlang/jq/releases/latest", true},
+		{"rate_limit", true},
+		{"repos/jqlang/jq/releases", false},
+		{"repos/acme/private/contents/secret.txt", false},
+		{"user/repos", false},
+		{"repos/jqlang/jq/releases/%2e%2e", false},
+		{"repos/jqlang/jq?/releases/x", false},
+		{"repos/jqlang/jq/releases/x#y", false},
+		{`repos/jqlang/jq/releases/x\y`, false},
+	}
+	for _, tt := range tests {
+		if got := GenericPathAllowed(patterns, tt.path); got != tt.want {
+			t.Errorf("GenericPathAllowed(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+	if !GenericPathAllowed(nil, "user/repos") {
+		t.Error("GenericPathAllowed without patterns refused a path")
+	}
+}
+
+func TestLoadGenericPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`
+upstream:
+  generic:
+    github-api: https://api.github.com
+  generic_paths:
+    github-api:
+      - "repos/*/*/releases/**"
+  auth:
+    "https://api.github.com":
+      type: bearer
+      token: t
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := cfg.Upstream.GenericPaths["github-api"]; len(got) != 1 || got[0] != "repos/*/*/releases/**" {
+		t.Errorf("generic_paths = %v", cfg.Upstream.GenericPaths)
 	}
 }

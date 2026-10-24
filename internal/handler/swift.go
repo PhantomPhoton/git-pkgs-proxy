@@ -628,6 +628,10 @@ func (h *SwiftHandler) writeArtifactError(w http.ResponseWriter, err error) {
 		writeSwiftProblem(w, http.StatusNotFound, "release not found")
 		return
 	}
+	if errors.Is(err, ErrArtifactBlocked) || errors.Is(err, ErrVersionDenied) {
+		writeSwiftProblem(w, http.StatusForbidden, err.Error())
+		return
+	}
 	if writeUpstreamHeld(w, err) {
 		return
 	}
