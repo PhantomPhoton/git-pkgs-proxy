@@ -51,7 +51,7 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | Hex | Elixir | Yes* | ✓ |
 | pub.dev | Dart | Yes | ✓ |
 | PyPI | Python | Yes | ✓ |
-| Maven | Java | | ✓ |
+| Maven | Java | Yes‡ | ✓ |
 | Gradle Build Cache | Java/Kotlin | | ✓ |
 | NuGet | .NET | Yes | ✓ |
 | Composer | PHP | Yes | ✓ |
@@ -78,6 +78,8 @@ Cooldown requires publish timestamps in metadata. Registries without a "Yes" in 
 \* Hex cooldown requires disabling registry signature verification (`HEX_NO_VERIFY_REPO_ORIGIN=1`) since the proxy re-encodes the protobuf payload.
 
 † Go cooldown uses the time in each version's `.info`, which is the commit time of the tagged revision, not when the tag was pushed.
+
+‡ Maven cooldown uses the `Last-Modified` header of each version's `.pom`. On Maven Central that is the deploy time; a Nexus or Artifactory upstream may report when it cached the file instead. SNAPSHOT versions are not held back.
 
 ## Install
 

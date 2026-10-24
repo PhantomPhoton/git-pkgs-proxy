@@ -2054,7 +2054,7 @@ func (p *Proxy) getOrFetchArtifactFromURLWithCachePURLs(ctx context.Context, eco
 	if p.StreamArtifacts {
 		return p.streamFromUpstream(ctx, ecosystem, name, version, filename, versionPURL, downloadURL, upstreamHash, declared,
 			func(fetchCtx context.Context) (*fetch.Artifact, error) {
-				return p.Fetcher.FetchWithHeaders(fetchCtx, downloadURL, headers)
+				return p.fetchUpstream(fetchCtx, downloadURL, headers)
 			})
 	}
 	if cached, err := p.getCachedArtifactWithUpstreamHash(ctx, pkgPURL, versionPURL, filename, upstreamHash); err != nil {
@@ -2129,7 +2129,7 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 		"ecosystem", ecosystem, "name", name, "version", version, "url", downloadURL)
 
 	fetchStart := time.Now()
-	artifact, err := p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
+	artifact, err := p.fetchUpstream(ctx, downloadURL, headers)
 	metrics.RecordUpstreamFetch(ecosystem, time.Since(fetchStart))
 	if err != nil {
 		metrics.RecordUpstreamError(ecosystem, "fetch_failed", metrics.FailureDetail{
@@ -2141,6 +2141,43 @@ func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, versi
 	}
 
 	return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL, upstreamHash, declared, artifact)
+}
+
+type upstreamLastModifiedKey struct{}
+
+// WithUpstreamLastModified returns a context under which an artifact fetched
+// from upstream reports its Last-Modified to fn, so a handler can learn a
+// version's publish time from the download itself rather than with a
+// request of its own. fn is not called for a cache hit, or when the
+// response has no usable Last-Modified.
+func WithUpstreamLastModified(ctx context.Context, fn func(time.Time)) context.Context {
+	return context.WithValue(ctx, upstreamLastModifiedKey{}, fn)
+}
+
+// observedFetcher is the part of fetch.Fetcher and its circuit breaker that
+// reports response headers.
+type observedFetcher interface {
+	FetchObservedWithHeaders(ctx context.Context, url string, headers http.Header) (*fetch.ObservedArtifact, error)
+}
+
+// fetchUpstream fetches downloadURL, reporting its Last-Modified when ctx
+// asks for it.
+func (p *Proxy) fetchUpstream(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
+	report, _ := ctx.Value(upstreamLastModifiedKey{}).(func(time.Time))
+	observer, ok := p.Fetcher.(observedFetcher)
+	if report == nil || !ok {
+		return p.Fetcher.FetchWithHeaders(ctx, downloadURL, headers)
+	}
+	observed, err := observer.FetchObservedWithHeaders(ctx, downloadURL, headers)
+	if err != nil {
+		return nil, err
+	}
+	if observed.Observation != nil {
+		if t, err := http.ParseTime(observed.Observation.Headers.Get(headerLastModified)); err == nil {
+			report(t)
+		}
+	}
+	return observed.Artifact, nil
 }
 
 // streamFromUpstream fetches an artifact when StreamArtifacts is set and hands its
