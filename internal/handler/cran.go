@@ -63,7 +63,7 @@ func (h *CRANHandler) Routes() http.Handler {
 	// Binary package downloads
 	mux.HandleFunc("GET /bin/{platform}/contrib/{rversion}/{filename}", h.handleBinaryDownload)
 
-	return mux
+	return rejectQueryChars(mux)
 }
 
 // handleSourceDownload serves a source package, fetching and caching from upstream.

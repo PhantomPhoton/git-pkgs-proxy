@@ -103,7 +103,7 @@ func (h *MavenHandler) Routes() http.Handler {
 	// e.g., /com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.jar
 	mux.HandleFunc("GET /", h.handleRequest)
 
-	return mux
+	return rejectQueryChars(mux)
 }
 
 // handleRequest routes Maven requests based on the path.
