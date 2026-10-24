@@ -463,6 +463,9 @@ while `upstream.oci` selects named registries through the `upstream/{name}/`
 repository prefix. For example, `oci://proxy.example.com/upstream/ghcr/owner/chart`
 uses the `ghcr` registry with `owner/chart` as its repository.
 
+The OCI handler only serves pulls (`GET` and `HEAD`). Pushes, such as a
+BuildKit `--cache-to type=registry` export, need a separate registry.
+
 containerd mirror requests carry the original registry host in an `ns` query
 parameter (see the containerd section in the README). The proxy only looks the
 host up and never connects to it: `docker.io`, `index.docker.io`,
