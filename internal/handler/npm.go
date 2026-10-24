@@ -955,18 +955,21 @@ func (h *NPMHandler) getTarball(r *http.Request, registryURL, packageName, versi
 	if cached, err := h.proxy.GetCachedArtifact(r.Context(), "npm", packageName, version, cacheFilename); err != nil || cached != nil {
 		return cached, err
 	}
-	downloadURL := fmt.Sprintf("%s/%s/-/%s", registryURL, escapeNPMDownloadPackage(packageName), url.PathEscape(filename))
-	var sri string
+	// The packument says where the tarball is and what it must hash to.
+	// Without it the tarball could not be verified, and an unverified copy
+	// would be cached and served to everyone, so the download fails instead.
 	body, err := metadata()
-	if err == nil {
-		if tarball := npmVersionTarball(body, version); tarball != "" {
-			downloadURL, err = validateTarballURL(tarball, registryURL)
-			if err != nil {
-				return nil, err
-			}
-		}
-		sri = npmVersionIntegrity(body, version)
+	if err != nil {
+		return nil, fmt.Errorf("fetching npm metadata to verify tarball: %w", err)
 	}
+	downloadURL := fmt.Sprintf("%s/%s/-/%s", registryURL, escapeNPMDownloadPackage(packageName), url.PathEscape(filename))
+	if tarball := npmVersionTarball(body, version); tarball != "" {
+		downloadURL, err = validateTarballURL(tarball, registryURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	sri := npmVersionIntegrity(body, version)
 	return h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "npm", packageName, version, cacheFilename, downloadURL, sri)
 }
 
