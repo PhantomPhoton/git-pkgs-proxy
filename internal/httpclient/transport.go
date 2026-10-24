@@ -22,6 +22,15 @@ const (
 	shortTokenSkewDivisor = 10
 	tokenMaxRetries       = 3
 	tokenRetryBaseDelay   = 500 * time.Millisecond
+
+	// maxTokenLifetime caps how long a token is reused, whatever lifetime
+	// the token service claims.
+	maxTokenLifetime = time.Hour
+	// maxCachedTokens and maxCachedChallenges bound the token and
+	// challenge caches, which grow with every repository and registry
+	// host the proxy pulls from.
+	maxCachedTokens     = 1024
+	maxCachedChallenges = 256
 )
 
 // AuthFunc returns a configured authentication header for a URL.
@@ -35,7 +44,7 @@ type Transport struct {
 
 	mu         sync.Mutex
 	tokens     map[string]cachedToken
-	challenges map[string]bearerChallenge
+	challenges map[string]bearerChallenge // by registry origin, without scopes
 }
 
 type cachedToken struct {
@@ -83,14 +92,15 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if hasExplicitAuthorization {
 		return resp, nil
 	}
-	if registryProtectionSpace(req.URL) == "" {
+	repository := registryRepository(req.URL)
+	if repository == "" {
 		return resp, nil
 	}
 
 	challenge, ok := parseBearerChallenge(resp.Header.Values("WWW-Authenticate"))
 	// Ask only for pull access to the repository being fetched, whatever
 	// scope the challenge names: the proxy only reads.
-	challenge.scopes = []string{"repository:" + registryRepository(req.URL) + ":pull"}
+	challenge.scopes = []string{pullScope(repository)}
 	if !ok || !canReplay(req) || !t.trustedWithToken(req.URL, challenge) {
 		return resp, nil
 	}
@@ -203,6 +213,17 @@ func (t *Transport) cacheToken(key string, token cachedToken) {
 			delete(t.tokens, cachedKey)
 		}
 	}
+	if _, ok := t.tokens[key]; !ok && len(t.tokens) >= maxCachedTokens {
+		// Drop the token that expires soonest.
+		var oldestKey string
+		var oldest time.Time
+		for cachedKey, cached := range t.tokens {
+			if oldestKey == "" || cached.expiresAt.Before(oldest) {
+				oldestKey, oldest = cachedKey, cached.expiresAt
+			}
+		}
+		delete(t.tokens, oldestKey)
+	}
 	t.tokens[key] = token
 }
 
@@ -282,6 +303,7 @@ func decodeTokenResponse(resp *http.Response) (string, time.Time, error) {
 	if lifetime <= 0 {
 		lifetime = defaultTokenLifetime
 	}
+	lifetime = min(lifetime, maxTokenLifetime)
 	expiresAt := issuedAt.Add(lifetime).Add(-expirySkew(lifetime))
 	return token, expiresAt, nil
 }
@@ -344,17 +366,18 @@ func (t configuredTransport) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 func (t *Transport) cachedTokenForRequest(requestURL *url.URL) string {
-	space := registryProtectionSpace(requestURL)
-	if space == "" {
+	repository := registryRepository(requestURL)
+	if repository == "" {
 		return ""
 	}
 
 	t.mu.Lock()
-	challenge, ok := t.challenges[space]
+	challenge, ok := t.challenges[registryOrigin(requestURL)]
 	t.mu.Unlock()
 	if !ok {
 		return ""
 	}
+	challenge.scopes = []string{pullScope(repository)}
 	return t.cachedToken(challenge.key())
 }
 
@@ -374,26 +397,32 @@ func (t *Transport) cachedToken(key string) string {
 	return token.value
 }
 
+// rememberChallenge records the token service a registry named, so later
+// requests to any of its repositories can send a cached token up front.
 func (t *Transport) rememberChallenge(requestURL *url.URL, challenge bearerChallenge) {
-	space := registryProtectionSpace(requestURL)
-	if space == "" {
-		return
-	}
+	origin := registryOrigin(requestURL)
+	challenge.scopes = nil
 	t.mu.Lock()
-	t.challenges[space] = challenge
-	t.mu.Unlock()
+	defer t.mu.Unlock()
+	if _, ok := t.challenges[origin]; !ok && len(t.challenges) >= maxCachedChallenges {
+		for evict := range t.challenges {
+			delete(t.challenges, evict)
+			break
+		}
+	}
+	t.challenges[origin] = challenge
 }
 
 func (c bearerChallenge) key() string {
 	return c.realm + "\x00" + c.service + "\x00" + strings.Join(c.scopes, "\x00")
 }
 
-func registryProtectionSpace(u *url.URL) string {
-	repository := registryRepository(u)
-	if repository == "" {
-		return ""
-	}
-	return u.Scheme + "://" + u.Host + "/v2/" + repository
+func registryOrigin(u *url.URL) string {
+	return strings.ToLower(u.Scheme + "://" + u.Host)
+}
+
+func pullScope(repository string) string {
+	return "repository:" + repository + ":pull"
 }
 
 // registryRepository returns the repository name from an OCI distribution

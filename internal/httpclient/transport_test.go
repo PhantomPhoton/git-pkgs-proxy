@@ -3,6 +3,7 @@ package httpclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -410,5 +411,53 @@ func TestTransportDoesNotFollowBearerChallengeOutsideOCIRegistry(t *testing.T) {
 	}
 	if tokenRequests != 0 {
 		t.Errorf("token requests = %d, want 0", tokenRequests)
+	}
+}
+
+func TestTransportBoundsTokenCache(t *testing.T) {
+	transport := NewTransport(http.DefaultTransport, nil)
+	expiry := time.Now().Add(time.Hour)
+	for i := range maxCachedTokens + 10 {
+		transport.cacheToken(fmt.Sprintf("key-%d", i), cachedToken{
+			value:     "token",
+			expiresAt: expiry.Add(time.Duration(i) * time.Second),
+		})
+	}
+	if got := len(transport.tokens); got != maxCachedTokens {
+		t.Errorf("cached tokens = %d, want %d", got, maxCachedTokens)
+	}
+	if got := transport.cachedToken(fmt.Sprintf("key-%d", maxCachedTokens+9)); got != "token" {
+		t.Error("the newest token was evicted")
+	}
+	if got := transport.cachedToken("key-0"); got != "" {
+		t.Error("the token expiring soonest was kept")
+	}
+}
+
+func TestTransportBoundsChallengeCache(t *testing.T) {
+	transport := NewTransport(http.DefaultTransport, nil)
+	challenge := bearerChallenge{realm: "https://auth.example.test/token", service: "registry"}
+	for i := range 50 {
+		transport.rememberChallenge(mustParse(t, fmt.Sprintf("https://registry.example.test/v2/repo-%d/blobs/sha256:abc", i)), challenge)
+	}
+	if got := len(transport.challenges); got != 1 {
+		t.Errorf("challenges for one registry host = %d, want 1", got)
+	}
+	for i := range maxCachedChallenges + 10 {
+		transport.rememberChallenge(mustParse(t, fmt.Sprintf("https://registry-%d.example.test/v2/repo/blobs/sha256:abc", i)), challenge)
+	}
+	if got := len(transport.challenges); got != maxCachedChallenges {
+		t.Errorf("challenges = %d, want %d", got, maxCachedChallenges)
+	}
+}
+
+func TestTransportCapsTokenLifetime(t *testing.T) {
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(`{"token":"t","expires_in":31536000}`))}
+	_, expiresAt, err := decodeTokenResponse(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit := time.Now().Add(maxTokenLifetime); expiresAt.After(limit) {
+		t.Errorf("token expires at %v, want no later than %v", expiresAt, limit)
 	}
 }
