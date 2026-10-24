@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -85,6 +86,11 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
 	queued_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at);
+
+CREATE TABLE IF NOT EXISTS job_runs (
+	name TEXT NOT NULL PRIMARY KEY,
+	started_at DATETIME NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
 	id INTEGER PRIMARY KEY,
@@ -209,6 +215,11 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
 	queued_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at);
+
+CREATE TABLE IF NOT EXISTS job_runs (
+	name TEXT NOT NULL PRIMARY KEY,
+	started_at TIMESTAMP NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
 	id SERIAL PRIMARY KEY,
@@ -420,6 +431,7 @@ var migrations = []migration{
 	{"012_add_artifact_source", migrateAddArtifactSource},
 	{"013_add_artifact_manifest", migrateAddArtifactManifest},
 	{"014_add_metadata_last_accessed", migrateAddMetadataLastAccessed},
+	{"015_add_job_runs", migrateAddJobRuns},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -489,9 +501,19 @@ func (db *DB) recordAllMigrations() error {
 	return nil
 }
 
+// schemaLock serialises schema creation and migrations across instances
+// sharing a Postgres database.
+const schemaLock = "schema"
+
 // MigrateSchema applies any unapplied migrations in order.
 // For a fully migrated database this executes a single SELECT query.
+// Instances sharing a Postgres database run it one after the other, so each
+// sees the migrations the one before it recorded.
 func (db *DB) MigrateSchema() error {
+	return db.WithLock(context.Background(), schemaLock, db.migrateSchema)
+}
+
+func (db *DB) migrateSchema() error {
 	applied, err := db.appliedMigrations()
 	if err != nil {
 		return err
@@ -705,6 +727,23 @@ func migrateAddPendingDeletes(db *DB) error {
 	)`, ts)
 	if _, err := db.Exec(query); err != nil {
 		return fmt.Errorf("creating pending_deletes table: %w", err)
+	}
+	return nil
+}
+
+// migrateAddJobRuns creates the table that records when a scheduled job
+// last started, so instances sharing the database run it once per interval.
+func migrateAddJobRuns(db *DB) error {
+	ts := sqliteDatetime
+	if db.dialect == DialectPostgres {
+		ts = postgresTimestamp
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS job_runs (
+		name TEXT NOT NULL PRIMARY KEY,
+		started_at %s NOT NULL
+	)`, ts)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating job_runs table: %w", err)
 	}
 	return nil
 }

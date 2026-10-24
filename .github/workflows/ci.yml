@@ -31,6 +31,40 @@ jobs:
       - name: Test
         run: go test -v -race ./...
 
+  postgres:
+    name: test (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: proxy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d proxy"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # The packages with tests that need PROXY_DATABASE_URL. -p 1 because
+      # their tests drop and recreate tables in the one shared database.
+      - name: Test
+        env:
+          PROXY_DATABASE_URL: postgres://postgres:test@localhost:5432/proxy?sslmode=disable
+        run: go test -v -race -p 1 ./internal/database/... ./internal/handler/... ./internal/server/...
+
   lint:
     runs-on: ubuntu-latest
     steps:

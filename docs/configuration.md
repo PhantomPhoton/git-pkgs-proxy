@@ -197,6 +197,18 @@ database:
 |--------|-------------|------|-------------|
 | `database.url` | `PROXY_DATABASE_URL` | `-database-url` | PostgreSQL connection URL |
 
+### Several instances
+
+Several instances can serve one cache when they share a PostgreSQL database and storage. The storage can be S3 or a `file://` directory on a volume every instance mounts, such as NFS, CephFS or a Kubernetes `ReadWriteMany` volume. Each fetch writes its own file and renames it into place, and records are updated with compare-and-swap, so concurrent fetches and a crashed instance leave no partial files or records that don't match a file. SQLite only supports a single instance.
+
+Instances coordinate through PostgreSQL advisory locks:
+
+- Instances started together create the schema and run migrations one after the other.
+- Eviction, reclaim, retention and the Gradle build cache sweep run on one instance at a time. An instance that finds a job running elsewhere skips that pass.
+- A [scheduled mirror](#scheduled-refresh) runs on whichever instance reaches it first in each interval.
+
+Cache misses are only coalesced within an instance. Two instances missing the same file both fetch it from upstream; the extra copy is queued for deletion like any replaced file. Each instance also needs its own [`git.cache_dir`](#git-repositories).
+
 ### Hit counts
 
 Every cache hit updates the artifact's hit count and last-access time, which the stats pages and LRU eviction use. Rather than writing each hit as its own transaction, the proxy counts hits in memory and writes them together every `hit_flush_interval`. SQLite allows one writer at a time, and the proxy uses a single SQLite connection, so with a write per hit, concurrent downloads queue behind each other.
@@ -1502,7 +1514,7 @@ mirror:
 
 Each run checks the tag with a HEAD request. If the tag still points to the cached digest, nothing else is fetched. If it moved, the new manifests and blobs are fetched first and the tag is switched only when all of them are cached, so a failed run leaves the previous image pullable. Images of one schedule are mirrored one after the other.
 
-- The first run starts within ten minutes of startup, later runs every `interval` ±10 %, so restarts and several instances don't hit the registry at once. Each instance runs the schedules on its own.
+- The first run starts within ten minutes of startup, later runs every `interval` ±10 %, so restarts and several instances don't hit the registry at once. Instances sharing a PostgreSQL database run each schedule once per interval: the first to reach it records the run, and the others skip it. A run cut off by a shutdown is not recorded, so the next instance to reach the schedule runs it.
 - Digest-pinned PURLs never move and are rejected. A `pkg:oci` digest with `tag=` is accepted; the tag is refreshed and a warning is logged when it no longer matches the digest.
 - The previous digest stays cached, so pulls by digest keep working, until eviction or retention removes it.
 - Docker Hub does not count HEAD requests against its pull limit, but every changed manifest is a pull. Set `platforms` and `upstream.auth` for `registry-1.docker.io` to stay under the anonymous limit.

@@ -34,7 +34,9 @@ func (s *Server) startReclaimLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			reclaimDue(ctx, s.db, s.storage, s.logger, time.Now().Add(-grace), reclaimTickBudget)
+			s.runExclusive(ctx, "reclaim", func() {
+				reclaimDue(ctx, s.db, s.storage, s.logger, time.Now().Add(-grace), reclaimTickBudget)
+			})
 		}
 	}
 }
