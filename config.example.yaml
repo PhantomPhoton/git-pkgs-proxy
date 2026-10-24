@@ -332,6 +332,18 @@ upstream:
   #   github-api: "https://api.github.com"
   #   apache: "https://archive.apache.org"
 
+  # Paths a generic upstream may serve, as path.Match patterns for the path
+  # after /generic/{name}/; a pattern ending in /** also matches everything
+  # nested below its prefix. Other paths answer 404. Required for an upstream
+  # that upstream.auth has credentials for, such as a GitHub token for
+  # api.github.com; use a fine-grained token with read-only access to public
+  # repositories.
+  # generic_paths:
+  #   github-api:
+  #     - "repos/*/*/releases"
+  #     - "repos/*/*/releases/**"
+  #     - "repos/*/*/tags"
+
   # Version-pinned paths of generic upstreams, cached immutably like GitHub
   # release assets. Each pattern must match the whole path after
   # /generic/{name}/ and have `version` and `file` named groups; an optional

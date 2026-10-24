@@ -71,6 +71,9 @@ type GenericHandler struct {
 	proxy            *Proxy
 	repositories     map[string]string
 	artifactPatterns map[string][]*regexp.Regexp
+	// paths holds each upstream's upstream.generic_paths patterns; an
+	// upstream without any serves every path.
+	paths map[string][]string
 }
 
 // NewGenericHandler creates a generic HTTP download proxy handler.
@@ -94,6 +97,13 @@ func NewGenericHandler(proxy *Proxy, repositories map[string]string, artifactPat
 	for name, upstreamURL := range h.repositories {
 		h.addArtifactPatterns(name, builtinGenericArtifacts[upstreamURL])
 	}
+	return h
+}
+
+// WithPaths limits upstreams to the paths their upstream.generic_paths
+// patterns match. Any other path answers 404.
+func (h *GenericHandler) WithPaths(paths map[string][]string) *GenericHandler {
+	h.paths = paths
 	return h
 }
 
@@ -131,7 +141,7 @@ func (h *GenericHandler) Routes() http.Handler {
 			return
 		}
 		upstreamURL, found := h.repositories[repository]
-		if !ok || rest == "" || !found {
+		if !ok || rest == "" || !found || !config.GenericPathAllowed(h.paths[repository], rest) {
 			http.NotFound(w, r)
 			return
 		}

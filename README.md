@@ -859,8 +859,26 @@ Release assets are cached permanently after the first download and keep
 installing while GitHub is down. Tag lookups through `api.github.com` are
 cached for `metadata_ttl` and served stale during an outage or rate limit.
 Commit a `mise.lock` and install with `mise install --locked` so pinned
-installs need no API call at all. Add a bearer token for `https://api.github.com`
-under `upstream.auth` if the fleet exceeds GitHub's anonymous rate limit.
+installs need no API call at all.
+
+If the fleet exceeds GitHub's anonymous rate limit, add a bearer token for
+`https://api.github.com` under `upstream.auth`. Everyone who can reach the
+proxy can then make requests with that token, so the proxy requires
+`generic_paths` listing the API paths it may serve, and the token should be a
+fine-grained one with read-only access to public repositories:
+
+```yaml
+upstream:
+  generic_paths:
+    github-api:
+      - "repos/*/*/releases"
+      - "repos/*/*/releases/**"
+      - "repos/*/*/tags"
+  auth:
+    "https://api.github.com":
+      type: bearer
+      token: "${GITHUB_TOKEN}"
+```
 
 Maven, mvnd, Node and Go downloads are cached the same way once their hosts
 are configured as generic upstreams; their version-pinned paths are built in
