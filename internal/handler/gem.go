@@ -101,7 +101,13 @@ func (h *GemHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 // starts at the first "-<digit>" that leaves such a version and platform,
 // so a name with a "-<digit>" segment of its own, such as devise-2fa, is
 // kept whole. A filename no split fits is split at the first "-<digit>".
+//
+// Trying every "-<digit>" costs time quadratic in the filename's length, so
+// a filename longer than maxGemFilenameLength is refused.
 func (h *GemHandler) parseGemFilename(filename string) (name, version string) {
+	if len(filename) > maxGemFilenameLength {
+		return "", ""
+	}
 	base := strings.TrimSuffix(filename, ".gem")
 	first := -1
 	for i := 0; i+1 < len(base); i++ {
@@ -120,6 +126,10 @@ func (h *GemHandler) parseGemFilename(filename string) (name, version string) {
 	}
 	return base[:first], base[first+1:]
 }
+
+// maxGemFilenameLength bounds the gem filenames parseGemFilename accepts.
+// Real gem filenames are a small fraction of this.
+const maxGemFilenameLength = 512
 
 var (
 	gemVersionPattern  = regexp.MustCompile(`^[0-9]+(\.[0-9A-Za-z]+)*$`)
