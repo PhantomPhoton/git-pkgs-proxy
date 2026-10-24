@@ -342,14 +342,12 @@ func TestGemCompactIndexVersionsAPIFails(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.handleCompactIndex(w, req)
 
-	// Should still return OK with unfiltered content
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	// Without publish times the index can't be filtered, so it isn't served.
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadGateway)
 	}
-
-	body := w.Body.String()
-	if !strings.Contains(body, "1.0.0") {
-		t.Error("expected unfiltered content when versions API fails")
+	if strings.Contains(w.Body.String(), "1.0.0") {
+		t.Error("served the unfiltered index when the versions API failed")
 	}
 }
 

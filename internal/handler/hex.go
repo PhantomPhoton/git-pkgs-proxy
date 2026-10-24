@@ -103,20 +103,15 @@ const hexAPIURL = "https://hex.pm"
 // when enabled. Since the protobuf format has no timestamps, we fetch them from the
 // Hex HTTP API concurrently.
 func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
-	if h.proxy.Cooldown == nil || !h.proxy.Cooldown.Enabled() {
-		h.proxyCached(w, r)
-		return
-	}
-
 	name := r.PathValue("name")
-	if name == "" {
+	if name == "" || !h.proxy.cooldownApplies("hex", name) {
 		h.proxyCached(w, r)
 		return
 	}
 
 	h.proxy.Logger.Info("hex package request with cooldown", "name", name)
 
-	protoResp, filteredVersions, err := h.fetchPackageAndVersions(r, name)
+	protoResp, filteredVersions, versionsErr, err := h.fetchPackageAndVersions(r, name)
 	if err != nil {
 		if writeUpstreamHeld(w, err) {
 			return
@@ -132,6 +127,11 @@ func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if versionsErr != nil {
+		h.proxy.writeCooldownLookupError(w, "hex", name, versionsErr)
+		return
+	}
+
 	body, err := io.ReadAll(protoResp.Body)
 	if err != nil {
 		http.Error(w, "failed to read response", http.StatusInternalServerError)
@@ -139,7 +139,7 @@ func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(filteredVersions) == 0 {
-		// No versions to filter or couldn't get timestamps, pass through
+		// No versions in cooldown, pass through
 		w.Header().Set(headerContentType, protoResp.Header.Get(headerContentType))
 		w.Header().Set("Content-Encoding", "gzip")
 		_, _ = w.Write(body)
@@ -148,10 +148,8 @@ func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 
 	filtered, err := h.filterSignedPackage(body, filteredVersions)
 	if err != nil {
-		h.proxy.Logger.Warn("failed to filter hex package, proxying original", "error", err)
-		w.Header().Set(headerContentType, protoResp.Header.Get(headerContentType))
-		w.Header().Set("Content-Encoding", "gzip")
-		_, _ = w.Write(body)
+		h.proxy.Logger.Error("failed to filter hex package", "name", name, "error", err)
+		http.Error(w, "failed to filter package metadata", http.StatusBadGateway)
 		return
 	}
 
@@ -160,8 +158,10 @@ func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(filtered)
 }
 
-// fetchPackageAndVersions fetches the protobuf package and version timestamps concurrently.
-func (h *HexHandler) fetchPackageAndVersions(r *http.Request, name string) (*http.Response, map[string]bool, error) {
+// fetchPackageAndVersions fetches the protobuf package and version timestamps
+// concurrently. It returns the package response and the set of versions to
+// filter, the Hex API's error, and the package fetch's error.
+func (h *HexHandler) fetchPackageAndVersions(r *http.Request, name string) (*http.Response, map[string]bool, error, error) {
 	type versionsResult struct {
 		filtered map[string]bool
 		err      error
@@ -178,16 +178,9 @@ func (h *HexHandler) fetchPackageAndVersions(r *http.Request, name string) (*htt
 	versionsRes := <-versionsCh
 
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-
-	if versionsRes.err != nil {
-		h.proxy.Logger.Warn("failed to fetch hex version timestamps, proxying unfiltered",
-			"name", name, "error", versionsRes.err)
-		return protoResp, nil, nil
-	}
-
-	return protoResp, versionsRes.filtered, nil
+	return protoResp, versionsRes.filtered, versionsRes.err, nil
 }
 
 // fetchUpstreamPackage fetches the protobuf package from upstream.
