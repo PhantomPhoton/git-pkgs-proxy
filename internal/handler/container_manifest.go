@@ -114,18 +114,23 @@ func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request,
 		h.serveStaleManifestOrError(w, r, cacheName, reference, cached, fmt.Errorf("reading manifest: %w", err))
 		return
 	}
-	computedDigest := sha256Digest(body)
 	contentDigest := resp.Header.Get("Docker-Content-Digest")
+	// A digest reference, and the digest the upstream says the manifest
+	// has, are both cache keys, so each must be the manifest's own digest.
+	// One the proxy can't compute is refused rather than cached unchecked.
 	for _, expected := range []string{reference, contentDigest} {
-		if strings.HasPrefix(expected, "sha256:") && expected != computedDigest {
+		if !strings.Contains(expected, ":") {
+			continue
+		}
+		if err := verifyDigest(expected, body); err != nil {
 			h.proxy.Logger.Error("upstream manifest failed digest verification",
-				"name", name, "reference", reference, "expected", expected, "actual", computedDigest)
+				"name", name, "reference", reference, "expected", expected, "error", err)
 			h.containerError(w, http.StatusBadGateway, "DIGEST_INVALID", "manifest digest verification failed")
 			return
 		}
 	}
 	if contentDigest == "" {
-		contentDigest = computedDigest
+		contentDigest = sha256Digest(body)
 	}
 
 	manifest := &cachedContainerManifest{
