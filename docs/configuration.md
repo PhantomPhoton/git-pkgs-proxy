@@ -1427,7 +1427,7 @@ Or via environment variable: `PROXY_MIRROR_API=true`.
 
 When disabled, the endpoints are not registered and return 404.
 
-Start a mirror job with either PURLs or an inline CycloneDX or SPDX JSON document:
+Start a mirror job with either PURLs or an inline CycloneDX or SPDX JSON document. Requests without `Content-Type: application/json` get 415, so other websites cannot start jobs through a visitor's browser:
 
 ```bash
 curl -X POST http://localhost:8080/api/mirror \

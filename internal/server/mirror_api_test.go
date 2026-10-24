@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/git-pkgs/proxy/internal/database"
@@ -62,6 +63,7 @@ func TestMirrorAPICreateJob(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("POST", "/api/mirror", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.HandleCreate(w, req)
 
@@ -98,6 +100,7 @@ func TestMirrorAPICreateJobFromInlineSBOM(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/mirror", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.HandleCreate(w, req)
 
@@ -126,6 +129,7 @@ func TestMirrorAPICreateJobRejectsPURLsAndSBOM(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/mirror", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.HandleCreate(w, req)
 
@@ -139,6 +143,7 @@ func TestMirrorAPICreateOversizedBody(t *testing.T) {
 
 	body := bytes.Repeat([]byte("x"), int(maxBodySize)+1)
 	req := httptest.NewRequest("POST", "/api/mirror", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.HandleCreate(w, req)
 
@@ -151,6 +156,7 @@ func TestMirrorAPICreateInvalidBody(t *testing.T) {
 	h := setupMirrorAPI(t)
 
 	req := httptest.NewRequest("POST", "/api/mirror", bytes.NewReader([]byte("not json")))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.HandleCreate(w, req)
 
@@ -164,6 +170,7 @@ func TestMirrorAPICreateEmptyRequest(t *testing.T) {
 
 	body, _ := json.Marshal(mirror.JobRequest{})
 	req := httptest.NewRequest("POST", "/api/mirror", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.HandleCreate(w, req)
 
@@ -210,6 +217,7 @@ func TestMirrorAPICreateAndGetJob(t *testing.T) {
 		PURLs: []string{"pkg:npm/lodash@4.17.21"},
 	})
 	createReq := httptest.NewRequest("POST", "/api/mirror", bytes.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
 	createW := httptest.NewRecorder()
 	h.HandleCreate(createW, createReq)
 
@@ -235,5 +243,33 @@ func TestMirrorAPICreateAndGetJob(t *testing.T) {
 	}
 	if job.ID != jobID {
 		t.Errorf("job ID = %q, want %q", job.ID, jobID)
+	}
+}
+
+// TestMirrorAPICreateRequiresJSON checks that only JSON requests start jobs.
+// A page on another site can make a browser POST text/plain or form data
+// without a CORS preflight, but not application/json.
+func TestMirrorAPICreateRequiresJSON(t *testing.T) {
+	h := setupMirrorAPI(t)
+	body := `{"purls":["pkg:npm/lodash@4.17.21"],"x":"="}`
+
+	for _, contentType := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/mirror", strings.NewReader(body))
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		w := httptest.NewRecorder()
+		h.HandleCreate(w, req)
+		if w.Code != http.StatusUnsupportedMediaType {
+			t.Errorf("Content-Type %q: status = %d, want %d", contentType, w.Code, http.StatusUnsupportedMediaType)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/mirror", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	w := httptest.NewRecorder()
+	h.HandleCreate(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Errorf("application/json with charset: status = %d, want %d", w.Code, http.StatusAccepted)
 	}
 }

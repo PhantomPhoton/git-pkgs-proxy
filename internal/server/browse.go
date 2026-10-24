@@ -424,7 +424,7 @@ func (s *Server) writeBrowseFile(w http.ResponseWriter, file io.Reader, filePath
 		contentType = detectContentTypeFromPrefix(head[:min(len(head), browseSniffSize)])
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("Content-Security-Policy", "sandbox; "+frameAncestorsNone)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	_, filename := path.Split(filePath)

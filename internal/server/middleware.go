@@ -174,3 +174,15 @@ func sandboxUpstreamContent(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// frameAncestorsNone stops other sites from framing the web UI, where a
+// framed page could trick a signed-in user into clicking Delete.
+const frameAncestorsNone = "frame-ancestors 'none'"
+
+func denyFraming(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", frameAncestorsNone)
+		next.ServeHTTP(w, r)
+	})
+}
