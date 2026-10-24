@@ -5,6 +5,7 @@ package enrichment
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 
@@ -37,13 +38,17 @@ type (
 )
 
 // EnrichPackage fetches metadata for a package from its registry. It returns
-// nil without an error when the name can't be expressed as a PURL.
+// nil without an error when the registry doesn't have the package or the name
+// can't be expressed as a PURL.
 func (s *Service) EnrichPackage(ctx context.Context, ecosystem, name string) (*PackageInfo, error) {
 	purlStr := packageurl.MakeString(ecosystem, name, "")
 	if purlStr == "" {
 		return nil, nil
 	}
 	info, err := s.registries.GetPackage(ctx, purlStr)
+	if errors.Is(err, registries.ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil || info == nil {
 		return nil, err
 	}
