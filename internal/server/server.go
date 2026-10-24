@@ -611,14 +611,17 @@ func configureScanning(proxy *handler.Proxy, cfg config.ScanningConfig, baseURL 
 }
 
 // newUpstreamClient builds the shared upstream client: a safehttp client whose
-// transport keeps upstreamMaxIdleConnsPerHost idle connections per host and
+// transport keeps upstreamMaxIdleConnsPerHost idle connections per host,
 // gives up after upstreamResponseHeaderTimeout when an upstream accepts a
-// request but stalls before sending headers.
+// request but stalls before sending headers, and checks the destination of
+// requests sent through a forward proxy.
 func newUpstreamClient(upstream config.UpstreamConfig) *http.Client {
-	client := safehttp.New(nil, upstreamSafeHTTPOptions(upstream))
+	opts := upstreamSafeHTTPOptions(upstream)
+	client := safehttp.New(nil, opts)
 	if transport, ok := client.Transport.(*http.Transport); ok {
 		transport.MaxIdleConnsPerHost = upstreamMaxIdleConnsPerHost
 		transport.ResponseHeaderTimeout = upstreamResponseHeaderTimeout
+		transport.Proxy = guardForwardProxy(upstreamForwardProxy, opts)
 	}
 	return client
 }
