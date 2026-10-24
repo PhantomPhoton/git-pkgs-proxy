@@ -13,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/publicsuffix"
 )
 
 const (
@@ -90,6 +88,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	challenge, ok := parseBearerChallenge(resp.Header.Values("WWW-Authenticate"))
+	// Ask only for pull access to the repository being fetched, whatever
+	// scope the challenge names: the proxy only reads.
+	challenge.scopes = []string{"repository:" + registryRepository(req.URL) + ":pull"}
 	if !ok || !canReplay(req) || !t.trustedWithToken(req.URL, challenge) {
 		return resp, nil
 	}
@@ -115,37 +116,46 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 // from that registry, which can be any host the proxy fetches from, such as
 // one named in a Composer dist URL or a Helm index. Credentials configured for
 // the realm would otherwise be turned into a token handed to that host. A
-// registry is trusted with such a token when it has configured credentials of
-// its own, or is on the same site as the realm, as Docker Hub's
-// registry-1.docker.io is with auth.docker.io. A token from a realm with no
-// configured credentials is anonymous, and any registry may have it.
+// token from a realm with no configured credentials is anonymous, and any
+// registry may have it. A credentialed token only goes to the realm's own
+// host, to a registry configured with the same credentials as the realm, or
+// to a registry in knownTokenServices.
 func (t *Transport) trustedWithToken(requestURL *url.URL, challenge bearerChallenge) bool {
 	if t.authForURL == nil {
 		return true
 	}
-	if name, value := t.authForURL(challenge.realm); name == "" || value == "" {
+	realmName, realmValue := t.authForURL(challenge.realm)
+	if realmName == "" || realmValue == "" {
 		return true
 	}
-	if name, value := t.authForURL(requestURL.String()); name != "" && value != "" {
+	if name, value := t.authForURL(requestURL.String()); name == realmName && value == realmValue {
 		return true
 	}
 	realm, err := url.Parse(challenge.realm)
-	return err == nil && sameSite(requestURL, realm)
+	return err == nil && sameTokenService(requestURL, realm)
 }
 
-// sameSite reports whether two URLs are on the same site: the same registrable
-// domain (public suffix plus one label), or, for IP addresses and names
-// without one, such as localhost, the same host and port.
-func sameSite(a, b *url.URL) bool {
-	hostA, hostB := strings.ToLower(a.Hostname()), strings.ToLower(b.Hostname())
-	if net.ParseIP(hostA) == nil && net.ParseIP(hostB) == nil {
-		siteA, errA := publicsuffix.EffectiveTLDPlusOne(hostA)
-		siteB, errB := publicsuffix.EffectiveTLDPlusOne(hostB)
-		if errA == nil && errB == nil {
-			return siteA == siteB
-		}
+// knownTokenServices maps registry hosts to the token service host they
+// use where the two differ and the registry cannot be configured with the
+// token service's credentials under the same upstream.auth key.
+var knownTokenServices = map[string]string{
+	"registry-1.docker.io": "auth.docker.io",
+	"index.docker.io":      "auth.docker.io",
+	"registry.gitlab.com":  "gitlab.com",
+}
+
+// sameTokenService reports whether a token service at realm belongs to the
+// registry at registry: both on the same scheme, host and port, or a known
+// pair of registry and token service hosts.
+func sameTokenService(registry, realm *url.URL) bool {
+	if strings.EqualFold(registry.Scheme, realm.Scheme) && strings.EqualFold(registry.Host, realm.Host) {
+		return true
 	}
-	return strings.EqualFold(a.Host, b.Host)
+	if registry.Scheme != "https" || realm.Scheme != "https" || registry.Port() != "" || realm.Port() != "" {
+		return false
+	}
+	want, ok := knownTokenServices[strings.ToLower(registry.Hostname())]
+	return ok && strings.EqualFold(realm.Hostname(), want)
 }
 
 func (t *Transport) applyAuthentication(req *http.Request, hasExplicitAuthorization bool) {
@@ -379,6 +389,17 @@ func (c bearerChallenge) key() string {
 }
 
 func registryProtectionSpace(u *url.URL) string {
+	repository := registryRepository(u)
+	if repository == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host + "/v2/" + repository
+}
+
+// registryRepository returns the repository name from an OCI distribution
+// API path, such as library/alpine from /v2/library/alpine/manifests/latest,
+// or "" if the path is not one.
+func registryRepository(u *url.URL) string {
 	const registryPrefix = "/v2/"
 	if u == nil || !strings.HasPrefix(u.Path, registryPrefix) {
 		return ""
@@ -393,7 +414,7 @@ func registryProtectionSpace(u *url.URL) string {
 	if end == len(rest) || end == 0 {
 		return ""
 	}
-	return u.Scheme + "://" + u.Host + registryPrefix + rest[:end]
+	return rest[:end]
 }
 
 func parseBearerChallenge(values []string) (bearerChallenge, bool) {
