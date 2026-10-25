@@ -27,7 +27,7 @@ func (p *Proxy) handleFilenameDownload(w http.ResponseWriter, r *http.Request, d
 		return
 	}
 
-	p.Logger.Info(d.ecosystem+" download request",
+	p.Logger.Debug(d.ecosystem+" download request",
 		"name", name, "version", version, "filename", filename)
 
 	downloadURL := d.upstreamURL + r.URL.Path

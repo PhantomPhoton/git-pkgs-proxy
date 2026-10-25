@@ -101,7 +101,7 @@ func (h *PyPIHandler) handleSimplePackage(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	h.proxy.Logger.Info("pypi simple request", "package", name)
+	h.proxy.Logger.Debug("pypi simple request", "package", name)
 
 	upstreamURL := fmt.Sprintf("%s/simple/%s/", h.upstreamURL, name)
 	accept := selectPyPISimpleRepresentation(r.Header.Get("Accept"))
@@ -392,7 +392,7 @@ func (h *PyPIHandler) handleJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("pypi json request", "package", name)
+	h.proxy.Logger.Debug("pypi json request", "package", name)
 
 	upstreamURL := fmt.Sprintf("%s/pypi/%s/json", h.upstreamURL, name)
 	h.proxyAndRewriteJSON(w, r, upstreamURL, name+"/json")
@@ -412,7 +412,7 @@ func (h *PyPIHandler) handleVersionJSON(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	h.proxy.Logger.Info("pypi version json request", "package", name, "version", version)
+	h.proxy.Logger.Debug("pypi version json request", "package", name, "version", version)
 
 	upstreamURL := fmt.Sprintf("%s/pypi/%s/%s/json", h.upstreamURL, name, version)
 	h.proxyAndRewriteJSON(w, r, upstreamURL, name+"/"+version)
@@ -646,7 +646,7 @@ func (h *PyPIHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		version = "0"
 	}
 
-	h.proxy.Logger.Info("pypi download request",
+	h.proxy.Logger.Debug("pypi download request",
 		"name", name, "version", version, "filename", filename)
 
 	// The path value starts with 'packages/' (no leading slash), so add

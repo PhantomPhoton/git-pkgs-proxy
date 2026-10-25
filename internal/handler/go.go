@@ -143,7 +143,7 @@ func (h *GoHandler) handleDownload(w http.ResponseWriter, r *http.Request, modul
 	decodedModule := decodeGoModule(module)
 	filename := goZipFilename(decodedModule, version)
 
-	h.proxy.Logger.Info("go module download request",
+	h.proxy.Logger.Debug("go module download request",
 		"module", decodedModule, "version", version)
 
 	// The URL escapes uppercase letters in the version (v1.0.0-!r!c1 for

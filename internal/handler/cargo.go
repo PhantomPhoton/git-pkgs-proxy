@@ -102,7 +102,7 @@ func (h *CargoHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("cargo index request", "crate", name)
+	h.proxy.Logger.Debug("cargo index request", "crate", name)
 
 	indexPath := h.buildIndexPath(name)
 	upstreamURL := fmt.Sprintf("%s/%s", h.indexURL, indexPath)
@@ -214,7 +214,7 @@ func (h *CargoHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	filename := fmt.Sprintf("%s-%s.crate", name, version)
 
-	h.proxy.Logger.Info("cargo download request",
+	h.proxy.Logger.Debug("cargo download request",
 		"crate", name, "version", version, "filename", filename)
 
 	downloadURL := fmt.Sprintf(
