@@ -58,8 +58,16 @@ func (h *GoHandler) writeGoMetadataError(w http.ResponseWriter, err error) {
 	http.Error(w, "failed to fetch from upstream", http.StatusBadGateway)
 }
 
+// fetchGoMetadata reads a module's @v/list, @latest, or a version's .info.
+// The .info of a canonical version comes from the cache whatever its age,
+// like proxyVersionFile serves it.
 func (h *GoHandler) fetchGoMetadata(ctx context.Context, escapedModule, module, rest string) ([]byte, error) {
-	body, _, err := h.proxy.FetchOrCacheMetadata(ctx, "golang", module+"/"+rest, h.upstreamURL+"/"+escapedModule+"/"+rest, "*/*")
+	cacheKey, upstreamURL := module+"/"+rest, h.upstreamURL+"/"+escapedModule+"/"+rest
+	if v, ok := strings.CutPrefix(rest, "@v/"); ok && strings.HasSuffix(v, ".info") && goVersionImmutable(strings.TrimSuffix(v, ".info")) {
+		res := h.proxy.fetchImmutableMetadata(ctx, "golang", cacheKey, upstreamURL, "*/*")
+		return res.body, res.err
+	}
+	body, _, err := h.proxy.FetchOrCacheMetadata(ctx, "golang", cacheKey, upstreamURL, "*/*")
 	return body, err
 }
 

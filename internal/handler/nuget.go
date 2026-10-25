@@ -88,7 +88,7 @@ func (h *NuGetHandler) Routes() http.Handler {
 
 // handleServiceIndex serves the NuGet V3 service index with rewritten URLs.
 func (h *NuGetHandler) handleServiceIndex(w http.ResponseWriter, r *http.Request) {
-	h.proxy.Logger.Info("nuget service index request")
+	h.proxy.Logger.Debug("nuget service index request")
 
 	upstreamURL := h.upstreamURL + "/v3/index.json"
 
@@ -203,7 +203,7 @@ func (h *NuGetHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("nuget download request",
+	h.proxy.Logger.Debug("nuget download request",
 		"id", id, "version", version, "filename", filename)
 
 	// NuGet package IDs are case-insensitive, lowercase for storage

@@ -37,6 +37,13 @@ func newTarballUpstream(t *testing.T, path, body string) (*httptest.Server, *ato
 // mirrorWithConfig mirrors purls with the proxy proxy mirror builds for cfg.
 func mirrorWithConfig(t *testing.T, cfg *config.Config, purls ...string) (*mirror.Progress, *handler.Proxy) {
 	t.Helper()
+	return mirrorWithVersions(t, cfg, nil, purls...)
+}
+
+// mirrorWithVersions mirrors purls, listing versions and files with versions,
+// or from the configured upstreams when it is nil.
+func mirrorWithVersions(t *testing.T, cfg *config.Config, versions mirror.VersionLister, purls ...string) (*mirror.Progress, *handler.Proxy) {
+	t.Helper()
 	cfg.Upstream.AllowLoopback = true
 	db, err := database.Create(t.TempDir() + "/test.db")
 	if err != nil {
@@ -53,7 +60,10 @@ func mirrorWithConfig(t *testing.T, cfg *config.Config, purls ...string) (*mirro
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	proxy, _ := NewMirrorProxy(cfg, db, store, logger)
 	m := mirror.New(proxy, db, store, logger, 1)
-	m.Versions = NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
+	m.Versions = versions
+	if versions == nil {
+		m.Versions = NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
+	}
 	progress, err := m.Run(context.Background(), &mirror.PURLSource{PURLs: purls})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)

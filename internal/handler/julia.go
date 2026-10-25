@@ -107,7 +107,7 @@ func (h *JuliaHandler) handleRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("julia registry request", "uuid", uuid, "hash", hash)
+	h.proxy.Logger.Debug("julia registry request", "uuid", uuid, "hash", hash)
 
 	upstreamURL := h.upstreamURL + r.URL.Path
 	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", juliaRegistryName, hash, hash+".tar.gz", upstreamURL)
@@ -156,7 +156,7 @@ func (h *JuliaHandler) handleArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("julia artifact request", "hash", hash)
+	h.proxy.Logger.Debug("julia artifact request", "hash", hash)
 
 	upstreamURL := h.upstreamURL + r.URL.Path
 	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", juliaArtifactName, hash, hash+".tar.gz", upstreamURL)

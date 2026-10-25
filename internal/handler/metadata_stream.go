@@ -24,7 +24,14 @@ import (
 // buffered path instead: no fresh row, a row without a digest or size, a
 // document over the metadata size limit, or one that can't be opened.
 func (p *Proxy) serveCachedMetadata(w http.ResponseWriter, r *http.Request, ecosystem, cacheKey string) bool {
-	entry := p.freshMetadataEntry(ecosystem, cacheKey)
+	return p.serveStoredMetadata(w, r, ecosystem, cacheKey, false)
+}
+
+// serveStoredMetadata is serveCachedMetadata. With immutable set the row is
+// served whatever its age and never marked stale, for documents that can't
+// change upstream (see proxyImmutable).
+func (p *Proxy) serveStoredMetadata(w http.ResponseWriter, r *http.Request, ecosystem, cacheKey string, immutable bool) bool {
+	entry := p.storedMetadataEntry(ecosystem, cacheKey, immutable)
 	if entry == nil {
 		return false
 	}
@@ -37,6 +44,9 @@ func (p *Proxy) serveCachedMetadata(w http.ResponseWriter, r *http.Request, ecos
 	p.recordStreamedMetadataHit(ecosystem, entry)
 
 	cm := p.cachedMetaFor(entry)
+	if immutable {
+		cm.stale = false
+	}
 	if writeMetadataValidators(w, r, cm) {
 		return true
 	}
@@ -62,11 +72,20 @@ func (p *Proxy) serveCachedMetadata(w http.ResponseWriter, r *http.Request, ecos
 // records a sha256 digest and a size within the metadata size limit. It
 // returns nil otherwise.
 func (p *Proxy) freshMetadataEntry(ecosystem, cacheKey string) *database.MetadataCacheEntry {
-	if p.DB == nil || p.Storage == nil || p.MetadataTTL <= 0 || containsPathTraversal(cacheKey) {
+	return p.storedMetadataEntry(ecosystem, cacheKey, false)
+}
+
+// storedMetadataEntry is freshMetadataEntry, ignoring the row's age when
+// immutable is set.
+func (p *Proxy) storedMetadataEntry(ecosystem, cacheKey string, immutable bool) *database.MetadataCacheEntry {
+	if p.DB == nil || p.Storage == nil || (!immutable && p.MetadataTTL <= 0) || containsPathTraversal(cacheKey) {
 		return nil
 	}
 	entry, err := p.DB.GetMetadataCache(ecosystem, cacheKey)
-	if err != nil || entry == nil || !entry.FetchedAt.Valid || time.Since(entry.FetchedAt.Time) >= p.MetadataTTL {
+	if err != nil || entry == nil || !entry.FetchedAt.Valid {
+		return nil
+	}
+	if !immutable && time.Since(entry.FetchedAt.Time) >= p.MetadataTTL {
 		return nil
 	}
 	limit := p.MetadataMaxSize

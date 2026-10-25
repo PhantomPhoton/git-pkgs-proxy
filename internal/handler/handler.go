@@ -149,13 +149,51 @@ var ErrMetadataTooLarge = errors.New("metadata response exceeds size limit")
 // from unexpectedly large responses. Returns ErrMetadataTooLarge if the response
 // is truncated by the limit.
 func (p *Proxy) ReadMetadata(r io.Reader) ([]byte, error) {
+	return p.ReadMetadataSized(r, -1)
+}
+
+// ReadMetadataSized is ReadMetadata for a body expected to be size bytes
+// long, such as a cached document or a response with a Content-Length.
+// Reading into a buffer of that size avoids io.ReadAll growing its buffer
+// step by step, which peaks at more than twice the document size. size is
+// only a hint: a negative one, or one above the limit, reads as ReadMetadata
+// does, and a body of a different length is still read correctly.
+func (p *Proxy) ReadMetadataSized(r io.Reader, size int64) ([]byte, error) {
 	limit := p.MetadataMaxSize
 	if limit <= 0 {
 		limit = defaultMetadataMaxSize
 	}
-	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if size < 0 || size > limit {
+		return readLimited(r, nil, limit)
+	}
+	// One byte more than expected, so a body of exactly size bytes ends in
+	// the buffer and a longer one is noticed.
+	buf := make([]byte, size+1)
+	n, err := io.ReadFull(r, buf)
+	switch {
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		if int64(n) < size/2 {
+			// The hint was far off; don't keep the oversized buffer alive.
+			return bytes.Clone(buf[:n]), nil
+		}
+		return buf[:n], nil
+	case err != nil:
+		return nil, err
+	}
+	return readLimited(r, buf, limit)
+}
+
+// readLimited appends the rest of r to data, failing with
+// ErrMetadataTooLarge once the total exceeds limit.
+func readLimited(r io.Reader, data []byte, limit int64) ([]byte, error) {
+	rest, err := io.ReadAll(io.LimitReader(r, limit+1-int64(len(data))))
 	if err != nil {
 		return nil, err
+	}
+	if data == nil {
+		data = rest
+	} else {
+		data = append(data, rest...)
 	}
 	if int64(len(data)) > limit {
 		return nil, ErrMetadataTooLarge
@@ -279,6 +317,9 @@ type CacheResult struct {
 	Artifact    artifacts.Artifact
 	Cached      bool
 	storagePath string
+	// rangeable is set on a HEAD cache hit, which has no Reader, when the
+	// stored object would open as a seekable reader.
+	rangeable bool
 }
 
 // GetOrFetchArtifact retrieves an artifact from cache or fetches from upstream.
@@ -474,6 +515,12 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 		}
 	}
 
+	if servingHead(ctx) {
+		result.rangeable = readsSeekable(p.Storage)
+		p.recordCacheHit(artifact.Ecosystem, versionPURL, filename)
+		return result, nil
+	}
+
 	start := time.Now()
 	reader, err := p.Storage.Open(ctx, artifact.StoragePath)
 	metrics.RecordStorageOperation("read", time.Since(start))
@@ -485,7 +532,7 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 		return nil, nil
 	}
 
-	result.Reader, err = checks.wrapFailOnMismatch(reader,
+	result.Reader, err = checks.forStoredObject().wrapFailOnMismatch(reader,
 		func(reason string) {
 			p.Logger.Error("cached artifact failed integrity check",
 				"purl", versionPURL, "filename", filename,
@@ -892,6 +939,28 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	return p.openStoredArtifact(ctx, stored, path)
 }
 
+type servingHeadKey struct{}
+
+// ServingHead marks ctx as serving a HEAD request. A cache hit under it is
+// answered from the artifact's database record without opening the stored
+// object: on S3 or GCS opening it issues a GET whose unread body would only
+// be thrown away. The server sets it on every HEAD request.
+func ServingHead(ctx context.Context) context.Context {
+	return context.WithValue(ctx, servingHeadKey{}, true)
+}
+
+func servingHead(ctx context.Context) bool {
+	head, _ := ctx.Value(servingHeadKey{}).(bool)
+	return head
+}
+
+// readsSeekable reports whether store opens objects as seekable readers, so a
+// HEAD response can advertise byte ranges exactly as the GET would.
+func readsSeekable(store storage.Storage) bool {
+	s, ok := store.(storage.SeekableReads)
+	return ok && s.ReadsSeekable()
+}
+
 type detachUpstreamFetchKey struct{}
 
 // DetachUpstreamFetch marks ctx so that an artifact fetch started under it
@@ -1067,9 +1136,9 @@ func serveArtifactResponse(w http.ResponseWriter, method string, request *http.R
 	if result.Reader != nil {
 		seeker, _ = result.Reader.(io.Seeker)
 	}
-	if seeker != nil && result.Artifact.Size >= 0 {
+	if (seeker != nil || result.rangeable) && result.Artifact.Size >= 0 {
 		w.Header().Set("Accept-Ranges", "bytes")
-		if request != nil && serveArtifactRange(w, request, result, seeker) {
+		if seeker != nil && request != nil && serveArtifactRange(w, request, result, seeker) {
 			return
 		}
 	}
@@ -1668,7 +1737,7 @@ func (p *Proxy) readCachedMetadata(ctx context.Context, entry *database.Metadata
 		return nil, "", err
 	}
 	defer func() { _ = cached.Close() }()
-	data, err := p.ReadMetadata(cached)
+	data, err := p.ReadMetadataSized(cached, metadataEntrySize(entry))
 	if err == nil && validate != nil {
 		err = validate(data)
 	}
@@ -1681,6 +1750,15 @@ func (p *Proxy) readCachedMetadata(ctx context.Context, entry *database.Metadata
 		ct = entry.ContentType.String
 	}
 	return data, ct, nil
+}
+
+// metadataEntrySize is the recorded size of a cached metadata document, or
+// -1 when none is recorded.
+func metadataEntrySize(entry *database.MetadataCacheEntry) int64 {
+	if !entry.Size.Valid {
+		return -1
+	}
+	return entry.Size.Int64
 }
 
 // recordMetadataRead marks a cached metadata document as used, so size
@@ -1744,7 +1822,7 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 			return nil, errStale304
 		}
 		defer func() { _ = cached.Close() }()
-		data, readErr := p.ReadMetadata(cached)
+		data, readErr := p.ReadMetadataSized(cached, metadataEntrySize(entry))
 		if readErr != nil {
 			return nil, errStale304
 		}
@@ -1769,7 +1847,9 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
 
-	body, err := p.ReadMetadata(resp.Body)
+	// ContentLength is -1 when the transport decompresses the body, and
+	// otherwise the length of the bytes read here.
+	body, err := p.ReadMetadataSized(resp.Body, resp.ContentLength)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
@@ -1963,7 +2043,12 @@ func (p *Proxy) writeMetadataCachedResponse(w http.ResponseWriter, r *http.Reque
 // missing or stale when the metadata cache write failed and would otherwise
 // mislabel the bytes.
 func (p *Proxy) writeMetadataCachedResponseWithEncoding(w http.ResponseWriter, r *http.Request, ecosystem, cacheKey string, body []byte, contentType, contentEncoding string) {
-	cm := p.lookupCachedMeta(ecosystem, cacheKey)
+	writeMetadataBody(w, r, p.lookupCachedMeta(ecosystem, cacheKey), body, contentType, contentEncoding)
+}
+
+// writeMetadataBody writes a metadata document with the validators and
+// staleness in cm.
+func writeMetadataBody(w http.ResponseWriter, r *http.Request, cm cachedMeta, body []byte, contentType, contentEncoding string) {
 	if writeMetadataValidators(w, r, cm) {
 		return
 	}

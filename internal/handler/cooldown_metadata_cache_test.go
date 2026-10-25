@@ -18,10 +18,10 @@ import (
 	"github.com/git-pkgs/cooldown"
 )
 
-// countingUpstream serves fixed documents by path with ETags, answers a
+// cooldownCountingUpstream serves fixed documents by path with ETags, answers a
 // matching If-None-Match with 304, and counts what it was asked. Setting
 // down makes it answer 500, and closing gate holds requests until opened.
-type countingUpstream struct {
+type cooldownCountingUpstream struct {
 	*httptest.Server
 	mu          sync.Mutex
 	docs        map[string][]byte
@@ -32,9 +32,9 @@ type countingUpstream struct {
 	gate        chan struct{}
 }
 
-func newCountingUpstream(t *testing.T) *countingUpstream {
+func newCooldownCountingUpstream(t *testing.T) *cooldownCountingUpstream {
 	t.Helper()
-	u := &countingUpstream{
+	u := &cooldownCountingUpstream{
 		docs: map[string][]byte{}, gzipped: map[string]bool{},
 		requests: map[string]int{}, notModified: map[string]int{}, down: map[string]bool{},
 	}
@@ -80,26 +80,26 @@ func newCountingUpstream(t *testing.T) *countingUpstream {
 	return u
 }
 
-func (u *countingUpstream) set(path string, doc []byte) {
+func (u *cooldownCountingUpstream) set(path string, doc []byte) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.docs[path] = doc
 }
 
-func (u *countingUpstream) setDown(path string, down bool) {
+func (u *cooldownCountingUpstream) setDown(path string, down bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.down[path] = down
 }
 
-func (u *countingUpstream) counts(path string) (requests, notModified int) {
+func (u *cooldownCountingUpstream) counts(path string) (requests, notModified int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.requests[path], u.notModified[path]
 }
 
 // cooldownCacheProxy returns a proxy with cooldown and the metadata cache on.
-func cooldownCacheProxy(t *testing.T, u *countingUpstream) *Proxy {
+func cooldownCacheProxy(t *testing.T, u *cooldownCountingUpstream) *Proxy {
 	t.Helper()
 	proxy, _, _, _ := setupTestProxy(t)
 	proxy.HTTPClient = u.Client()
@@ -156,9 +156,9 @@ func gemVersionsJSON(t *testing.T, versions map[string]time.Duration) []byte {
 
 // gemCacheSetup serves testgem with 1.0.0 published a week ago and 2.0.0 an
 // hour ago.
-func gemCacheSetup(t *testing.T) (*countingUpstream, *Proxy, http.Handler) {
+func gemCacheSetup(t *testing.T) (*cooldownCountingUpstream, *Proxy, http.Handler) {
 	t.Helper()
-	u := newCountingUpstream(t)
+	u := newCooldownCountingUpstream(t)
 	u.set(gemInfoPath, []byte("---\n1.0.0 |checksum:a\n2.0.0 |checksum:b\n"))
 	u.set(gemVersionsPath, gemVersionsJSON(t, map[string]time.Duration{"1.0.0": 7 * 24 * time.Hour, "2.0.0": time.Hour}))
 	proxy := cooldownCacheProxy(t, u)
@@ -329,9 +329,9 @@ func hexAPIJSON(t *testing.T, releases map[string]time.Duration) []byte {
 	return b
 }
 
-func hexCacheSetup(t *testing.T, recent time.Duration) (*countingUpstream, *Proxy, http.Handler, []byte) {
+func hexCacheSetup(t *testing.T, recent time.Duration) (*cooldownCountingUpstream, *Proxy, http.Handler, []byte) {
 	t.Helper()
-	u := newCountingUpstream(t)
+	u := newCooldownCountingUpstream(t)
 	signed := buildHexSigned(buildHexPackage("testpkg", []string{testVersion100, "2.0.0"}))
 	u.set(hexPackagePath, signed)
 	u.set(hexAPIPath, hexAPIJSON(t, map[string]time.Duration{testVersion100: 7 * 24 * time.Hour, "2.0.0": recent}))
@@ -440,9 +440,9 @@ func TestHexCooldownUnfilteredKeepsSignature(t *testing.T) {
 
 const condaRepodataPath = "/conda-forge/noarch/repodata.json"
 
-func condaCacheSetup(t *testing.T) (*countingUpstream, *Proxy, *CondaHandler, http.Handler) {
+func condaCacheSetup(t *testing.T) (*cooldownCountingUpstream, *Proxy, *CondaHandler, http.Handler) {
 	t.Helper()
-	u := newCountingUpstream(t)
+	u := newCooldownCountingUpstream(t)
 	repodata, err := json.Marshal(map[string]any{
 		"info": map[string]any{"subdir": "noarch"},
 		"packages": map[string]any{

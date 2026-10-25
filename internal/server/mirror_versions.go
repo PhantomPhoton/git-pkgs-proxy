@@ -2,6 +2,7 @@ package server
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -61,7 +62,7 @@ func mirrorVersionsURL(u config.UpstreamConfig, purlType, name string) (string, 
 		return upstreamOr(u.NuGet, d.NuGet) + "/v3", nil
 	case "composer":
 		if _, ok := handler.RoutedPackageURL(u.ComposerRoutes, name); ok {
-			return "", fmt.Errorf("listing versions of packages in upstream.composer_routes isn't supported; give a version")
+			return "", errors.New("mirroring packages in upstream.composer_routes isn't supported")
 		}
 		return upstreamOr(u.Composer, d.Composer), nil
 	case "cran":
@@ -71,7 +72,12 @@ func mirrorVersionsURL(u config.UpstreamConfig, purlType, name string) (string, 
 	case "cargo":
 		return publicOnly("upstream.cargo", u.Cargo, d.Cargo)
 	case "conda":
-		return publicOnly("upstream.conda", u.Conda, d.Conda)
+		// Files are listed from anaconda.org even for a given version, so a
+		// version doesn't help here.
+		if upstreamOr(u.Conda, d.Conda) != strings.TrimSuffix(d.Conda, "/") {
+			return "", errors.New("mirroring conda packages from a custom upstream.conda isn't supported")
+		}
+		return "", nil
 	case "julia":
 		return publicOnly("upstream.julia", u.Julia, d.Julia)
 	default:

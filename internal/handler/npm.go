@@ -214,7 +214,7 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	h.proxy.Logger.Info("npm metadata request", "package", packageName, "path", packagePath)
+	h.proxy.Logger.Debug("npm metadata request", "package", packageName, "path", packagePath)
 
 	registryURL, cacheKey := h.sourceFor(packageName)
 	// A version or dist-tag is its own path segment. Escaping the whole path
@@ -897,7 +897,7 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("npm download request",
+	h.proxy.Logger.Debug("npm download request",
 		"package", packageName, "version", version, "filename", filename)
 
 	if h.proxy.versionDenied("npm", packageName, version) {

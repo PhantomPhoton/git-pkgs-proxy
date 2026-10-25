@@ -39,6 +39,7 @@ type mockStorage struct {
 	signErr   error
 	seekable  bool
 	stores    int
+	opens     int
 }
 
 func newMockStorage() *mockStorage {
@@ -63,6 +64,7 @@ func (s *mockStorage) Store(_ context.Context, path string, r io.Reader) (int64,
 func (s *mockStorage) Open(_ context.Context, path string) (io.ReadCloser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.opens++
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
@@ -75,6 +77,9 @@ func (s *mockStorage) Open(_ context.Context, path string) (io.ReadCloser, error
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
+
+// ReadsSeekable reports what Open returns, as storage.Blob does.
+func (s *mockStorage) ReadsSeekable() bool { return s.seekable }
 
 type mockSeekableReadCloser struct {
 	*bytes.Reader
@@ -440,6 +445,69 @@ func TestCorruptCachedArtifactIsQueuedForDeletion(t *testing.T) {
 		t.Errorf("record = %+v (err %v), want it cleared", artifact, err)
 	}
 	assertQueuedForDeletion(t, db, storagePath)
+}
+
+// TestCachedArtifactVerifiedByContentHash checks that a cache hit is verified
+// against the recorded content hash only. The version's native integrity is
+// one value per version and was checked when the bytes were stored; a stale
+// or foreign value there must not discard an artifact whose bytes still
+// match their SHA-256.
+func TestCachedArtifactVerifiedByContentHash(t *testing.T) {
+	proxy, db, store, _ := setupTestProxy(t)
+	seedPackage(t, db, store, "npm", "hashed", "1.0.0", "hashed-1.0.0.tgz", "cached content")
+	setVersionIntegrity(t, db, "npm", "hashed", "1.0.0", sha512SRI("other bytes"))
+
+	result, err := proxy.GetCachedArtifact(context.Background(), "npm", "hashed", "1.0.0", "hashed-1.0.0.tgz")
+	if err != nil || result == nil {
+		t.Fatalf("GetCachedArtifact = %v, %v", result, err)
+	}
+	body, err := io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if err != nil || string(body) != "cached content" {
+		t.Fatalf("read %q, %v; want the cached bytes", body, err)
+	}
+	artifact, err := db.GetArtifact("pkg:npm/hashed@1.0.0", "hashed-1.0.0.tgz")
+	if err != nil || artifact == nil || !artifact.StoragePath.Valid {
+		t.Errorf("record = %+v (err %v), want it kept", artifact, err)
+	}
+}
+
+// TestCachedArtifactWithoutContentHashChecksNativeIntegrity checks that a
+// record without a content hash is still verified against the native
+// integrity, which is then the only digest there is.
+func TestCachedArtifactWithoutContentHashChecksNativeIntegrity(t *testing.T) {
+	proxy, db, store, _ := setupTestProxy(t)
+	seedPackage(t, db, store, "npm", "nohash", "1.0.0", "nohash-1.0.0.tgz", "cached content")
+	setVersionIntegrity(t, db, "npm", "nohash", "1.0.0", sha512SRI("other bytes"))
+	artifact, err := db.GetArtifact("pkg:npm/nohash@1.0.0", "nohash-1.0.0.tgz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact.ContentHash = sql.NullString{}
+	if err := db.UpsertArtifact(artifact); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := proxy.GetCachedArtifact(context.Background(), "npm", "nohash", "1.0.0", "nohash-1.0.0.tgz")
+	if err != nil || result == nil {
+		t.Fatalf("GetCachedArtifact = %v, %v", result, err)
+	}
+	_, err = io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if !errors.Is(err, ErrArtifactDigestMismatch) {
+		t.Fatalf("read error = %v, want ErrArtifactDigestMismatch", err)
+	}
+}
+
+func setVersionIntegrity(t *testing.T, db *database.DB, ecosystem, name, version, integrity string) {
+	t.Helper()
+	if err := db.UpsertVersion(&database.Version{
+		PURL:        purl.MakePURLString(ecosystem, name, version),
+		PackagePURL: purl.MakePURLString(ecosystem, name, ""),
+		Integrity:   sql.NullString{String: integrity, Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // assertQueuedForDeletion fails unless path waits in the pending delete queue.

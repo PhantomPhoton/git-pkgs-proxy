@@ -229,6 +229,24 @@ func TestNPMMetadataIgnoresPushesWhenHostedDisabled(t *testing.T) {
 	}
 }
 
+// With hosted packages disabled, a pushed archive is not served ahead of the
+// upstream, but it is still never replaced by the upstream copy: the
+// download is answered from its stored record like any cached archive.
+func TestNPMDownloadWithHostedDisabledKeepsPush(t *testing.T) {
+	f := newNPMHostedFixture(t, map[string]string{"/request": requestPackument})
+	manifest := `{"name":"request","version":"2.88.3"}`
+	f.push(t, "request", "2.88.3", manifest)
+	f.proxy.HostedEnabled = false
+
+	rec := f.get(t, "/request/-/request-2.88.3.tgz")
+	if rec.Code != http.StatusOK || rec.Body.String() != string(npmTarball(manifest)) {
+		t.Errorf("download status = %d, want 200 and the pushed tarball", rec.Code)
+	}
+	if f.fetcher.fetchCalled {
+		t.Error("the upstream tarball was fetched for a pushed version")
+	}
+}
+
 func TestNPMDownloadOfPushedPackageWithCooldown(t *testing.T) {
 	f := newNPMHostedFixture(t, nil)
 	f.proxy.Cooldown = &cooldown.Config{Default: "7d"}

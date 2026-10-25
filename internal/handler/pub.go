@@ -91,7 +91,7 @@ func (h *PubHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	filename := name + "-" + version + pubArchiveExt
 
-	h.proxy.Logger.Info("pub download request",
+	h.proxy.Logger.Debug("pub download request",
 		"name", name, "version", version)
 
 	downloadURL := fmt.Sprintf("%s/packages/%s/versions/%s%s",
@@ -142,7 +142,7 @@ func (h *PubHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	h.proxy.Logger.Info("pub metadata request", "package", name)
+	h.proxy.Logger.Debug("pub metadata request", "package", name)
 
 	upstreamURL := fmt.Sprintf("%s/api/packages/%s", h.upstreamURL, name)
 

@@ -77,6 +77,13 @@ type Storage interface {
 	Close() error
 }
 
+// SeekableReads is implemented by backends whose Open always returns a
+// reader that implements io.Seeker. It tells a caller that byte ranges can be
+// served from an object without opening it first.
+type SeekableReads interface {
+	ReadsSeekable() bool
+}
+
 // FetchPath builds the storage path for one fetch of an artifact:
 // {ecosystem}/{name}/{version}/{fetchID}/{filename}. Each fetch writes its own
 // object, so no fetch overwrites or deletes another's.

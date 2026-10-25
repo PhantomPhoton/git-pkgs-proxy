@@ -15,6 +15,7 @@ import (
 
 	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/purl"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -114,6 +115,10 @@ type ContainerHandler struct {
 	// refusalsFull is set once the refusals set reached its limit and that
 	// was logged.
 	refusalsFull bool
+
+	// manifestFlight shares one upstream exchange among concurrent
+	// requests for the same manifest.
+	manifestFlight singleflight.Group
 }
 
 type containerRegistry struct {
@@ -393,7 +398,7 @@ func (h *ContainerHandler) handleBlobDownload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	h.proxy.Logger.Info("container blob request", "name", upstreamName, "digest", digest)
+	h.proxy.Logger.Debug("container blob request", "name", upstreamName, "digest", digest)
 
 	filename := digest
 	cached, err := h.proxy.GetCachedArtifact(r.Context(), "oci", cacheName, digest, filename)
@@ -481,7 +486,7 @@ func (h *ContainerHandler) handleManifest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	h.proxy.Logger.Info("container manifest request", "name", upstreamName, "reference", reference)
+	h.proxy.Logger.Debug("container manifest request", "name", upstreamName, "reference", reference)
 	if h.manifestDenied(w, cacheName, reference) {
 		return
 	}

@@ -51,7 +51,9 @@ Metadata is not cached - always fetched fresh. This ensures clients see new vers
    - Open file from storage
    - Record hit (increment counter, update last_accessed_at)
    - Return reader to handler
-   - Handler streams file to client
+   - Handler streams file to client, checking it against the recorded
+     SHA-256 `content_hash` (the registry's own integrity was checked when the
+     file was stored); a mismatch aborts the response and clears the record
 
    **Cache Miss:**
    - Resolve download URL using Resolver
@@ -200,7 +202,7 @@ metadata_dates (
 )
 ```
 
-`metadata_dates` holds the `Last-Modified` served with rewritten npm and Composer metadata. A package's date is the second it started serving its current representation, and a new representation is only dated in a later second. Keeping it in the database means replicas sharing one serve the same date, and never give one representation's date to another, so `If-Modified-Since` cannot return 304 for a body the client does not have.
+`metadata_dates` holds the `Last-Modified` served with rewritten metadata, such as npm packuments, Composer documents, PyPI simple pages and Helm indexes. A package's date is the second it started serving its current representation, and a new representation is only dated in a later second. Keeping it in the database means replicas sharing one serve the same date, and never give one representation's date to another, so `If-Modified-Since` cannot return 304 for a body the client does not have.
 
 On PostgreSQL, `INTEGER PRIMARY KEY` becomes `SERIAL`, `DATETIME` becomes `TIMESTAMP`, `INTEGER DEFAULT 0` booleans become `BOOLEAN DEFAULT FALSE`, and size/count columns use `BIGINT`.
 
@@ -327,6 +329,10 @@ HTTP server setup, web UI, and API handlers.
 - Templates are embedded in the binary via `//go:embed`
 - Enrichment API for package metadata, vulnerability scanning, and outdated detection
 - Health, stats, and Prometheus metrics endpoints. `/health` runs an active write → size-check → read → verify → delete probe against the storage backend and returns a structured JSON response (`HealthResponse`) with `"ok"` / `"error"` status per subsystem. Probe results are cached (default 30 s, configurable via `health.storage_probe_interval`) to avoid overwhelming remote backends. The response also carries a `circuit_breakers` map reporting each upstream's artifact-fetch breaker as `"open"` or `"closed"`, keyed by the host fetched from (or an opaque placeholder where the fetch URL has no host to read); the same state is published as the `proxy_circuit_breaker_state` gauge on each `/metrics` scrape. An open breaker leaves the overall status `"ok"` — it describes an upstream, not this proxy.
+
+### `internal/memlimit`
+
+Sets Go's soft memory limit to 80% of the cgroup memory limit at startup on Linux, unless `GOMEMLIMIT` is set. See "Memory limit" in the configuration docs.
 
 ### `internal/metrics`
 

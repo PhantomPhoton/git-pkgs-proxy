@@ -98,7 +98,7 @@ func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 		case strings.HasSuffix(rest, ".info"):
 			// GET /{module}/@v/{version}.info - version metadata
-			h.proxyCached(w, r, decodedMod+"/@v/"+rest)
+			h.proxyVersionFile(w, r, decodedMod+"/@v/"+rest, strings.TrimSuffix(rest, ".info"))
 
 		case strings.HasSuffix(rest, ".mod"):
 			// GET /{module}/@v/{version}.mod - go.mod file
@@ -110,7 +110,7 @@ func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 			if h.checkCooldown(w, r, module, decodedMod, version) {
 				return
 			}
-			h.proxyCached(w, r, decodedMod+"/@v/"+rest)
+			h.proxyVersionFile(w, r, decodedMod+"/@v/"+rest, strings.TrimSuffix(rest, ".mod"))
 
 		case strings.HasSuffix(rest, ".zip"):
 			// GET /{module}/@v/{version}.zip - source archive (cache this)
@@ -143,7 +143,7 @@ func (h *GoHandler) handleDownload(w http.ResponseWriter, r *http.Request, modul
 	decodedModule := decodeGoModule(module)
 	filename := goZipFilename(decodedModule, version)
 
-	h.proxy.Logger.Info("go module download request",
+	h.proxy.Logger.Debug("go module download request",
 		"module", decodedModule, "version", version)
 
 	// The URL escapes uppercase letters in the version (v1.0.0-!r!c1 for
@@ -240,6 +240,29 @@ func (h *GoHandler) discardOtherModulesZip(module, escapedModule, version, filen
 // proxyCached forwards a request with metadata caching.
 func (h *GoHandler) proxyCached(w http.ResponseWriter, r *http.Request, cacheKey string) {
 	h.proxy.ProxyCached(w, r, h.upstreamURL+r.URL.Path, "golang", cacheKey, "*/*")
+}
+
+// proxyVersionFile serves a version's .info or .mod. For a canonical version
+// it never changes, so it is served from the cache without revalidation.
+func (h *GoHandler) proxyVersionFile(w http.ResponseWriter, r *http.Request, cacheKey, escapedVersion string) {
+	if goVersionImmutable(escapedVersion) {
+		h.proxy.proxyImmutable(w, r, h.upstreamURL+r.URL.Path, "golang", cacheKey, "*/*")
+		return
+	}
+	h.proxyCached(w, r, cacheKey)
+}
+
+// goVersionImmutable reports whether escapedVersion, as it appears in a
+// proxy URL, names a canonical version, whose .info and .mod the module
+// proxy protocol and the checksum database fix for good. This includes
+// pseudo-versions, which name a commit by its hash, and +incompatible
+// versions. Anything else, such as a branch name or v1.2 for v1.2.0, is a
+// query that can resolve to another version later and stays on the TTL.
+// The .zip of a canonical version is cached for good already, and a .mod
+// that changed upstream would no longer match it.
+func goVersionImmutable(escapedVersion string) bool {
+	version, err := gomodule.UnescapeVersion(escapedVersion)
+	return err == nil && version != "" && gomodule.CanonicalVersion(version) == version
 }
 
 // decodeGoModule decodes an encoded module path.

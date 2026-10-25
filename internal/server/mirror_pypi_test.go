@@ -16,13 +16,14 @@ import (
 )
 
 const (
-	mirrorWheelPath = "/packages/ab/cd/example_pkg-1.0-py3-none-any.whl"
-	mirrorSdistPath = "/packages/ef/01/example.pkg-1.0.tar.gz"
+	mirrorWheelPath      = "/packages/ab/cd/example_pkg-1.0-py3-none-any.whl"
+	mirrorLinuxWheelPath = "/packages/23/45/example_pkg-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"
+	mirrorSdistPath      = "/packages/ef/01/example.pkg-1.0.tar.gz"
 )
 
-// pypiUpstream serves the JSON API for example-pkg 1.0 with a wheel and an
-// sdist, whose filenames spell the name differently, and counts file
-// downloads by path.
+// pypiUpstream serves the JSON API for example-pkg 1.0 with two wheels, which
+// are cached under the same name and version, and an sdist, whose filename
+// spells the name differently. It counts file downloads by path.
 type pypiUpstream struct {
 	*httptest.Server
 	mu    sync.Mutex
@@ -33,13 +34,13 @@ type pypiUpstream struct {
 func newPyPIUpstream(t *testing.T, digests map[string]string) *pypiUpstream {
 	t.Helper()
 	u := &pypiUpstream{
-		files: map[string]string{mirrorWheelPath: "wheel", mirrorSdistPath: "sdist"},
+		files: map[string]string{mirrorWheelPath: "wheel", mirrorLinuxWheelPath: "linux wheel", mirrorSdistPath: "sdist"},
 		hits:  map[string]int{},
 	}
 	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/pypi/example-pkg/json" {
 			var files []map[string]any
-			for _, path := range []string{mirrorWheelPath, mirrorSdistPath} {
+			for _, path := range []string{mirrorWheelPath, mirrorLinuxWheelPath, mirrorSdistPath} {
 				sum := sha256.Sum256([]byte(u.files[path]))
 				digest := hex.EncodeToString(sum[:])
 				if d, ok := digests[path]; ok {
@@ -93,16 +94,16 @@ func TestMirrorPyPIFetchesEveryFile(t *testing.T) {
 	if progress.Completed != 1 || progress.Failed != 0 {
 		t.Fatalf("completed = %d, failed = %d, errors = %v", progress.Completed, progress.Failed, progress.Errors)
 	}
-	for _, path := range []string{mirrorWheelPath, mirrorSdistPath} {
+	for path := range upstream.files {
 		if got := upstream.hitsFor(path); got != 1 {
 			t.Errorf("%s fetched %d times, want 1", path, got)
 		}
 	}
 
-	// pip gets both files from the cache once the upstream is down.
+	// pip gets every file from the cache once the upstream is down.
 	upstream.Close()
 	pypi := handler.NewPyPIHandlerWithUpstreams(proxy, "http://proxy.test", cfg.Upstream.PyPI, cfg.Upstream.PyPIDownload)
-	for path, want := range map[string]string{mirrorWheelPath: "wheel", mirrorSdistPath: "sdist"} {
+	for path, want := range upstream.files {
 		rec := httptest.NewRecorder()
 		pypi.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusOK || rec.Body.String() != want {

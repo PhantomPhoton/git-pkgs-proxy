@@ -84,6 +84,14 @@ func TestBlobOpen(t *testing.T) {
 	}
 }
 
+// Blob.ReadsSeekable promises seekable readers for every bucket: file://
+// objects open as *os.File (checked in TestBlobOpen) and remote ones as
+// *blob.Reader.
+var (
+	_ io.Seeker     = (*blob.Reader)(nil)
+	_ SeekableReads = (*Blob)(nil)
+)
+
 func TestBlobOpenNotFound(t *testing.T) {
 	b := createTestBlob(t)
 	ctx := context.Background()

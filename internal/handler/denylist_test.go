@@ -147,7 +147,7 @@ func TestPyPIDenylistJSONMetadata(t *testing.T) {
 	setTestDenylist(t, p, "pkg:pypi/demo@1.0.0")
 	h := NewPyPIHandlerWithUpstreams(p, "https://proxy.example", "", "")
 	body := `{"info":{"name":"Demo","version":"1.0.0"},"releases":{"1.0.0":[{"url":"https://files.pythonhosted.org/packages/demo-1.0.0.tar.gz"}],"2.0.0":[]},"urls":[{"url":"https://files.pythonhosted.org/packages/demo-1.0.0.tar.gz"}]}`
-	out, err := h.rewriteJSONMetadata([]byte(body))
+	out, _, err := h.rewriteJSONMetadata([]byte(body))
 	if err != nil {
 		t.Fatal(err)
 	}
