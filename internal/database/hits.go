@@ -211,5 +211,5 @@ func (db *DB) Close() error {
 		b.stopOnce.Do(func() { close(b.stop) })
 		<-b.done
 	}
-	return db.DB.Close()
+	return db.closePools()
 }
