@@ -2,12 +2,19 @@ package handler
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/git-pkgs/proxy/internal/jsonstream"
@@ -55,6 +62,11 @@ type CondaHandler struct {
 	proxy       *Proxy
 	upstreamURL string
 	proxyURL    string
+
+	// repodataStates holds, per metadata cache key, what is known of the
+	// last filtered copy of a repodata document. Guarded by repodataMu.
+	repodataMu     sync.Mutex
+	repodataStates map[string]repodataState
 }
 
 // NewCondaHandler creates a new Conda protocol handler.
@@ -179,6 +191,14 @@ func (h *CondaHandler) parseFilename(filename string) (name, version string) {
 }
 
 // handleRepodata proxies repodata.json, applying cooldown filtering when enabled.
+//
+// With cache_metadata the document is read through the metadata cache, as
+// without cooldown, so within metadata_ttl it is filtered from storage
+// without asking upstream, and after it revalidated with its ETag. A stored
+// copy is streamed through the filter rather than read into memory; a
+// document just fetched is held compressed, as the metadata cache holds every
+// document it fetches. The decompressed document, hundreds of MB for
+// conda-forge, is never held whole.
 func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
 	if h.proxy.Cooldown == nil || !h.proxy.Cooldown.Enabled() {
 		h.proxyCached(w, r)
@@ -186,7 +206,49 @@ func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upstreamURL := h.upstreamURL + r.URL.Path
+	p := h.proxy
+	if !p.CacheMetadata || p.DB == nil || p.Storage == nil {
+		h.streamRepodata(w, r, upstreamURL)
+		return
+	}
 
+	cacheKey := h.metadataCacheKey(r.URL.Path)
+	now := time.Now()
+	if entry := p.freshMetadataEntry("conda", cacheKey); entry != nil {
+		if body, err := p.openMetadataEntry(r.Context(), "conda", cacheKey, entry); err == nil {
+			defer func() { _ = body.Close() }()
+			p.recordStreamedMetadataHit("conda", entry)
+			digest := entry.ContentDigest.String
+			if !h.repodataNotModified(w, r, cacheKey, digest, now) {
+				h.writeFilteredRepodata(w, upstreamURL, cacheKey, digest, body, entry.ContentEncoding.String, now)
+			}
+			return
+		}
+	}
+
+	// The same key and encoding as proxyCached, so with and without cooldown
+	// the proxy keeps one copy of the document.
+	res := p.lookupMetadata(r.Context(), "conda", cacheKey, upstreamURL, "*/*", "gzip", nil)
+	if errors.Is(res.err, ErrMetadataTooLarge) {
+		// Too large to cache even compressed: stream it as without the cache.
+		p.Logger.Warn("conda repodata exceeds the metadata size limit, streaming it uncached", "url", upstreamURL)
+		h.streamRepodata(w, r, upstreamURL)
+		return
+	}
+	if res.err != nil {
+		p.writeMetadataFetchError(w, res.err)
+		return
+	}
+	markStale(w, res.stale)
+	if h.repodataNotModified(w, r, cacheKey, res.digest, now) {
+		return
+	}
+	h.writeFilteredRepodata(w, upstreamURL, cacheKey, res.digest, bytes.NewReader(res.body), res.contentEncoding, now)
+}
+
+// streamRepodata filters repodata.json as it streams from upstream, without
+// the metadata cache.
+func (h *CondaHandler) streamRepodata(w http.ResponseWriter, r *http.Request, upstreamURL string) {
 	h.proxy.Logger.Debug("fetching repodata for cooldown filtering", "url", upstreamURL)
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
@@ -212,11 +274,21 @@ func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Explicitly requesting gzip disables the transport's automatic decoding.
+	// Explicitly requesting gzip disables the transport's automatic decoding,
+	// so writeFilteredRepodata decodes it.
+	h.writeFilteredRepodata(w, upstreamURL, "", "", resp.Body, resp.Header.Get(headerContentEncoding), time.Now())
+}
+
+// writeFilteredRepodata writes repodata.json from src, decoded by
+// contentEncoding, without the entries in cooldown at now. digest identifies
+// the document in the metadata cache under cacheKey, and is empty when it
+// isn't cached; when known, the ETag of the filtered copy is remembered for
+// the next request.
+func (h *CondaHandler) writeFilteredRepodata(w http.ResponseWriter, upstreamURL, cacheKey, digest string, src io.Reader, contentEncoding string, now time.Time) {
 	// Cooldown needs JSON, so decode here and bound the decompressed size too.
-	var reader io.Reader = resp.Body
-	if strings.EqualFold(strings.TrimSpace(resp.Header.Get(headerContentEncoding)), "gzip") {
-		decoded, err := gzip.NewReader(resp.Body)
+	reader := src
+	if strings.EqualFold(strings.TrimSpace(contentEncoding), "gzip") {
+		decoded, err := gzip.NewReader(src)
 		if err != nil {
 			http.Error(w, "failed to decode response", http.StatusBadGateway)
 			return
@@ -231,7 +303,8 @@ func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
 	out := &countingWriter{w: w}
 	buffered := bufio.NewWriterSize(out, repodataWriteBuffer)
 	w.Header().Set(headerContentType, "application/json")
-	err = h.filterRepodata(io.LimitReader(reader, maxRepodataSize), buffered)
+	filter := h.newRepodataFilter(now)
+	err := h.filterRepodataWith(io.LimitReader(reader, maxRepodataSize), buffered, filter)
 	if err == nil {
 		err = buffered.Flush()
 	}
@@ -243,6 +316,61 @@ func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
 		}
 		panic(http.ErrAbortHandler)
 	}
+	if digest != "" {
+		h.rememberRepodata(cacheKey, digest, filter)
+	}
+}
+
+// repodataState is what the proxy remembers of the last filtered copy of a
+// cached repodata document: which document it was made from, its ETag, and
+// until when filtering that document again gives the same copy.
+type repodataState struct {
+	digest string
+	etag   string
+	// until is when the first entry left out leaves cooldown, or zero when
+	// none was left out.
+	until time.Time
+}
+
+// repodataNotModified sets the ETag of the filtered copy of the document
+// identified by digest when the proxy knows it, and answers a conditional
+// request it matches with 304, reporting whether it did. The ETag is known
+// once the document has been filtered, until an entry it left out leaves
+// cooldown. Filtering a large document costs seconds, and sending it
+// hundreds of MB, so this is what makes revalidating clients cheap.
+func (h *CondaHandler) repodataNotModified(w http.ResponseWriter, r *http.Request, cacheKey, digest string, now time.Time) bool {
+	if digest == "" {
+		return false
+	}
+	h.repodataMu.Lock()
+	state, ok := h.repodataStates[cacheKey]
+	h.repodataMu.Unlock()
+	if !ok || state.digest != digest || (!state.until.IsZero() && !now.Before(state.until)) {
+		return false
+	}
+	w.Header().Set(headerETag, state.etag)
+	if ifNoneMatchHits(r.Header.Get("If-None-Match"), state.etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	return false
+}
+
+// rememberRepodata records the ETag of a filtered copy of the document
+// identified by digest. The copy depends only on the document, the startup
+// configuration and which entries were left out, and those stay left out
+// until the first of them leaves cooldown.
+func (h *CondaHandler) rememberRepodata(cacheKey, digest string, filter *repodataFilter) {
+	if filter.unknownUntil {
+		return
+	}
+	etag := keptVersionsETag(digest, "", cacheKey, []string{hex.EncodeToString(filter.withheld.Sum(nil))})
+	h.repodataMu.Lock()
+	defer h.repodataMu.Unlock()
+	if h.repodataStates == nil {
+		h.repodataStates = make(map[string]repodataState)
+	}
+	h.repodataStates[cacheKey] = repodataState{digest: digest, etag: etag, until: filter.until}
 }
 
 // countingWriter records whether anything has reached the response yet.
@@ -271,6 +399,11 @@ const (
 // packages and packages.conda that are still inside their cooldown. Kept
 // entries and every other member are written with their upstream bytes.
 func (h *CondaHandler) filterRepodata(r io.Reader, w io.Writer) error {
+	return h.filterRepodataWith(r, w, h.newRepodataFilter(time.Now()))
+}
+
+// filterRepodataWith is filterRepodata deciding by filter.
+func (h *CondaHandler) filterRepodataWith(r io.Reader, w io.Writer, filter *repodataFilter) error {
 	return jsonstream.CopyObject(json.NewDecoder(r), w, func(m *jsonstream.Member) error {
 		if m.Key != "packages" && m.Key != "packages.conda" {
 			return m.Copy()
@@ -280,7 +413,7 @@ func (h *CondaHandler) filterRepodata(r io.Reader, w io.Writer) error {
 			if err != nil {
 				return err
 			}
-			if h.inCooldown(entry.Key, raw) {
+			if filter.inCooldown(entry.Key, raw) {
 				return nil
 			}
 			return entry.Write(raw)
@@ -294,14 +427,50 @@ type repodataEntry struct {
 	Timestamp float64 `json:"timestamp"`
 }
 
+// repodataFilter decides which repodata entries cooldown leaves out, all as
+// of one time, and records what it left out, which with the document fixes
+// the filtered copy.
+type repodataFilter struct {
+	h   *CondaHandler
+	now time.Time
+	// withheld hashes the filenames left out.
+	withheld hash.Hash
+	// until is when the first entry left out leaves cooldown.
+	until time.Time
+	// unknownUntil is set when an entry was left out without a time it
+	// leaves cooldown, so until can't be relied on.
+	unknownUntil bool
+}
+
+func (h *CondaHandler) newRepodataFilter(now time.Time) *repodataFilter {
+	return &repodataFilter{h: h, now: now, withheld: sha256.New()}
+}
+
 // inCooldown reports whether a repodata entry was published too recently.
 // Entries without a name or timestamp are kept.
-func (h *CondaHandler) inCooldown(filename string, raw []byte) bool {
+func (f *repodataFilter) inCooldown(filename string, raw []byte) bool {
 	var entry repodataEntry
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		return false
 	}
-	return h.recordInCooldown(filename, entry.Name, entry.Version, entry.Timestamp)
+	if entry.Name == "" || entry.Timestamp == 0 {
+		return false
+	}
+	publishedAt := time.Unix(int64(entry.Timestamp)/condaTimestampDivisor, 0)
+	decision := f.h.proxy.Cooldown.Evaluate("conda", canonicalPackagePURL("conda", entry.Name), publishedAt, f.now)
+	if decision.Allowed {
+		return false
+	}
+	f.h.proxy.Logger.Info("cooldown: filtering conda package",
+		"name", entry.Name, "version", entry.Version, "filename", filename)
+	_, _ = fmt.Fprintf(f.withheld, "%d:%s", len(filename), filename)
+	switch {
+	case decision.AvailableAt.IsZero():
+		f.unknownUntil = true
+	case f.until.IsZero() || decision.AvailableAt.Before(f.until):
+		f.until = decision.AvailableAt
+	}
+	return true
 }
 
 // recordInCooldown reports whether a package record with a millisecond
