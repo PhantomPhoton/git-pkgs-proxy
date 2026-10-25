@@ -197,6 +197,20 @@ database:
 |--------|-------------|------|-------------|
 | `database.url` | `PROXY_DATABASE_URL` | `-database-url` | PostgreSQL connection URL |
 
+### Several instances
+
+Several instances can serve one cache when they share a PostgreSQL database and storage. The storage can be S3 or a `file://` directory on a volume every instance mounts, such as NFS, CephFS or a Kubernetes `ReadWriteMany` volume. Each fetch writes its own file and renames it into place, and records are updated with compare-and-swap, so concurrent fetches and a crashed instance leave no partial files or records that don't match a file. SQLite only supports a single instance.
+
+Instances coordinate through PostgreSQL advisory locks:
+
+- Instances started together create the schema and run migrations one after the other.
+- Eviction, reclaim, retention and the Gradle build cache sweep run on one instance at a time. An instance that finds a job running elsewhere skips that pass.
+- A [scheduled mirror](#scheduled-refresh) runs on whichever instance reaches it first in each interval.
+
+Cache misses are fetched from upstream once across instances. The instance that fetches holds a lease on the miss in the `fetch_leases` table and renews it while it downloads. Another instance missing the same file waits until it is stored and serves the stored copy; `proxy_fetch_lease_waits_total` counts those waits. If the fetch fails, the instances waiting on it stop waiting together: each serves its stale metadata copy if it has one, and otherwise fetches itself, so a failing upstream costs every instance one attempt at the same time rather than one after another. A lease of an instance that stopped expires after 30 seconds. Metadata is shared this way only with [`cache_metadata`](#metadata-caching) and a `metadata_ttl` above zero, since without a stored copy there is nothing to wait for. A cache hit costs no extra query; a miss costs one.
+
+Each instance needs its own [`git.cache_dir`](#git-repositories).
+
 ### Hit counts
 
 Every cache hit updates the artifact's hit count and last-access time, which the stats pages and LRU eviction use. Rather than writing each hit as its own transaction, the proxy counts hits in memory and writes them together every `hit_flush_interval`. SQLite allows one writer at a time, and the proxy uses a single SQLite connection, so with a write per hit, concurrent downloads queue behind each other.
@@ -393,6 +407,13 @@ upstream:
   generic:
     github: "https://github.com"
     github-api: "https://api.github.com"
+  # Paths each upstream may serve. Required for an upstream that
+  # upstream.auth has credentials for.
+  generic_paths:
+    github-api:
+      - "repos/*/*/releases"
+      - "repos/*/*/releases/**"
+      - "repos/*/*/tags"
   auth:
     # Optional: raise the GitHub API rate limit. Scoped to this host only,
     # so the token is never sent to the object store GitHub redirects to.
@@ -402,6 +423,19 @@ upstream:
 ```
 
 Only configured upstreams are reachable, so this is not an open HTTP proxy.
+`generic_paths` limits an upstream to the paths after `/generic/{name}/` that
+its patterns match; any other path answers 404. The patterns use the syntax of
+`upstream.git` `repos`: `path.Match`, where `*` does not cross a `/`, and a
+pattern ending in `/**` also matches every path nested below its prefix. A
+path containing `%`, `?`, `#` or a backslash is refused for an upstream with
+`generic_paths`. An upstream without `generic_paths` serves every path.
+
+When `upstream.auth` has credentials for a generic upstream, `generic_paths`
+is required and the proxy refuses to start without it: everyone who can reach
+the proxy can send requests with those credentials, so list only the paths
+they need. For GitHub, use a fine-grained personal access token limited to
+public repositories with read-only access; it raises the rate limit like any
+other token but cannot read anything private, even through an allowed path.
 Paths shaped like `{owner}/{repo}/releases/download/{tag}/{asset}` are
 version-pinned GitHub release assets: they are stored in the artifact cache
 and served from it without revalidation, including while the upstream is
@@ -450,6 +484,9 @@ mise section in the README for the client-side `url_replacements`.
 while `upstream.oci` selects named registries through the `upstream/{name}/`
 repository prefix. For example, `oci://proxy.example.com/upstream/ghcr/owner/chart`
 uses the `ghcr` registry with `owner/chart` as its repository.
+
+The OCI handler only serves pulls (`GET` and `HEAD`). Pushes, such as a
+BuildKit `--cache-to type=registry` export, need a separate registry.
 
 containerd mirror requests carry the original registry host in an `ns` query
 parameter (see the containerd section in the README). The proxy only looks the
@@ -713,11 +750,10 @@ without `repos` serves every repository on it, and a repository outside
 `repos` is required: everyone who can reach the proxy can read every
 repository it serves, so list only those they may read. Per-client
 permissions are not supported. `upstream.auth` matches credentials by URL, so
-they are sent by every route to that host, not only `/git`. With a token for
-`https://github.com`, a `generic` upstream at the same URL, such as the one
-the mise setup in the README uses, sends it for any path and checks no
-`repos`, so `/generic/github/acme/private.git/info/refs?service=git-upload-pack`
-would list a private repository's refs to anyone.
+they are sent by every route to that host, not only `/git`. A `generic`
+upstream at the same URL, such as the one the mise setup in the README uses,
+checks `generic_paths` instead of `repos`, and needs them too; keep Git paths
+like `{owner}/{repo}.git/info/refs` out of its patterns.
 
 Every request for a repository's refs checks the upstream's branches and tags,
 and fetches only when they changed, so a clone right after a push sees the new
@@ -841,9 +877,22 @@ This field has no environment variable, as with the other named upstream maps.
 
 Configure authentication for private upstream registries. The same authentication-aware client is used for metadata and artifact downloads, and credentials can reference environment variables using `${VAR_NAME}` syntax.
 
-OCI registries that return a Bearer challenge from a `/v2/{repository}/…` endpoint are handled automatically. The proxy discovers the token realm from `WWW-Authenticate`, applies any configured credentials for the token URL, and reuses the scoped token until shortly before it expires.
+OCI registries that return a Bearer challenge from a `/v2/{repository}/…` endpoint are handled automatically. The proxy discovers the token realm from `WWW-Authenticate`, applies any configured credentials for the token URL, and reuses the token until shortly before it expires. The token is always requested for pull access to the repository being fetched (`repository:{repository}:pull`), whatever scope the challenge names.
 
-A token fetched with credentials configured for the token URL is only fetched for, and sent to, a registry that is trusted with it: one with configured credentials of its own, or one on the same site (registrable domain) as the token service, as `registry-1.docker.io` is with `auth.docker.io`. Any other host that answers with a challenge naming that token service gets its 401 back, so it cannot obtain a token minted from your credentials. Tokens from a token service with no configured credentials are anonymous and are fetched for any registry, as before. If your registry and its token service are on different sites, configure credentials for the registry URL as well.
+A token fetched with credentials configured for the token URL is only fetched for, and sent to, a registry that is trusted with it: one on the same host and port as the token service, one configured with the same credentials as the token URL, or Docker Hub (`registry-1.docker.io` and `index.docker.io` with `auth.docker.io`) and GitLab.com (`registry.gitlab.com` with `gitlab.com`). Sharing a parent domain is not enough, so `team-a.jfrog.io` is not trusted with tokens from `team-b.jfrog.io`. Any other host that answers with a challenge naming that token service gets its 401 back, so it cannot obtain a token minted from your credentials. Tokens from a token service with no configured credentials are anonymous and are fetched for any registry, as before. If your registry and its token service are on different hosts, such as a self-hosted GitLab with its registry on its own hostname, configure the same credentials for both URLs:
+
+```yaml
+upstream:
+  auth:
+    "https://registry.gitlab.example.com":
+      type: basic
+      username: "deploy-token"
+      password: "${GITLAB_DEPLOY_TOKEN}"
+    "https://gitlab.example.com/jwt/auth":
+      type: basic
+      username: "deploy-token"
+      password: "${GITLAB_DEPLOY_TOKEN}"
+```
 
 ### Bearer Token
 
@@ -982,11 +1031,22 @@ Exact `packages` entries take precedence over patterns. When several patterns ma
 
 Resolution order: exact package override, then package pattern, then ecosystem override, then global default. This lets you set a conservative default while exempting trusted package families.
 
-Currently supported for npm, PyPI, pub.dev, Composer, Cargo, NuGet, Conda, RubyGems, Hex and Go. These ecosystems include publish timestamps in their metadata.
+Currently supported for npm, PyPI, pub.dev, Composer, Cargo, NuGet, Conda, RubyGems, Hex, Go and Maven. Most of these ecosystems include publish timestamps in their metadata; Go and Maven are described below.
 
 Go has no publish time. The module proxy's `.info` gives the commit time of the revision a version points at, so a version tagged on an old commit counts as old. The proxy reads each listed version's `.info` once, stores the time, and leaves versions in cooldown out of `@v/list` and `@latest`. When upstream's `@latest` is in cooldown, it serves the newest release out of cooldown instead. Requests for a version in cooldown, including its `.info`, `.mod` and `.zip`, and a branch or commit query that resolves to one, get 403 rather than 404, because the go command moves on to the next `GOPROXY` entry, such as `direct`, after a 404. If a version's `.info` can't be fetched, the list or download fails with 502 instead of letting the version through.
 
+Maven metadata has no publish time per version. The proxy uses the `Last-Modified` header of each version's `.pom`, which on Maven Central is the time the version was deployed. It reads the header once per version and stores the time, for each repository under `upstream.maven_repositories` separately: from the response when the `.pom` or Gradle `.module` itself is downloaded, which clients do before a version's other files, and otherwise with a `HEAD` request. A `.pom` or `.module` refused this way is still cached, so it counts toward `max_size` before the version leaves cooldown. To keep requests to the upstream down, it only checks versions that can still be in cooldown: none when the metadata's `<lastUpdated>` is older than the cooldown, and otherwise the versions from the end of the list back to the first one that is old enough. Versions in cooldown are left out of `maven-metadata.xml`, `<latest>` and `<release>` are set to the last versions left, and the metadata's `.md5`, `.sha1`, `.sha256` and `.sha512` files are computed from what is served. Requests for any file of a version in cooldown get 403, as for a version on the denylist. If a `.pom` can't be checked, the metadata or download fails with 502 instead of letting the version through, or with 503 and `Retry-After` when the upstream rate-limits the proxy; a version without a `.pom` is let through.
+
+Maven caveats:
+
+- A Nexus or Artifactory upstream may report when it cached the `.pom` rather than when it was published, so a version can stay in cooldown longer than it should.
+- On Google's Maven Central mirror, `Last-Modified` is when the file reached the mirror's bucket, a few hours after it was published, so versions stay in cooldown a little longer. The upload time is in `x-goog-meta-last-modified`, which the proxy does not read. It is missing for files from the mirror's 2019 bulk import.
+- Maven Central lists versions in version order, not in the order they were published. A patch to an older release line published after a newer release that is out of cooldown stays listed while it is in cooldown, but its files are still refused.
+- SNAPSHOT versions are not held back.
+
 With cooldown on, the proxy asks npm for full packuments, since the abbreviated ones it uses otherwise carry no publish times. Abbreviated packuments cached before cooldown was turned on are fetched again in full rather than served, including as a stale copy when the upstream is down.
+
+Conda cooldown covers `repodata.json` and sharded repodata (CEP 16). Clients cache shards by the hash in the shard index, so with cooldown on the proxy serves a rewritten index whose shard hashes change every hour and filters each shard as it is fetched. Versions leaving cooldown show up within the hour, and clients fetch the shards they need again once an hour. If a channel's shard index points packages or shards somewhere the proxy doesn't route, the proxy answers 404 for it and clients fall back to `repodata.json`.
 
 Note: Hex cooldown requires disabling registry signature verification since the proxy re-encodes the protobuf payload without the original signature. Set `HEX_NO_VERIFY_REPO_ORIGIN=1` or configure your repo with `no_verify: true`.
 
@@ -1401,7 +1461,7 @@ Or via environment variable: `PROXY_MIRROR_API=true`.
 
 When disabled, the endpoints are not registered and return 404.
 
-Start a mirror job with either PURLs or an inline CycloneDX or SPDX JSON document:
+Start a mirror job with either PURLs or an inline CycloneDX or SPDX JSON document. Requests without `Content-Type: application/json` get 415, so other websites cannot start jobs through a visitor's browser:
 
 ```bash
 curl -X POST http://localhost:8080/api/mirror \
@@ -1502,7 +1562,7 @@ mirror:
 
 Each run checks the tag with a HEAD request. If the tag still points to the cached digest, nothing else is fetched. If it moved, the new manifests and blobs are fetched first and the tag is switched only when all of them are cached, so a failed run leaves the previous image pullable. Images of one schedule are mirrored one after the other.
 
-- The first run starts within ten minutes of startup, later runs every `interval` ±10 %, so restarts and several instances don't hit the registry at once. Each instance runs the schedules on its own.
+- The first run starts within ten minutes of startup, later runs every `interval` ±10 %, so restarts and several instances don't hit the registry at once. Instances sharing a PostgreSQL database run each schedule once per interval: the first to reach it records the run, and the others skip it. A run cut off by a shutdown is not recorded, so the next instance to reach the schedule runs it.
 - Digest-pinned PURLs never move and are rejected. A `pkg:oci` digest with `tag=` is accepted; the tag is refreshed and a warning is logged when it no longer matches the digest.
 - The previous digest stays cached, so pulls by digest keep working, until eviction or retention removes it.
 - Docker Hub does not count HEAD requests against its pull limit, but every changed manifest is a pull. Set `platforms` and `upstream.auth` for `registry-1.docker.io` to stay under the anonymous limit.

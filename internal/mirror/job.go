@@ -50,6 +50,8 @@ type JobStore struct {
 	jobs      map[string]*Job
 	mirror    *Mirror
 	parentCtx context.Context
+	// running counts the jobs whose goroutine has not returned yet.
+	running sync.WaitGroup
 }
 
 // NewJobStore creates a new job store. The parent context is used as the base
@@ -83,7 +85,7 @@ func (js *JobStore) Create(req JobRequest) (string, error) {
 	js.jobs[id] = job
 	js.mu.Unlock()
 
-	go js.runJob(ctx, cancel, job, source)
+	js.running.Go(func() { js.runJob(ctx, cancel, job, source) })
 
 	return id, nil
 }
@@ -123,6 +125,12 @@ func (js *JobStore) Cancel(id string) bool {
 	job.cancel()
 	job.State = JobStateCanceled
 	return true
+}
+
+// Wait blocks until every job has returned. Cancel the parent context first
+// to stop running jobs.
+func (js *JobStore) Wait() {
+	js.running.Wait()
 }
 
 // Cleanup removes completed/failed/canceled jobs older than jobTTL.

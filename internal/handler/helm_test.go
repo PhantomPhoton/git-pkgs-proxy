@@ -179,8 +179,8 @@ func TestHelmHandler_RejectsChartDigestMismatch(t *testing.T) {
 			t.Errorf("rejected chart at %q is not queued for deletion", path)
 		}
 	}
-	if stored != requests {
-		t.Errorf("found %d stored charts, want one per request (%d)", stored, requests)
+	if stored != 0 {
+		t.Errorf("found %d stored charts, want none: a mismatch is discarded before it is committed", stored)
 	}
 }
 

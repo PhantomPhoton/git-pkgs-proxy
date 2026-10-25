@@ -121,6 +121,7 @@ func newTestServer(t *testing.T) *testServer {
 	r.Get("/stats", s.handleStats)
 	r.Get("/openapi.json", s.handleOpenAPIJSON)
 	r.Route("/ui", func(ui chi.Router) {
+		ui.Use(denyFraming)
 		ui.Mount("/static", http.StripPrefix("/ui/static/", staticHandler()))
 		ui.Get("/", s.handleRoot)
 		ui.Get("/analytics", s.handleAnalytics)
@@ -805,6 +806,9 @@ func TestCategorizeLicenseCSS(t *testing.T) {
 		{"MPL-2.0", "copyleft"},
 		{"", "unknown"},
 		{"Proprietary", "unknown"},
+		{"mit", "permissive"},
+		{"Apache 2.0", "permissive"},
+		{"GPLv3", "copyleft"},
 	}
 
 	for _, tc := range tests {
@@ -1693,5 +1697,23 @@ func TestStatsEndpoint_StorageURL(t *testing.T) {
 	}
 	if strings.Contains(body, `"storage_path"`) {
 		t.Errorf("unexpected JSON key storage_path in response (should be storage_url)")
+	}
+}
+
+// TestUIRefusesFraming checks that other sites cannot frame UI pages, where
+// a framed Delete button could be clicked by a signed-in user.
+func TestUIRefusesFraming(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.close()
+
+	for _, target := range []string{"/ui/", "/ui/install", "/ui/static/style.css"} {
+		w := httptest.NewRecorder()
+		ts.handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+		if got := w.Header().Get("X-Frame-Options"); got != "DENY" {
+			t.Errorf("%s (status %d): X-Frame-Options = %q, want DENY", target, w.Code, got)
+		}
+		if got := w.Header().Get("Content-Security-Policy"); got != frameAncestorsNone {
+			t.Errorf("%s (status %d): Content-Security-Policy = %q, want %q", target, w.Code, got, frameAncestorsNone)
+		}
 	}
 }

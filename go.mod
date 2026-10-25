@@ -12,23 +12,23 @@ require (
 	github.com/git-pkgs/archives v0.9.0
 	github.com/git-pkgs/artifacts v0.2.1
 	github.com/git-pkgs/cooldown v0.3.0
-	github.com/git-pkgs/enrichment v0.7.3
+	github.com/git-pkgs/enrichment v0.7.4
 	github.com/git-pkgs/gcs v0.1.0
 	github.com/git-pkgs/integrity v0.2.0
 	github.com/git-pkgs/magic v0.5.0
-	github.com/git-pkgs/purl v0.1.23
+	github.com/git-pkgs/purl v0.1.24
 	github.com/git-pkgs/registries v0.11.1
 	github.com/git-pkgs/sbom v0.1.7
 	github.com/git-pkgs/spdx v0.3.3
-	github.com/git-pkgs/vers v0.7.2
-	github.com/git-pkgs/vulns v0.2.4
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/jmoiron/sqlx v1.4.0
+	github.com/klauspost/compress v1.20.1
 	github.com/lib/pq v1.12.3
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/swaggo/swag v1.16.6
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 	gocloud.dev v0.47.0
 	golang.org/x/mod v0.42.0
 	golang.org/x/net v0.61.0
@@ -76,6 +76,8 @@ require (
 	github.com/ecosyste-ms/ecosystems-go v0.5.0 // indirect
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a // indirect
 	github.com/git-pkgs/pom v0.1.8 // indirect
+	github.com/git-pkgs/vers v0.7.2 // indirect
+	github.com/git-pkgs/vulns v0.2.4 // indirect
 	github.com/github/go-spdx/v2 v2.7.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -90,7 +92,6 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.21 // indirect
 	github.com/googleapis/gax-go/v2 v2.24.1 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
@@ -108,6 +109,7 @@ require (
 	github.com/rs/dnscache v0.0.0-20230804202142-fc85eb664529 // indirect
 	github.com/rubyist/circuitbreaker v2.2.1+incompatible // indirect
 	github.com/ulikunitz/xz v0.5.17 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.46.0 // indirect
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect

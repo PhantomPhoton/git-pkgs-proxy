@@ -126,14 +126,10 @@ func (h *HelmHandler) handleChart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A streamed fetch is never stored, so serveChart's digest check has
-	// nothing to compare against: verify the stream itself instead.
-	expectedDigest := ""
-	if h.proxy.StreamArtifacts {
-		expectedDigest = "sha256:" + digest
-	}
+	// Verify the chart against the index digest while it is fetched, so a
+	// mismatch is never committed to the cache, nor streamed out complete.
 	result, err := h.proxy.GetOrFetchArtifactFromURLWithDigest(
-		r.Context(), helmMetadataEcosystem, repository, digest, filename, downloadURL, expectedDigest)
+		r.Context(), helmMetadataEcosystem, repository, digest, filename, downloadURL, "sha256:"+digest)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch chart")
 		return

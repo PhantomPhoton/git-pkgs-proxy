@@ -402,6 +402,12 @@ func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) (rewri
 // accepting gzip gets the compressed copy when there is one. Being another
 // representation, it has an ETag of its own.
 func serveRewrittenMetadata(w http.ResponseWriter, r *http.Request, m rewrittenMetadata) {
+	serveRewrittenMetadataAs(w, r, m, contentTypeJSON)
+}
+
+// serveRewrittenMetadataAs is serveRewrittenMetadata for a document of
+// another content type.
+func serveRewrittenMetadataAs(w http.ResponseWriter, r *http.Request, m rewrittenMetadata, contentType string) {
 	body, etag := m.body, m.etag
 	compressed := m.gzipped != nil && acceptsGzip(r)
 	if compressed {
@@ -416,7 +422,7 @@ func serveRewrittenMetadata(w http.ResponseWriter, r *http.Request, m rewrittenM
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	w.Header().Set(headerContentType, contentTypeJSON)
+	w.Header().Set(headerContentType, contentType)
 	if compressed {
 		w.Header().Set(headerContentEncoding, "gzip")
 	}

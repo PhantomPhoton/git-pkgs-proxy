@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+
+	"github.com/git-pkgs/registries/fetch"
 )
 
 func sha256Hex(data string) string {
@@ -449,5 +452,65 @@ func TestFailOnMismatchHoldsBackFinalChunk(t *testing.T) {
 				t.Errorf("onMismatch called %d times, want 1", calls)
 			}
 		})
+	}
+}
+
+// TestFetchWithDigestVerifiesEveryAlgorithm checks that a sha512 digest is
+// verified before the artifact is cached, like a sha256 one, and that a digest
+// whose algorithm can't be verified is refused without fetching.
+func TestFetchWithDigestVerifiesEveryAlgorithm(t *testing.T) {
+	const content = "blob content"
+	sum512 := sha512.Sum512([]byte(content))
+	tests := []struct {
+		name, digest string
+		wantErr      error
+	}{
+		{"sha256", "sha256:" + sha256Hex(content), nil},
+		{"sha512", "sha512:" + hex.EncodeToString(sum512[:]), nil},
+		{"mismatched sha256", "sha256:" + sha256Hex("other"), ErrArtifactDigestMismatch},
+		{"mismatched sha512", "sha512:" + strings.Repeat("a", 128), ErrArtifactDigestMismatch},
+		{"unsupported algorithm", "sha1:" + strings.Repeat("a", 40), ErrUnsupportedDigest},
+		{"malformed sha512", "sha512:abc", ErrUnsupportedDigest},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s/stream=%t", tt.name, stream), func(t *testing.T) {
+				checkFetchWithDigest(t, stream, content, tt.digest, tt.wantErr)
+			})
+		}
+	}
+}
+
+func checkFetchWithDigest(t *testing.T, stream bool, content, digest string, wantErr error) {
+	t.Helper()
+	proxy, _, _, fetcher := setupTestProxy(t)
+	proxy.StreamArtifacts = stream
+	fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader(content))}
+
+	result, err := proxy.GetOrFetchArtifactFromURLWithDigest(t.Context(), "oci", "library/demo", digest, digest,
+		"https://registry.example/v2/library/demo/blobs/"+digest, digest)
+	if err == nil {
+		var body []byte
+		body, err = io.ReadAll(result.Reader)
+		_ = result.Reader.Close()
+		if err == nil && string(body) != content {
+			t.Errorf("body = %q, want %q", body, content)
+		}
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if errors.Is(wantErr, ErrUnsupportedDigest) && fetcher.fetchCalled {
+		t.Error("fetched an artifact whose digest can't be verified")
+	}
+	cached, err := proxy.GetCachedArtifact(t.Context(), "oci", "library/demo", digest, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached != nil {
+		_ = cached.Reader.Close()
+	}
+	if wantCached := wantErr == nil && !stream; (cached != nil) != wantCached {
+		t.Errorf("cached = %v, want %v", cached != nil, wantCached)
 	}
 }

@@ -65,10 +65,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/git-pkgs/archives"
 	"github.com/git-pkgs/cooldown"
+	shared "github.com/git-pkgs/enrichment"
 	swaggerdoc "github.com/git-pkgs/proxy/docs/swagger"
 	"github.com/git-pkgs/proxy/internal/accesslog"
 	"github.com/git-pkgs/proxy/internal/config"
@@ -86,7 +88,6 @@ import (
 	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
 	"github.com/git-pkgs/registries/safehttp"
-	"github.com/git-pkgs/spdx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -130,6 +131,10 @@ type Server struct {
 	browseLimits archives.StreamOptions
 
 	compares compareLimiter
+
+	// background counts the goroutines Start runs until cancel, which
+	// Shutdown waits for before it closes storage and the database.
+	background sync.WaitGroup
 }
 
 // New creates a new Server with the given configuration.
@@ -343,6 +348,7 @@ func (s *Server) serve(listener net.Listener) error {
 	// Web UI. Mounted under /ui so a reverse proxy can apply different
 	// access rules to it than to the package endpoints above (#123).
 	r.Route("/ui", func(ui chi.Router) {
+		ui.Use(denyFraming)
 		ui.Mount("/static", http.StripPrefix("/ui/static/", staticHandler()))
 		ui.Get("/", s.handleRoot)
 		ui.Get("/analytics", s.handleAnalytics)
@@ -388,7 +394,12 @@ func (s *Server) serve(listener net.Listener) error {
 		r.Post("/api/mirror", mirrorAPI.HandleCreate)
 		r.Get("/api/mirror/{id}", mirrorAPI.HandleGet)
 		r.Delete("/api/mirror/{id}", mirrorAPI.HandleCancel)
-		go jobStore.StartCleanup(bgCtx)
+		s.background.Go(func() { jobStore.StartCleanup(bgCtx) })
+		// Mirror jobs stop with bgCtx; their fetches still use the database.
+		s.background.Go(func() {
+			<-bgCtx.Done()
+			jobStore.Wait()
+		})
 	}
 	s.startMirrorSchedules(bgCtx, proxy)
 
@@ -415,11 +426,11 @@ func (s *Server) serve(listener net.Listener) error {
 	for _, warning := range s.cfg.EnvWarnings() {
 		s.logger.Warn(warning)
 	}
-	go s.updateCacheStatsMetrics()
-	go backfillMetadataAccess(bgCtx, s.db, s.logger, metadataBackfillBatch)
-	go s.startEvictionLoop(bgCtx)
-	go s.startRetentionLoop(bgCtx)
-	go s.startReclaimLoop(bgCtx)
+	s.background.Go(func() { s.updateCacheStatsMetrics(bgCtx) })
+	s.background.Go(func() { backfillMetadataAccess(bgCtx, s.db, s.logger, metadataBackfillBatch) })
+	s.background.Go(func() { s.startEvictionLoop(bgCtx) })
+	s.background.Go(func() { s.startRetentionLoop(bgCtx) })
+	s.background.Go(func() { s.startReclaimLoop(bgCtx) })
 
 	if listener != nil {
 		return s.http.Serve(listener)
@@ -493,7 +504,8 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 		s.cfg.Upstream.DebianRepositories,
 	)
 	rpmHandler := handler.NewRPMHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.RPM)
-	genericHandler := handler.NewGenericHandler(proxy, s.cfg.Upstream.Generic, s.cfg.Upstream.GenericArtifacts)
+	genericHandler := handler.NewGenericHandler(proxy, s.cfg.Upstream.Generic, s.cfg.Upstream.GenericArtifacts).
+		WithPaths(s.cfg.Upstream.GenericPaths)
 
 	r = r.With(sandboxUpstreamContent, rejectQueryInPath, rejectDotSegments)
 	r.Mount("/npm", http.StripPrefix("/npm", npmHandler.Routes()))
@@ -631,17 +643,18 @@ func upstreamSafeHTTPOptions(upstream config.UpstreamConfig) safehttp.Options {
 }
 
 // updateCacheStatsMetrics periodically updates cache statistics in Prometheus metrics.
-func (s *Server) updateCacheStatsMetrics() {
+func (s *Server) updateCacheStatsMetrics(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	// Update once immediately
-	s.updateCacheStats()
-	s.updateMetadataCacheStats()
-
-	for range ticker.C {
+	for {
 		s.updateCacheStats()
 		s.updateMetadataCacheStats()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -712,6 +725,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	s.waitForMirrorSchedules(ctx)
+	s.waitForBackground(ctx)
 
 	if s.git != nil {
 		if err := s.git.Close(); err != nil {
@@ -741,6 +755,27 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return errs[0]
 	}
 	return nil
+}
+
+// backgroundShutdownWait bounds how long shutdown waits for background jobs
+// to notice they were cancelled.
+const backgroundShutdownWait = 30 * time.Second
+
+// waitForBackground waits for the goroutines Start ran to return, so none of
+// them still uses storage or the database when they are closed.
+func (s *Server) waitForBackground(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, backgroundShutdownWait)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		s.background.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		s.logger.Warn("background jobs still running at shutdown")
+	}
 }
 
 // authForURL returns the authentication header for a given URL based on config.
@@ -1435,21 +1470,9 @@ func formatTimeAgo(t time.Time) string {
 	}
 }
 
-// categorizeLicenseCSS returns the CSS class suffix for a license category using the spdx module.
+// categorizeLicenseCSS returns the CSS class suffix for a license category.
 func categorizeLicenseCSS(license string) string {
-	if license == "" {
-		return licenseCategoryUnknown
-	}
-
-	if spdx.HasCopyleft(license) {
-		return "copyleft"
-	}
-
-	if spdx.IsFullyPermissive(license) {
-		return "permissive"
-	}
-
-	return licenseCategoryUnknown
+	return string(shared.CategorizeLicense(license))
 }
 
 // categorizeLicense is a helper that handles sql.NullString.

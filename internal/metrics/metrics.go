@@ -86,6 +86,14 @@ var (
 		[]string{"ecosystem"},
 	)
 
+	FetchLeaseWaits = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "proxy_fetch_lease_waits_total",
+			Help: "Cache misses that waited for another instance's upstream fetch, by kind (artifact or metadata)",
+		},
+		[]string{"kind"},
+	)
+
 	// Upstream metrics
 	UpstreamFetchDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -303,6 +311,7 @@ func init() {
 		CachedArtifacts,
 		ArtifactsEvicted,
 		MetadataEvicted,
+		FetchLeaseWaits,
 		UpstreamFetchDuration,
 		UpstreamErrors,
 		CircuitBreakerState,
@@ -398,6 +407,12 @@ func RecordArtifactEvicted(reason, ecosystem string) {
 // counter.
 func RecordMetadataEvicted(ecosystem string) {
 	MetadataEvicted.WithLabelValues(purl.NormalizeEcosystem(ecosystem)).Inc()
+}
+
+// RecordFetchLeaseWait counts a cache miss that found another instance
+// sharing the database already fetching it.
+func RecordFetchLeaseWait(kind string) {
+	FetchLeaseWaits.WithLabelValues(kind).Inc()
 }
 
 // RecordArtifactCacheMiss counts an artifact that had to be fetched upstream.

@@ -2,6 +2,9 @@ package mirror
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
@@ -27,6 +30,14 @@ type Scheduler struct {
 	schedules []Schedule
 	logger    *slog.Logger
 	wg        sync.WaitGroup
+	// Claim, when set, reports whether this instance should run a schedule
+	// that no instance sharing the database started within minGap. Each
+	// instance keeps its own timer, so without it every instance would run
+	// every schedule.
+	Claim func(key string, minGap time.Duration) (bool, error)
+	// Release, when set, drops the claim of a run that was interrupted, so
+	// the next attempt runs it rather than waiting an interval.
+	Release func(key string) error
 	// randN returns a value in [0, n); tests replace it.
 	randN func(n int64) int64
 }
@@ -75,9 +86,29 @@ func (s *Scheduler) loop(ctx context.Context, index int, schedule Schedule) {
 }
 
 func (s *Scheduler) run(ctx context.Context, index int, schedule Schedule) {
+	key := scheduleKey(schedule)
+	if s.Claim != nil {
+		// Later runs come at least interval - 2*spread apart, so a run
+		// started more recently than that was another instance's.
+		minGap := schedule.Interval - 2*(schedule.Interval/scheduleJitter) //nolint:mnd // two spreads of margin
+		claimed, err := s.Claim(key, minGap)
+		if err != nil {
+			s.logger.Warn("mirror schedule: failed to claim run, skipping it", "schedule", index, "error", err)
+			return
+		}
+		if !claimed {
+			s.logger.Debug("mirror schedule: another instance ran it, skipping", "schedule", index)
+			return
+		}
+	}
 	started := time.Now()
 	progress, err := s.mirror.Run(ctx, &PURLSource{PURLs: schedule.PURLs, Platforms: schedule.Platforms})
 	if ctx.Err() != nil {
+		if s.Claim != nil && s.Release != nil {
+			if err := s.Release(key); err != nil {
+				s.logger.Warn("mirror schedule: failed to release interrupted run", "schedule", index, "error", err)
+			}
+		}
 		return
 	}
 	if err != nil {
@@ -102,4 +133,19 @@ func scheduleDelay(interval time.Duration, first bool, randN func(int64) int64) 
 	}
 	spread := interval / scheduleJitter
 	return interval - spread + time.Duration(randN(int64(2*spread)+1)) //nolint:mnd // spread on both sides
+}
+
+// scheduleKey names a schedule by what it mirrors and how often, so
+// instances with the same configuration agree on it and a changed schedule
+// does not inherit the old one's last run.
+func scheduleKey(schedule Schedule) string {
+	h := sha256.New()
+	for _, purl := range schedule.PURLs {
+		_, _ = fmt.Fprintf(h, "purl %s\n", purl)
+	}
+	for _, platform := range schedule.Platforms {
+		_, _ = fmt.Fprintf(h, "platform %s\n", platform)
+	}
+	_, _ = fmt.Fprintf(h, "interval %s\n", schedule.Interval)
+	return "mirror-schedule:" + hex.EncodeToString(h.Sum(nil))[:32]
 }

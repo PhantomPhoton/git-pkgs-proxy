@@ -34,7 +34,7 @@ func (s *Server) startGradleBuildCacheEviction(ctx context.Context) {
 		"max_size_bytes", maxSize,
 		"interval", interval)
 
-	sweep := func() {
+	sweepOnce := func() {
 		deletedCount, freedBytes, err := sweepGradleBuildCache(ctx, s.storage, lister, maxAge, maxSize, time.Now())
 		if err != nil {
 			s.logger.Warn("gradle cache eviction sweep failed", "error", err)
@@ -47,9 +47,10 @@ func (s *Server) startGradleBuildCacheEviction(ctx context.Context) {
 		}
 	}
 
+	sweep := func() { s.runExclusive(ctx, "gradle-cache-eviction", sweepOnce) }
 	sweep()
 
-	go func() {
+	s.background.Go(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -61,7 +62,7 @@ func (s *Server) startGradleBuildCacheEviction(ctx context.Context) {
 				sweep()
 			}
 		}
-	}()
+	})
 }
 
 func sweepGradleBuildCache(

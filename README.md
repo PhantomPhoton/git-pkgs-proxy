@@ -51,7 +51,7 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | Hex | Elixir | Yes* | ✓ |
 | pub.dev | Dart | Yes | ✓ |
 | PyPI | Python | Yes | ✓ |
-| Maven | Java | | ✓ |
+| Maven | Java | Yes‡ | ✓ |
 | Gradle Build Cache | Java/Kotlin | | ✓ |
 | NuGet | .NET | Yes | ✓ |
 | Composer | PHP | Yes | ✓ |
@@ -78,6 +78,8 @@ Cooldown requires publish timestamps in metadata. Registries without a "Yes" in 
 \* Hex cooldown requires disabling registry signature verification (`HEX_NO_VERIFY_REPO_ORIGIN=1`) since the proxy re-encodes the protobuf payload.
 
 † Go cooldown uses the time in each version's `.info`, which is the commit time of the tagged revision, not when the tag was pushed.
+
+‡ Maven cooldown uses the `Last-Modified` header of each version's `.pom`. On Maven Central that is the deploy time; a Nexus or Artifactory upstream may report when it cached the file instead. SNAPSHOT versions are not held back.
 
 ## Install
 
@@ -412,6 +414,8 @@ Or set via command:
 ```bash
 conda config --add channels http://localhost:8080/conda/main
 ```
+
+pixi and other rattler-based clients use sharded repodata ([CEP 16](https://github.com/conda/ceps/blob/main/cep-0016.md)) where a channel offers it, as conda-forge does. Point them at the same channel URLs, for example `pixi init -c http://localhost:8080/conda/conda-forge`. The shard index and shards are cached as metadata when `cache_metadata` is on.
 
 ### CRAN (R)
 
@@ -859,8 +863,26 @@ Release assets are cached permanently after the first download and keep
 installing while GitHub is down. Tag lookups through `api.github.com` are
 cached for `metadata_ttl` and served stale during an outage or rate limit.
 Commit a `mise.lock` and install with `mise install --locked` so pinned
-installs need no API call at all. Add a bearer token for `https://api.github.com`
-under `upstream.auth` if the fleet exceeds GitHub's anonymous rate limit.
+installs need no API call at all.
+
+If the fleet exceeds GitHub's anonymous rate limit, add a bearer token for
+`https://api.github.com` under `upstream.auth`. Everyone who can reach the
+proxy can then make requests with that token, so the proxy requires
+`generic_paths` listing the API paths it may serve, and the token should be a
+fine-grained one with read-only access to public repositories:
+
+```yaml
+upstream:
+  generic_paths:
+    github-api:
+      - "repos/*/*/releases"
+      - "repos/*/*/releases/**"
+      - "repos/*/*/tags"
+  auth:
+    "https://api.github.com":
+      type: bearer
+      token: "${GITHUB_TOKEN}"
+```
 
 Maven, mvnd, Node and Go downloads are cached the same way once their hosts
 are configured as generic upstreams; their version-pinned paths are built in
@@ -1477,6 +1499,7 @@ The proxy exposes Prometheus metrics at `GET /metrics`. All metric names are pre
 | `proxy_metadata_cache_entries` | gauge | `ecosystem` | Number of cached metadata documents per ecosystem. |
 | `proxy_artifacts_evicted_total` | counter | `reason`, `ecosystem` | Artifacts evicted by the size limit (`lru`) or by age (`retention`) |
 | `proxy_metadata_evicted_total` | counter | `ecosystem` | Cached metadata documents evicted by the size limit |
+| `proxy_fetch_lease_waits_total` | counter | `kind` | Cache misses (`artifact` or `metadata`) that waited for another instance sharing the database to fetch them |
 | `proxy_upstream_fetch_duration_seconds` | histogram | `ecosystem` | Time spent fetching from upstream |
 | `proxy_upstream_errors_total` | counter | `ecosystem`, `error_type` | Upstream fetch failures |
 | `proxy_storage_operation_duration_seconds` | histogram | `operation` | Storage read/write latency |

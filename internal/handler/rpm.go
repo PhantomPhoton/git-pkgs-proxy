@@ -61,7 +61,7 @@ func NewRPMHandlerWithUpstream(proxy *Proxy, proxyURL, upstreamURL string) *RPMH
 // Routes returns the HTTP handler for RPM requests.
 // Mount this at /rpm on your router.
 func (h *RPMHandler) Routes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return rejectQueryChars(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -86,7 +86,7 @@ func (h *RPMHandler) Routes() http.Handler {
 			// Other files - proxy directly
 			h.proxyFile(w, r, path)
 		}
-	})
+	}))
 }
 
 // handlePackageDownload fetches and caches .rpm packages.
@@ -122,8 +122,12 @@ func (h *RPMHandler) handlePackageDownload(w http.ResponseWriter, r *http.Reques
 // handleMetadata proxies repository metadata files (repomd.xml, primary.xml.gz, etc.).
 // These change frequently so we don't cache them.
 func (h *RPMHandler) handleMetadata(w http.ResponseWriter, r *http.Request, path string) {
-	cacheKey := strings.ReplaceAll(path, "/", "_")
-	h.proxy.ProxyCached(w, r, fmt.Sprintf("%s/%s", h.upstreamURL, path), "rpm", cacheKey, "*/*")
+	h.proxy.ProxyCached(w, r, fmt.Sprintf("%s/%s", h.upstreamURL, path), "rpm", h.metadataCacheKey(path), "*/*")
+}
+
+// metadataCacheKey is the metadata cache key of a repository path.
+func (h *RPMHandler) metadataCacheKey(path string) string {
+	return hashedCacheKey(h.upstreamURL, path)
 }
 
 // proxyFile proxies any file directly without caching.

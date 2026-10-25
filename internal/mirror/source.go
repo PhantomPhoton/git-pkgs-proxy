@@ -144,9 +144,20 @@ func (s *SBOMSource) extractPURLs() ([]string, error) {
 	var purls []string
 	for _, p := range doc.Packages {
 		for _, ref := range p.ExternalRefs {
-			if ref.Type == "purl" && ref.Locator != "" {
-				purls = append(purls, ref.Locator)
+			if ref.Type != "purl" || ref.Locator == "" {
+				continue
 			}
+			locator := ref.Locator
+			if p.Version != "" {
+				parsed, err := purl.Parse(locator)
+				if err != nil {
+					return nil, fmt.Errorf("parsing PURL %q: %w", locator, err)
+				}
+				if parsed.Version == "" {
+					locator = parsed.WithVersion(p.Version).String()
+				}
+			}
+			purls = append(purls, locator)
 		}
 	}
 	if len(purls) == 0 {

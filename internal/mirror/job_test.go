@@ -7,9 +7,22 @@ import (
 	"time"
 )
 
-func TestJobStoreCreateAndGet(t *testing.T) {
+// newTestJobStore returns a job store whose jobs are stopped and waited for
+// before the test's database and directories are removed.
+func newTestJobStore(t *testing.T) *JobStore {
+	t.Helper()
 	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	ctx, cancel := context.WithCancel(context.Background())
+	js := NewJobStore(ctx, m)
+	t.Cleanup(func() {
+		cancel()
+		js.Wait()
+	})
+	return js
+}
+
+func TestJobStoreCreateAndGet(t *testing.T) {
+	js := newTestJobStore(t)
 
 	id, err := js.Create(JobRequest{
 		PURLs: []string{"pkg:npm/lodash@4.17.21"},
@@ -35,8 +48,7 @@ func TestJobStoreCreateAndGet(t *testing.T) {
 }
 
 func TestJobStoreGetNotFound(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	job := js.Get("nonexistent")
 	if job != nil {
@@ -45,8 +57,7 @@ func TestJobStoreGetNotFound(t *testing.T) {
 }
 
 func TestJobStoreCancelNotFound(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	if js.Cancel("nonexistent") {
 		t.Error("expected Cancel to return false for nonexistent job")
@@ -54,8 +65,7 @@ func TestJobStoreCancelNotFound(t *testing.T) {
 }
 
 func TestJobStoreCreateInvalidRequest(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	_, err := js.Create(JobRequest{})
 	if err == nil {
@@ -64,8 +74,7 @@ func TestJobStoreCreateInvalidRequest(t *testing.T) {
 }
 
 func TestJobStoreMultipleJobs(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	id1, err := js.Create(JobRequest{PURLs: []string{"pkg:npm/lodash@4.17.21"}})
 	if err != nil {
@@ -89,8 +98,7 @@ func TestJobStoreMultipleJobs(t *testing.T) {
 }
 
 func TestSourceFromRequestPURLs(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	source, err := js.sourceFromRequest(JobRequest{PURLs: []string{"pkg:npm/lodash@1.0.0"}})
 	if err != nil {
@@ -102,8 +110,7 @@ func TestSourceFromRequestPURLs(t *testing.T) {
 }
 
 func TestSourceFromRequestSBOM(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 	sbom := json.RawMessage(`{"bomFormat":"CycloneDX","components":[]}`)
 
 	source, err := js.sourceFromRequest(JobRequest{SBOM: sbom})
@@ -120,8 +127,7 @@ func TestSourceFromRequestSBOM(t *testing.T) {
 }
 
 func TestSourceFromRequestRejectsPURLsAndSBOM(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	_, err := js.sourceFromRequest(JobRequest{
 		PURLs: []string{"pkg:npm/lodash@4.17.21"},
@@ -133,8 +139,7 @@ func TestSourceFromRequestRejectsPURLsAndSBOM(t *testing.T) {
 }
 
 func TestSourceFromRequestRegistryRejected(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	_, err := js.sourceFromRequest(JobRequest{Registry: "npm"})
 	if err == nil {
@@ -143,8 +148,7 @@ func TestSourceFromRequestRegistryRejected(t *testing.T) {
 }
 
 func TestJobStoreCleanup(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	// Add a completed job with old CreatedAt
 	js.mu.Lock()
@@ -179,8 +183,7 @@ func TestJobStoreCleanup(t *testing.T) {
 }
 
 func TestJobStoreCancelPreservesStateAfterRunJob(t *testing.T) {
-	m := setupTestMirror(t, 1)
-	js := NewJobStore(context.Background(), m)
+	js := newTestJobStore(t)
 
 	// Create a job with a PURL that will fail (no real upstream in test)
 	id, err := js.Create(JobRequest{PURLs: []string{"pkg:npm/nonexistent-pkg@0.0.0"}})
