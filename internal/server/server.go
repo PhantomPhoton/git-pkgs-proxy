@@ -530,7 +530,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	r.Mount("/rpm", http.StripPrefix("/rpm", rpmHandler.Routes()))
 	r.Mount("/generic", http.StripPrefix("/generic", genericHandler.Routes()))
 	if s.git != nil {
-		gitHandler := handler.NewGitHandler(proxy, s.git, s.cfg.Upstream)
+		gitHandler := handler.NewGitHandler(proxy, s.git, s.cfg.Upstream).WithBaseURL(s.cfg.BaseURL)
 		r.Mount("/git", http.StripPrefix("/git", gitHandler.Routes()))
 	}
 }
