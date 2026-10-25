@@ -79,8 +79,9 @@ func (h *CondaHandler) Routes() http.Handler {
 
 	// Channel index (repodata)
 	mux.HandleFunc("GET /{channel}/{arch}/repodata.json", h.handleRepodata)
-	mux.HandleFunc("GET /{channel}/{arch}/repodata.json.bz2", h.proxyCached)
+	mux.HandleFunc("GET /{channel}/{arch}/repodata.json.bz2", h.handleRepodataVariant)
 	mux.HandleFunc("GET /{channel}/{arch}/current_repodata.json", h.handleRepodata)
+	mux.HandleFunc("GET /{channel}/{arch}/repodata_from_packages.json", h.handleRepodata)
 
 	// Sharded repodata (CEP 16)
 	mux.HandleFunc("GET /{channel}/{arch}/"+condaShardIndexFile, h.handleShardIndex)
@@ -106,6 +107,10 @@ func (h *CondaHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// Only cache actual package files
 	if !h.isPackageFile(filename) {
+		if isCondaRepodataVariant(filename) && h.cooldownEnabled() {
+			refuseUnfilteredRepodata(w)
+			return
+		}
 		h.proxyUpstream(w, r)
 		return
 	}
@@ -178,9 +183,34 @@ func (h *CondaHandler) parseFilename(filename string) (name, version string) {
 	return name, version
 }
 
+// isCondaRepodataVariant reports whether filename is a form of a subdir's
+// repodata other than the plain JSON documents the proxy filters, such as
+// repodata.json.zst, repodata.json.bz2 or repodata.jlap patches. Package
+// files are told apart by the caller.
+func isCondaRepodataVariant(filename string) bool {
+	return strings.HasPrefix(filename, "repodata") || strings.HasPrefix(filename, "current_repodata")
+}
+
+// handleRepodataVariant serves repodata.json.bz2 from the metadata cache,
+// unless cooldown is on: the proxy filters only the JSON, so a compressed
+// copy would list versions still in cooldown.
+func (h *CondaHandler) handleRepodataVariant(w http.ResponseWriter, r *http.Request) {
+	if h.cooldownEnabled() {
+		refuseUnfilteredRepodata(w)
+		return
+	}
+	h.proxyCached(w, r)
+}
+
+// refuseUnfilteredRepodata answers 404 for a repodata variant the proxy
+// can't filter. conda and mamba then fall back to repodata.json.
+func refuseUnfilteredRepodata(w http.ResponseWriter) {
+	http.Error(w, "only repodata.json is served while cooldown is enabled", http.StatusNotFound)
+}
+
 // handleRepodata proxies repodata.json, applying cooldown filtering when enabled.
 func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
-	if h.proxy.Cooldown == nil || !h.proxy.Cooldown.Enabled() {
+	if !h.cooldownEnabled() {
 		h.proxyCached(w, r)
 		return
 	}
