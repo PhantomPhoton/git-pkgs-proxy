@@ -185,6 +185,8 @@ database:
 | `database.driver` | `PROXY_DATABASE_DRIVER` | `-database-driver` | `sqlite` or `postgres` |
 | `database.path` | `PROXY_DATABASE_PATH` | `-database-path` | SQLite file path |
 
+The database runs in WAL mode. Writes go through a single connection, since SQLite allows one writer at a time. Reads use a separate pool of read-only connections (one per CPU, between 2 and 8), so request lookups don't wait behind writes, stats queries or eviction scans. An in-memory database (`:memory:`) uses one connection for both.
+
 ### PostgreSQL
 
 ```yaml
@@ -213,7 +215,7 @@ Each instance needs its own [`git.cache_dir`](#git-repositories).
 
 ### Hit counts
 
-Every cache hit updates the artifact's hit count and last-access time, which the stats pages and LRU eviction use. Rather than writing each hit as its own transaction, the proxy counts hits in memory and writes them together every `hit_flush_interval`. SQLite allows one writer at a time, and the proxy uses a single SQLite connection, so with a write per hit, concurrent downloads queue behind each other.
+Every cache hit updates the artifact's hit count and last-access time, which the stats pages and LRU eviction use. Rather than writing each hit as its own transaction, the proxy counts hits in memory and writes them together every `hit_flush_interval`. SQLite allows one writer at a time, and the proxy writes through a single SQLite connection, so with a write per hit, concurrent downloads queue behind each other.
 
 ```yaml
 database:
