@@ -44,11 +44,8 @@ func containsPathTraversal(path string) bool {
 	return false
 }
 
-// rejectQueryChars refuses requests whose decoded path contains '?' or '#',
-// for handlers that build upstream URLs from the decoded path: there either
-// would cut the upstream path short and cache one file under another file's
-// name. The server refuses these paths too; this keeps the handlers safe on
-// their own.
+// rejectQueryChars refuses a decoded path containing '?' or '#', which would cut
+// the upstream URL short and cache one file under another's name.
 func rejectQueryChars(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.ContainsAny(r.URL.Path, "?#") {

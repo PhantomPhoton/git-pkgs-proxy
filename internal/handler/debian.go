@@ -75,7 +75,7 @@ func NewDebianHandler(
 // Routes returns the HTTP handler for Debian requests.
 // Mount this at /debian on your router.
 func (h *DebianHandler) Routes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return rejectQueryChars(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -83,9 +83,7 @@ func (h *DebianHandler) Routes() http.Handler {
 
 		path := strings.TrimPrefix(r.URL.Path, "/")
 
-		// A decoded '?' or '#' would cut the upstream path short and cache one
-		// file under another file's name.
-		if containsPathTraversal(path) || strings.ContainsAny(path, "?#") {
+		if containsPathTraversal(path) {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
@@ -122,7 +120,7 @@ func (h *DebianHandler) Routes() http.Handler {
 			// Other files (like README, etc.) - proxy directly
 			h.proxyFile(w, r, upstreamURL, rest)
 		}
-	})
+	}))
 }
 
 // repositoryNotFound answers a request addressed to a repository that is not
