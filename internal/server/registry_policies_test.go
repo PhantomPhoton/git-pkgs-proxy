@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/git-pkgs/proxy/internal/config"
+	upstreamhttp "github.com/git-pkgs/proxy/internal/httpclient"
 	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
 )
@@ -59,7 +60,7 @@ func TestMirrorProxySharesHoldAfterBearerRetry(t *testing.T) {
 		t.Fatalf("metadata fetch = %v, upstream calls %d", err, calls.Load())
 	}
 	var held *registryclient.HeldError
-	if !errors.As(proxy.RateLimits.Held(upstream.URL), &held) || held.RetryAfter < 59*time.Minute || len(proxy.RateLimits.Holds()) != 1 {
+	if !errors.As(proxy.RateLimits.Held(upstream.URL), &held) || held.RetryAfter < 59*time.Minute || len(proxy.RateLimits.(*upstreamhttp.SharedRateLimitGate).Holds()) != 1 {
 		t.Fatalf("shared hold = %+v", held)
 	}
 }

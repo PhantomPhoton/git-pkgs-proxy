@@ -147,6 +147,11 @@ CREATE TABLE IF NOT EXISTS metadata_dates (
 	PRIMARY KEY (ecosystem, proxy_url, name)
 );
 
+CREATE TABLE IF NOT EXISTS upstream_holds (
+	host TEXT NOT NULL PRIMARY KEY,
+	until_ms INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS migrations (
 	name TEXT NOT NULL PRIMARY KEY,
 	applied_at DATETIME NOT NULL
@@ -281,6 +286,11 @@ CREATE TABLE IF NOT EXISTS metadata_dates (
 	etag TEXT NOT NULL,
 	last_modified BIGINT NOT NULL,
 	PRIMARY KEY (ecosystem, proxy_url, name)
+);
+
+CREATE TABLE IF NOT EXISTS upstream_holds (
+	host TEXT NOT NULL PRIMARY KEY,
+	until_ms BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS migrations (
@@ -447,6 +457,7 @@ var migrations = []migration{
 	{"014_add_metadata_last_accessed", migrateAddMetadataLastAccessed},
 	{"015_add_job_runs", migrateAddJobRuns},
 	{"016_add_fetch_leases", migrateAddFetchLeases},
+	{"018_add_upstream_holds", migrateAddUpstreamHolds},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -778,6 +789,23 @@ func migrateAddFetchLeases(db *DB) error {
 	)`, ts)
 	if _, err := db.Exec(query); err != nil {
 		return fmt.Errorf("creating fetch_leases table: %w", err)
+	}
+	return nil
+}
+
+// migrateAddUpstreamHolds creates the table through which instances sharing
+// the database honour each other's upstream rate-limit holds.
+func migrateAddUpstreamHolds(db *DB) error {
+	millis := "INTEGER"
+	if db.dialect == DialectPostgres {
+		millis = "BIGINT"
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS upstream_holds (
+		host TEXT NOT NULL PRIMARY KEY,
+		until_ms %s NOT NULL
+	)`, millis)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating upstream_holds table: %w", err)
 	}
 	return nil
 }
