@@ -1011,6 +1011,36 @@ func composerIntegrity(shasum, version string, listed bool) string {
 	return sha1Checksum(shasum)
 }
 
+// ComposerReleaseArchive returns the file name the Composer handler caches a
+// tagged release's archive under, and the integrity it checks it against,
+// given the dist the release's metadata lists. It refuses versions the
+// handler only serves after reading the metadata again: branches, whose
+// archive changes with every push, and archives whose URL has a query, which
+// clients ask for with one.
+func ComposerReleaseArchive(version, distURL, distType, shasum string) (filename, declared string, err error) {
+	switch {
+	case isDevVersion(version):
+		return "", "", fmt.Errorf("%s is a branch; Composer branches are fetched when requested, not mirrored", version)
+	case distURL == "":
+		return "", "", fmt.Errorf("%s has no dist archive", version)
+	case strings.ContainsAny(distURL, "?#"):
+		return "", "", fmt.Errorf("the archive URL of %s has a query, which isn't mirrored", version)
+	}
+	return distFilename(distURL, distType), composerIntegrity(shasum, version, true), nil
+}
+
+// RecordComposerPublishTime stores the publish time of a tagged release from
+// the default repository, as the Composer handler does when it resolves the
+// release's dist, so the archive is served from the cache without the
+// metadata, with or without cooldown.
+func (p *Proxy) RecordComposerPublishTime(packageName, version string, publishedAt time.Time) error {
+	if p.DB == nil || isDevVersion(version) || publishedAt.IsZero() {
+		return nil
+	}
+	return p.DB.SetVersionPublishedAt(canonicalVersionPURL("composer", packageName, version),
+		canonicalPackagePURL("composer", packageName), publishedAt)
+}
+
 // proxyUpstream forwards a request to packagist.org without caching.
 func (h *ComposerHandler) proxyUpstream(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := h.upstreamURL + r.URL.Path

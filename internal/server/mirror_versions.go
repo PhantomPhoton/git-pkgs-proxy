@@ -62,7 +62,7 @@ func mirrorVersionsURL(u config.UpstreamConfig, purlType, name string) (string, 
 		return upstreamOr(u.NuGet, d.NuGet) + "/v3", nil
 	case "composer":
 		if _, ok := handler.RoutedPackageURL(u.ComposerRoutes, name); ok {
-			return "", fmt.Errorf("listing versions of packages in upstream.composer_routes isn't supported; give a version")
+			return "", errors.New("mirroring packages in upstream.composer_routes isn't supported")
 		}
 		return upstreamOr(u.Composer, d.Composer), nil
 	case "cran":

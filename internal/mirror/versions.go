@@ -23,10 +23,10 @@ type RegistryVersions struct {
 	URL func(purlType, name string) (string, error)
 }
 
-// FileLister lists the files of one package version, for ecosystems that
-// publish several files per version.
-type FileLister interface {
-	ListFiles(ctx context.Context, ecosystem, name, version string) ([]registries.Artifact, error)
+// VersionFinder finds one version of a package, with the files it
+// publishes, for ecosystems the mirror fetches from the version's metadata.
+type VersionFinder interface {
+	FindVersion(ctx context.Context, ecosystem, name, version string) (registries.Version, error)
 }
 
 // ListVersions implements VersionLister.
@@ -42,18 +42,18 @@ func (r RegistryVersions) ListVersions(ctx context.Context, ecosystem, name stri
 	return result, nil
 }
 
-// ListFiles implements FileLister.
-func (r RegistryVersions) ListFiles(ctx context.Context, ecosystem, name, version string) ([]registries.Artifact, error) {
+// FindVersion implements VersionFinder.
+func (r RegistryVersions) FindVersion(ctx context.Context, ecosystem, name, version string) (registries.Version, error) {
 	versions, err := r.fetchVersions(ctx, ecosystem, name)
 	if err != nil {
-		return nil, err
+		return registries.Version{}, err
 	}
 	for _, v := range versions {
 		if v.Number == version {
-			return v.Artifacts, nil
+			return v, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: %s %s@%s", registries.ErrNotFound, ecosystem, name, version)
+	return registries.Version{}, fmt.Errorf("%w: %s %s@%s", registries.ErrNotFound, ecosystem, name, version)
 }
 
 func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name string) ([]registries.Version, error) {
