@@ -469,7 +469,14 @@ func (p *Proxy) deleteLocal(ecosystem, name, version, filename string, notFound 
 // before serving a cached copy call it first, so pushed versions the upstream
 // does not list are still served. Pushed artifacts are not a cache, so they
 // are served even when StreamArtifacts is set.
+//
+// With hosted packages disabled it returns nil without a lookup, as
+// localVersions does: pushes are then left out of metadata, so they are not
+// served ahead of the upstream either.
 func (p *Proxy) GetLocalArtifact(ctx context.Context, ecosystem, name, version, filename string) (*CacheResult, error) {
+	if !p.HostedEnabled {
+		return nil, nil
+	}
 	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
 	if err != nil {
 		return nil, err

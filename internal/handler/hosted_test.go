@@ -228,6 +228,7 @@ func TestLocalArtifactsAndDeleteLocalVersion(t *testing.T) {
 
 func TestGetLocalArtifactIgnoresUpstreamCopies(t *testing.T) {
 	proxy, _, _, fetcher := setupTestProxy(t)
+	proxy.HostedEnabled = true
 	fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader("upstream tarball")), ContentType: "application/gzip"}
 	cached, err := proxy.GetOrFetchArtifactFromURL(context.Background(), "npm", "request", "2.88.3", "request-2.88.3.tgz",
 		"https://registry.npmjs.org/request/-/request-2.88.3.tgz")
@@ -248,6 +249,34 @@ func TestGetLocalArtifactIgnoresUpstreamCopies(t *testing.T) {
 	}
 	if got := readResult(local); got != pushedTarball {
 		t.Errorf("served body = %q, want the pushed tarball", got)
+	}
+}
+
+// With hosted packages disabled, downloads don't look for a pushed artifact,
+// as metadata requests don't.
+func TestGetLocalArtifactNeedsHostedEnabled(t *testing.T) {
+	proxy, db, _, _ := setupTestProxy(t)
+	proxy.HostedEnabled = true
+	pushRequest(t, proxy)
+	if local, err := proxy.GetLocalArtifact(context.Background(), "npm", "request", "2.88.3", "request-2.88.3.tgz"); err != nil || local == nil {
+		t.Fatalf("GetLocalArtifact with hosted enabled = %+v, %v, want the pushed artifact", local, err)
+	} else {
+		_ = local.Reader.Close()
+	}
+
+	proxy.HostedEnabled = false
+	if local, err := proxy.GetLocalArtifact(context.Background(), "npm", "request", "2.88.3", "request-2.88.3.tgz"); err != nil || local != nil {
+		t.Fatalf("GetLocalArtifact with hosted disabled = %+v, %v, want nil, nil", local, err)
+	}
+
+	// A closed database fails every query, so a nil error shows no lookup ran.
+	_ = db.Close()
+	if local, err := proxy.GetLocalArtifact(context.Background(), "npm", "request", "2.88.3", "request-2.88.3.tgz"); err != nil || local != nil {
+		t.Errorf("GetLocalArtifact with hosted disabled = %+v, %v, want nil, nil without a database lookup", local, err)
+	}
+	proxy.HostedEnabled = true
+	if _, err := proxy.GetLocalArtifact(context.Background(), "npm", "request", "2.88.3", "request-2.88.3.tgz"); err == nil {
+		t.Error("GetLocalArtifact with hosted enabled did not query the closed database")
 	}
 }
 
