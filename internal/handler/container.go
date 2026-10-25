@@ -15,6 +15,7 @@ import (
 
 	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/purl"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -114,6 +115,10 @@ type ContainerHandler struct {
 	// refusalsFull is set once the refusals set reached its limit and that
 	// was logged.
 	refusalsFull bool
+
+	// manifestFlight shares one upstream exchange among concurrent
+	// requests for the same manifest.
+	manifestFlight singleflight.Group
 }
 
 type containerRegistry struct {
