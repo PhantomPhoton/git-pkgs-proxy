@@ -191,6 +191,8 @@ database:
 | `database.driver` | `PROXY_DATABASE_DRIVER` | `-database-driver` | `sqlite` or `postgres` |
 | `database.path` | `PROXY_DATABASE_PATH` | `-database-path` | SQLite file path |
 
+The database runs in WAL mode. Writes go through a single connection, since SQLite allows one writer at a time. Reads use a separate pool of read-only connections (one per CPU, between 2 and 8), so request lookups don't wait behind writes, stats queries or eviction scans. An in-memory database (`:memory:`) uses one connection for both.
+
 ### PostgreSQL
 
 ```yaml
@@ -213,13 +215,15 @@ Instances coordinate through PostgreSQL advisory locks:
 - Eviction, reclaim, retention and the Gradle build cache sweep run on one instance at a time. An instance that finds a job running elsewhere skips that pass.
 - A [scheduled mirror](#scheduled-refresh) runs on whichever instance reaches it first in each interval.
 
-Cache misses are fetched from upstream once across instances. The instance that fetches holds a lease on the miss in the `fetch_leases` table and renews it while it downloads. Another instance missing the same file waits until it is stored and serves the stored copy; `proxy_fetch_lease_waits_total` counts those waits. If the fetch fails, the instances waiting on it stop waiting together: each serves its stale metadata copy if it has one, and otherwise fetches itself, so a failing upstream costs every instance one attempt at the same time rather than one after another. A lease of an instance that stopped expires after 30 seconds. Metadata is shared this way only with [`cache_metadata`](#metadata-caching) and a `metadata_ttl` above zero, since without a stored copy there is nothing to wait for. A cache hit costs no extra query; a miss costs one.
+Cache misses are fetched from upstream once across instances. The instance that fetches holds a lease on the miss in the `fetch_leases` table and renews it while it downloads. Another instance missing the same file waits until it is stored and serves the stored copy; `proxy_fetch_lease_waits_total` counts those waits. If the fetch fails, the instances waiting on it stop waiting together: each serves its stale metadata copy if it has one, and otherwise fetches itself, so a failing upstream costs every instance one attempt at the same time rather than one after another. When the fetch failed because the upstream rate limited it, the waiters without a stale copy answer 503 with the upstream's `Retry-After` instead of fetching. A lease of an instance that stopped expires after 30 seconds. Metadata is shared this way only with [`cache_metadata`](#metadata-caching) and a `metadata_ttl` above zero, since without a stored copy there is nothing to wait for. A cache hit costs no extra query; a miss costs one.
+
+Rate-limit holds (see `upstream_holds` under [Health Check](../README.md#health-check)) are shared through the `upstream_holds` table. When one instance gets a 429, or a 503 with `Retry-After`, it records the host and the end of the hold, and the other instances stop sending to that host too instead of each waiting for its own 429. Each instance rereads the table at most every two seconds, so another instance can still send for up to two seconds after a hold starts. A hold is also recorded with SQLite, where it then outlasts a restart.
 
 Each instance needs its own [`git.cache_dir`](#git-repositories).
 
 ### Hit counts
 
-Every cache hit updates the artifact's hit count and last-access time, which the stats pages and LRU eviction use. Rather than writing each hit as its own transaction, the proxy counts hits in memory and writes them together every `hit_flush_interval`. SQLite allows one writer at a time, and the proxy uses a single SQLite connection, so with a write per hit, concurrent downloads queue behind each other.
+Every cache hit updates the artifact's hit count and last-access time, which the stats pages and LRU eviction use. Rather than writing each hit as its own transaction, the proxy counts hits in memory and writes them together every `hit_flush_interval`. SQLite allows one writer at a time, and the proxy writes through a single SQLite connection, so with a write per hit, concurrent downloads queue behind each other.
 
 ```yaml
 database:
@@ -833,7 +837,42 @@ those yourself. The proxy locks `cache_dir` while it runs, through a
 `.gitcache-lock` file in it, so a second process given the same directory,
 such as another replica on a shared volume, fails to start; give each its own.
 
-Pushing, the dumb HTTP protocol and Git LFS are not supported. The settings
+Git LFS objects are cached in the artifact cache, so they use the configured
+storage backend and retention rather than `cache_dir`. git-lfs finds the LFS
+API under the rewritten remote, at `/git/{name}/{repo}.git/info/lfs`, with no
+further configuration. A batch request is passed to the upstream, which
+decides which objects the repository has, and each download is pointed at
+the proxy. An object the cache doesn't have is fetched from the download URL
+the batch returned, which the proxy keeps in memory until shortly before it
+expires, or else from one a fresh batch request returns. That URL is often
+on another host than the Git server, such as GitHub's or Hugging Face's
+object storage; the proxy fetches from whatever host the upstream names,
+with the usual address checks, and `upstream.auth` credentials only go to
+the hosts they are configured for. A download that isn't the object's size
+is cut off. If the object's content is already stored under another
+repository, such as a fork, it is copied from there instead of downloaded,
+once the upstream has confirmed this repository has it; the copy takes its
+own space.
+
+Large LFS objects may need longer timeouts. The proxy downloads an object it
+doesn't have before sending any of it, within `artifact_timeout`, and the
+whole response, download included, must fit within `write_timeout`; both
+default to 5 minutes. git-lfs gives up on a response after 30 seconds without
+data (`lfs.activitytimeout`) and retries. A retry waits for the download still
+running, so the object is served once it is cached, but a download that
+outlasts git-lfs's retries fails that clone or pull until it finishes.
+Download URLs are often signed; only the URL without its query is logged
+and recorded with the object. An object is only cached once its content
+matches its sha256 object ID. Objects are cached per repository, so one
+repository's objects are never served for another. When the upstream can't
+be reached or fails, a batch is answered with the objects cached for the
+repository, and the others are reported as unavailable; a batch the upstream
+refuses is refused. A cached object stays available after it is removed
+upstream, until retention removes it or you delete it through the
+[cache delete API](#cache-delete-api).
+
+Pushing, LFS uploads and locking, and the dumb HTTP protocol are not
+supported. The settings
 under `git` can also be set with `PROXY_GIT_CACHE_DIR`, `PROXY_GIT_MAX_SIZE`,
 `PROXY_GIT_MAX_REPO_SIZE`, `PROXY_GIT_REFRESH_WAIT` and
 `PROXY_GIT_STALE_MAX_AGE`.

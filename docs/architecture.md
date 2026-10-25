@@ -98,6 +98,8 @@ the full artifact digest because they read only part of the artifact.
 
 SQLite or PostgreSQL database for cache metadata. SQLite uses `modernc.org/sqlite` (pure Go, no CGO). PostgreSQL uses `lib/pq`.
 
+For SQLite, `DB` holds two pools: one connection for writes and a pool of read-only (`query_only`) connections for reads. `Get`, `Select`, `Query` and `QueryRow` go to the reader; `Exec`, transactions and everything else go to the writer, so a read inside a transaction sees the transaction's writes. A write sent to the reader fails instead of running. WAL mode lets the readers run while the writer commits. PostgreSQL and in-memory SQLite use one pool for both.
+
 The schema is compatible with [git-pkgs](https://github.com/git-pkgs) databases. The proxy adds the `artifacts` and `vulnerabilities` tables on top of the shared `packages` and `versions` tables, so both tools can point at the same database.
 
 **Tables:**
@@ -306,6 +308,7 @@ HTTP protocol handlers for each registry type.
 **GitHandler:**
 - Serves `/git/{name}/{repo}` from `internal/gitcache`, read-only over smart HTTP
 - Validates repository paths and the `repos` allowlist, and maps cache errors to statuses
+- Serves the Git LFS API under `{repo}.git/info/lfs/`: forwards download batches upstream and points each object at `objects/{oid}/{size}`, which is served from the artifact cache (ecosystem `git`, name `{name}/{repo}`, version the object ID); a miss uses the download URL kept from the batch or asks the upstream batch API for a fresh one, recorded without its signed query, copies the object from another repository when its content is already stored, and checks the object against its sha256 ID; a batch the upstream can't answer is answered from the cache
 
 ### `internal/gitcache`
 

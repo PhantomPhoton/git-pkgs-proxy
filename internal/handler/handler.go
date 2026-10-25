@@ -26,7 +26,6 @@ import (
 	"github.com/git-pkgs/proxy/internal/scanner"
 	"github.com/git-pkgs/proxy/internal/storage"
 	"github.com/git-pkgs/purl"
-	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
 	"github.com/opencontainers/go-digest"
 )
@@ -233,7 +232,7 @@ type Proxy struct {
 
 	// RateLimits is the gate under the upstream clients. Artifact fetches
 	// check it before calling Fetcher, so held hosts never reach its breaker.
-	RateLimits *registryclient.RateLimitGate
+	RateLimits UpstreamHolds
 
 	// HostedNPMScopes and HostedComposerVendors name namespaces served from
 	// pushed packages alone, without asking the upstream.
@@ -631,7 +630,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 		}
 	}
 
-	if err := p.RateLimits.Held(info.URL); err != nil {
+	if err := p.upstreamHeld(info.URL); err != nil {
 		return artifacts.Artifact{}, "", err
 	}
 	p.Logger.Info("fetching from upstream",
@@ -921,7 +920,12 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	}
 	// With leaseFailed, release is a no-op and this instance fetches on its
 	// own, so a failing upstream costs each instance one attempt in
-	// parallel.
+	// parallel. A rate-limited holder has published its hold by now, and
+	// rereading it makes commit refuse the fetch with the holder's
+	// Retry-After instead of sending one more request to the limited host.
+	if outcome == leaseFailed {
+		p.reloadUpstreamHolds()
+	}
 	failed := true
 	defer func() { release(failed) }()
 
@@ -1510,7 +1514,10 @@ func (p *Proxy) coalescedMetadataMiss(ctx context.Context, ecosystem, cacheKey, 
 				return *hit
 			case leaseFailed:
 				// Serve the stale copy at once, as the holder did, rather
-				// than trying the failing upstream again. Without one, fetch.
+				// than trying the failing upstream again. Without one, fetch,
+				// unless the holder was rate limited: its hold, read here,
+				// refuses the fetch with its Retry-After.
+				p.reloadUpstreamHolds()
 				if entry != nil {
 					if res := p.staleMetadata(fetchCtx, ecosystem, cacheKey, validate, entry, errFetchFailedElsewhere); res.err == nil {
 						return res
@@ -2273,6 +2280,33 @@ func (p *Proxy) coalescedFetchFromURL(ctx context.Context, ecosystem, name, vers
 	})
 }
 
+// cacheStoredCopy caches a copy of the object stored at source under a new
+// name, instead of downloading the same bytes again. It shares the coalescing
+// key a download from upstreamURL would use, so the two never run at once.
+func (p *Proxy) cacheStoredCopy(ctx context.Context, ecosystem, name, version, filename, upstreamURL, upstreamHash string, source *database.StoredContent) (*CacheResult, error) {
+	pkgPURL, versionPURL, err := packagePURLStrings(ecosystem, name, version)
+	if err != nil {
+		return nil, err
+	}
+	if p.versionDenied(ecosystem, name, version) || p.Denylist.Denied(versionPURL) {
+		return nil, fmt.Errorf("%w: %s", ErrVersionDenied, versionPURL)
+	}
+	key := artifactCoalesceKey(versionPURL, filename, upstreamURL, upstreamHash, "")
+	recheck := func() (artifacts.Artifact, string, bool) {
+		return p.cachedArtifactRecord(pkgPURL, versionPURL, filename, upstreamHash)
+	}
+	return p.coalesceFetch(ctx, key, recheck, func(fetchCtx context.Context) (artifacts.Artifact, string, error) {
+		body, err := p.Storage.Open(fetchCtx, source.StoragePath)
+		if err != nil {
+			return artifacts.Artifact{}, "", fmt.Errorf("opening stored copy: %w", err)
+		}
+		p.Logger.Info("caching a stored copy", "ecosystem", ecosystem, "name", name, "version", version,
+			"source", source.StoragePath)
+		return p.storeArtifact(fetchCtx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, "",
+			&fetch.Artifact{Body: body, Size: source.Size, ContentType: source.ContentType.String})
+	})
+}
+
 // getCachedArtifactWithUpstreamHash returns a cached artifact whose recorded
 // content hash matches the checksum the upstream currently declares for it.
 // This detects an upstream re-publishing under the same version, which the
@@ -2315,7 +2349,7 @@ func (p *Proxy) discardStaleArtifact(pkgPURL, versionPURL, filename, upstreamHas
 }
 
 func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (artifacts.Artifact, string, error) {
-	if err := p.RateLimits.Held(downloadURL); err != nil {
+	if err := p.upstreamHeld(downloadURL); err != nil {
 		return artifacts.Artifact{}, "", err
 	}
 	p.Logger.Info("fetching from upstream",
@@ -2353,9 +2387,96 @@ type observedFetcher interface {
 	FetchObservedWithHeaders(ctx context.Context, url string, headers http.Header) (*fetch.ObservedArtifact, error)
 }
 
-// fetchUpstream fetches downloadURL, reporting its Last-Modified when ctx
-// asks for it.
+type signedDownloadKey struct{}
+
+// signedDownload is a download URL carrying a signature, and the URL without
+// its query that stands for it everywhere but the request itself. size, when
+// not negative, is the exact size the download must have.
+type signedDownload struct {
+	signed, recorded string
+	size             int64
+}
+
+// errDownloadSize is a download larger or smaller than the size it was
+// expected to have.
+var errDownloadSize = errors.New("download does not have the expected size")
+
+// withSignedDownload returns a context under which a fetch of the returned
+// URL requests signedURL instead. The returned URL, signedURL without its
+// query and fragment, is what is logged, recorded with the artifact and used
+// to coalesce fetches, so a signature that grants access to the object
+// stays out of logs and the database. A download of other than size bytes
+// is cut off with errDownloadSize, unless size is negative.
+func withSignedDownload(ctx context.Context, signedURL string, size int64) (context.Context, string) {
+	u, err := url.Parse(signedURL)
+	if err != nil {
+		return ctx, signedURL
+	}
+	u.User = nil
+	u.RawQuery, u.ForceQuery = "", false
+	u.Fragment, u.RawFragment = "", ""
+	recorded := u.String()
+	return context.WithValue(ctx, signedDownloadKey{}, signedDownload{signed: signedURL, recorded: recorded, size: size}), recorded
+}
+
+// redactedFetchError is a fetch error whose text names the recorded URL
+// rather than the signed one.
+type redactedFetchError struct {
+	err      error
+	download signedDownload
+}
+
+func (e *redactedFetchError) Error() string {
+	return strings.ReplaceAll(e.err.Error(), e.download.signed, e.download.recorded)
+}
+
+func (e *redactedFetchError) Unwrap() error { return e.err }
+
+// fetchUpstream fetches downloadURL, or the signed URL ctx gives for it,
+// reporting its Last-Modified when ctx asks for it.
 func (p *Proxy) fetchUpstream(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
+	download, ok := ctx.Value(signedDownloadKey{}).(signedDownload)
+	if !ok || download.recorded != downloadURL {
+		return p.fetchUpstreamURL(ctx, downloadURL, headers)
+	}
+	artifact, err := p.fetchUpstreamURL(ctx, download.signed, headers)
+	if err != nil {
+		return nil, &redactedFetchError{err: err, download: download}
+	}
+	if download.size < 0 {
+		return artifact, nil
+	}
+	if artifact.Size >= 0 && artifact.Size != download.size {
+		_ = artifact.Body.Close()
+		return nil, fmt.Errorf("%w: upstream announced %d bytes, want %d", errDownloadSize, artifact.Size, download.size)
+	}
+	artifact.Body = &exactSizeBody{ReadCloser: artifact.Body, left: download.size}
+	return artifact, nil
+}
+
+// exactSizeBody fails a body that turns out longer or shorter than left
+// bytes, without reading more than one byte past it.
+type exactSizeBody struct {
+	io.ReadCloser
+	left int64
+}
+
+func (b *exactSizeBody) Read(p []byte) (int, error) {
+	if int64(len(p)) > b.left+1 {
+		p = p[:b.left+1]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.left -= int64(n)
+	switch {
+	case b.left < 0:
+		return n, fmt.Errorf("%w: upstream sent more bytes", errDownloadSize)
+	case errors.Is(err, io.EOF) && b.left > 0:
+		return n, fmt.Errorf("%w: upstream sent %d bytes too few", errDownloadSize, b.left)
+	}
+	return n, err
+}
+
+func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
 	report, _ := ctx.Value(upstreamLastModifiedKey{}).(func(time.Time))
 	observer, ok := p.Fetcher.(observedFetcher)
 	if report == nil || !ok {
@@ -2382,7 +2503,7 @@ func (p *Proxy) fetchUpstream(ctx context.Context, downloadURL string, headers h
 // after the bytes have been sent, and an unterminated chunked response is the
 // only way left to make the client reject them (see serveArtifact).
 func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, error)) (*CacheResult, error) {
-	if err := p.RateLimits.Held(upstreamURL); err != nil {
+	if err := p.upstreamHeld(upstreamURL); err != nil {
 		return nil, err
 	}
 	p.Logger.Info("streaming from upstream",

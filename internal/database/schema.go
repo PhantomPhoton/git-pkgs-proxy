@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -145,6 +146,11 @@ CREATE TABLE IF NOT EXISTS metadata_dates (
 	etag TEXT NOT NULL,
 	last_modified INTEGER NOT NULL,
 	PRIMARY KEY (ecosystem, proxy_url, name)
+);
+
+CREATE TABLE IF NOT EXISTS upstream_holds (
+	host TEXT NOT NULL PRIMARY KEY,
+	until_ms INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS migrations (
@@ -215,6 +221,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -283,6 +290,11 @@ CREATE TABLE IF NOT EXISTS metadata_dates (
 	PRIMARY KEY (ecosystem, proxy_url, name)
 );
 
+CREATE TABLE IF NOT EXISTS upstream_holds (
+	host TEXT NOT NULL PRIMARY KEY,
+	until_ms BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS migrations (
 	name TEXT NOT NULL PRIMARY KEY,
 	applied_at TIMESTAMP NOT NULL
@@ -310,6 +322,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -333,6 +346,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -447,6 +461,8 @@ var migrations = []migration{
 	{"014_add_metadata_last_accessed", migrateAddMetadataLastAccessed},
 	{"015_add_job_runs", migrateAddJobRuns},
 	{"016_add_fetch_leases", migrateAddFetchLeases},
+	{"017_add_artifact_content_hash_index", migrateAddArtifactContentHashIndex},
+	{"018_add_upstream_holds", migrateAddUpstreamHolds},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -782,12 +798,39 @@ func migrateAddFetchLeases(db *DB) error {
 	return nil
 }
 
+// migrateAddUpstreamHolds creates the table through which instances sharing
+// the database honour each other's upstream rate-limit holds.
+func migrateAddUpstreamHolds(db *DB) error {
+	millis := "INTEGER"
+	if db.dialect == DialectPostgres {
+		millis = "BIGINT"
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS upstream_holds (
+		host TEXT NOT NULL PRIMARY KEY,
+		until_ms %s NOT NULL
+	)`, millis)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating upstream_holds table: %w", err)
+	}
+	return nil
+}
+
 // migrateAddPendingDeletesQueuedAtIndex indexes the column reclaim orders
 // the queue by, which grows large after a retention sweep.
 func migrateAddPendingDeletesQueuedAtIndex(db *DB) error {
 	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at)`)
 	if err != nil {
 		return fmt.Errorf("creating pending_deletes queued_at index: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactContentHashIndex indexes artifacts by content, so an
+// artifact already stored under another name can be found by its hash.
+func migrateAddArtifactContentHashIndex(db *DB) error {
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)`)
+	if err != nil {
+		return fmt.Errorf("creating artifacts content_hash index: %w", err)
 	}
 	return nil
 }

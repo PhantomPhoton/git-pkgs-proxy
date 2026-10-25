@@ -120,7 +120,7 @@ type Server struct {
 	accessLog   *accesslog.Logger
 	ecr         *ecrTokens
 	breakers    *breakerMonitor
-	rateLimits  *registryclient.RateLimitGate
+	rateLimits  *upstreamhttp.SharedRateLimitGate
 	ecoStats    ecosystemStatsCache
 	metaStats   metadataStatsCache
 	sources     sourceTracker
@@ -530,7 +530,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	r.Mount("/rpm", http.StripPrefix("/rpm", rpmHandler.Routes()))
 	r.Mount("/generic", http.StripPrefix("/generic", genericHandler.Routes()))
 	if s.git != nil {
-		gitHandler := handler.NewGitHandler(proxy, s.git, s.cfg.Upstream)
+		gitHandler := handler.NewGitHandler(proxy, s.git, s.cfg.Upstream).WithBaseURL(s.cfg.BaseURL)
 		r.Mount("/git", http.StripPrefix("/git", gitHandler.Routes()))
 	}
 }
@@ -567,8 +567,14 @@ func (s *Server) newUpstreamClients(artifactTimeout time.Duration) (metadataClie
 			s.logger.Info("upstream rate limit cleared", "host", host)
 		}
 	}
-	s.rateLimits = gate
-	authTransport := upstreamhttp.NewTransport(gate, upstreamhttp.AuthFunc(s.authForURL))
+	// Holds go through the database so instances sharing it stop sending to
+	// a host as soon as any one of them is rate limited.
+	var holdStore upstreamhttp.HoldStore
+	if s.db != nil {
+		holdStore = s.db
+	}
+	s.rateLimits = upstreamhttp.NewSharedRateLimitGate(gate, holdStore, s.logger)
+	authTransport := upstreamhttp.NewTransport(s.rateLimits, upstreamhttp.AuthFunc(s.authForURL))
 	metadata := *safeClient
 	metadata.Timeout = s.cfg.ParseHTTPTimeout()
 	metadata.Transport = authTransport
