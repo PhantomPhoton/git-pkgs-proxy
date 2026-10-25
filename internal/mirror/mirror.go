@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -284,7 +285,7 @@ func (m *Mirror) mirrorFiles(ctx context.Context, pv PackageVersion, tracker *pr
 		if name == "" {
 			name, version = pv.Name, pv.Version
 		}
-		result, err := m.proxy.GetOrFetchArtifactFromURLWithIntegrity(ctx, pv.Ecosystem, name, version, file.Filename, file.URL, file.Integrity)
+		result, err := m.proxy.GetOrFetchArtifactFromURLWithDigest(ctx, pv.Ecosystem, name, version, file.Filename, file.URL, fileDigest(file.Integrity))
 		if err != nil {
 			fail(fmt.Errorf("%s: %w", file.Filename, err))
 			return
@@ -313,6 +314,18 @@ func (m *Mirror) mirrorFiles(ctx context.Context, pv PackageVersion, tracker *pr
 			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version,
 			"files", fetched, "size", size)
 	}
+}
+
+// fileDigest returns the SHA-256 of one file as a digest, which is checked
+// against that file alone. The integrity GetOrFetchArtifactFromURLWithIntegrity
+// takes is kept with the version instead, and the files of a version that
+// share a name and version would overwrite each other's. Other checksums are
+// not checked, as the download handlers don't check them either.
+func fileDigest(integrity string) string {
+	if sum, ok := strings.CutPrefix(integrity, "sha256-"); ok {
+		return "sha256:" + sum
+	}
+	return ""
 }
 
 // fileLister lists files from where Versions lists versions, so both come
