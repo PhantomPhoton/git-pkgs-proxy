@@ -129,8 +129,7 @@ func genericSwiftRegistry(pkg *purl.PURL) (scope, name string, ok bool) {
 // swift-registry spelling is the proxy's own, so it is mapped here first.
 func identify(pkg *purl.PURL) identity {
 	if scope, name, ok := genericSwiftRegistry(pkg); ok {
-		// Registry identities ignore case.
-		pkg = purl.New("swift", strings.ToLower(scope), strings.ToLower(name), pkg.Version, nil)
+		pkg = purl.New("swift", scope, name, pkg.Version, nil)
 	}
 	c := pkg.ComparisonForm()
 	var channel string
