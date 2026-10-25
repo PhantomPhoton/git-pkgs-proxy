@@ -52,7 +52,9 @@ func mirrorWithConfig(t *testing.T, cfg *config.Config, purls ...string) (*mirro
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	proxy, _ := NewMirrorProxy(cfg, db, store, logger)
-	progress, err := mirror.New(proxy, db, store, logger, 1).Run(context.Background(), &mirror.PURLSource{PURLs: purls})
+	m := mirror.New(proxy, db, store, logger, 1)
+	m.Versions = NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
+	progress, err := m.Run(context.Background(), &mirror.PURLSource{PURLs: purls})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}

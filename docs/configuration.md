@@ -1506,6 +1506,8 @@ The `proxy mirror` command pre-populates the cache from various sources. It acce
 
 Packages are downloaded from the configured upstreams: npm, cargo, gem, golang, hex, pub, maven and nuget from `upstream.npm`, `upstream.cargo_download`, `upstream.gem`, `upstream.go`, `upstream.hex`, `upstream.pub`, `upstream.maven` and `upstream.nuget`. npm packages in `upstream.npm_routes` come from their route and are cached under the route's keys, so clients get them from the cache as they would after an install. Mirror API jobs do the same.
 
+A PyPI version is mirrored with every file `upstream.pypi` lists for it: the sdist and each wheel, checked against the listed sha256 and cached under the name and version the download handler reads from the filename. Add the `file_name` qualifier to mirror one file, for example `pkg:pypi/zope.interface@7.2?file_name=zope.interface-7.2-cp312-cp312-macosx_11_0_arm64.whl`.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |

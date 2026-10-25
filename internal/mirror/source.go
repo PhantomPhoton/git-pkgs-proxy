@@ -14,7 +14,7 @@ type PackageVersion struct {
 	Name      string
 	Version   string
 	// Qualifiers are the PURL qualifiers. Images use repository_url, tag and
-	// arch.
+	// arch; PyPI uses file_name to mirror one file of the version.
 	Qualifiers map[string]string
 	// Platforms limit which platforms of an image index are mirrored.
 	Platforms []string
@@ -78,6 +78,8 @@ func (s *PURLSource) Enumerate(ctx context.Context, fn func(PackageVersion) erro
 			if isImageEcosystem(ecosystem) {
 				pv.Qualifiers = p.Qualifiers.Map()
 				pv.Platforms = s.Platforms
+			} else if fileName := p.Qualifier("file_name"); fileName != "" && ecosystem == "pypi" {
+				pv.Qualifiers = map[string]string{"file_name": fileName}
 			}
 			if err := fn(pv); err != nil {
 				return err
