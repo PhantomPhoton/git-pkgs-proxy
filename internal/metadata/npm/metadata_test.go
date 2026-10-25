@@ -151,3 +151,17 @@ func TestNPMRewriteMetadataDuplicateKeys(t *testing.T) {
 		t.Errorf("rewrite = %s", out)
 	}
 }
+
+func TestAbbreviated(t *testing.T) {
+	for body, want := range map[string]bool{
+		`{"name":"demo","modified":"2024-01-01T00:00:00Z","versions":{}}`:           true,
+		`{"name":"demo","modified":"2024-01-01T00:00:00Z","time":{},"versions":{}}`: false,
+		`{"name":"demo","versions":{}}`:                                             false,
+		`["modified"]`:                                                              false,
+		`{"modified":`:                                                              false,
+	} {
+		if got := Abbreviated([]byte(body)); got != want {
+			t.Errorf("Abbreviated(%s) = %v, want %v", body, got, want)
+		}
+	}
+}

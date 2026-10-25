@@ -1,3 +1,12 @@
+// Package jsonscan walks a JSON document in place, reporting where
+// object members sit as offsets into the original bytes. It lets a caller
+// read or replace one value in a large metadata document without decoding the
+// rest of it into Go values, which for an npm packument costs many times the
+// document's size.
+//
+// It checks structure only as far as it needs to find its way through
+// the document. Callers that copy unvisited bytes into a response validate the
+// whole document first with json.Valid.
 package jsonscan
 
 import (
@@ -6,16 +15,7 @@ import (
 	"errors"
 )
 
-// The helpers in this file walk a JSON document in place, reporting where
-// object members sit as offsets into the original bytes. They let a handler
-// read or replace one value in a large metadata document without decoding the
-// rest of it into Go values, which for an npm packument costs many times the
-// document's size.
-//
-// They check structure only as far as they need to find their way through
-// the document. Callers that copy unvisited bytes into a response validate the
-// whole document first with json.Valid.
-
+// ErrMalformed is returned when the document is not well-formed JSON.
 var ErrMalformed = errors.New("malformed JSON")
 
 // ErrNotObject is returned when a value expected to be an object is not.

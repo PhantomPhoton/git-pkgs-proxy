@@ -91,6 +91,25 @@ func Version(packageName, specifier string, packument []byte, options Options) (
 	return out.Bytes(), nil
 }
 
+// Abbreviated reports whether body is an abbreviated packument: one with the
+// top-level "modified" field the abbreviated format carries and no "time"
+// map, which cooldown needs. A full document without a time map, as some
+// registries serve, is not abbreviated, and neither is anything that is not
+// a JSON object.
+func Abbreviated(body []byte) bool {
+	var hasTime, hasModified bool
+	err := jsonscan.EachMember(body, func(m jsonscan.Member) error {
+		switch key := m.Key(body); {
+		case jsonscan.KeyIs(key, "time"):
+			hasTime = true
+		case jsonscan.KeyIs(key, "modified"):
+			hasModified = true
+		}
+		return nil
+	})
+	return err == nil && hasModified && !hasTime
+}
+
 func (h *transformer) rewriteMetadataWithLocal(packageName string, body []byte, local []LocalVersion) ([]byte, []string, error) {
 	doc, err := indexNPMPackument(body)
 	if err != nil {

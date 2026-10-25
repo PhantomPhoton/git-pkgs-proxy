@@ -329,23 +329,12 @@ func (h *NPMHandler) packumentValidator() func([]byte) error {
 	return requireFullPackument
 }
 
-// requireFullPackument rejects an abbreviated packument: one with the
-// top-level "modified" field the abbreviated format carries and no "time"
-// map. A full document without a time map, as some registries serve, is
-// let through as before, and so is anything that is not a JSON object,
-// leaving it to the usual handling.
+// requireFullPackument rejects an abbreviated packument (see
+// npm.Abbreviated). A full document without a time map, as some registries
+// serve, is let through as before, and so is anything that is not a JSON
+// object, leaving it to the usual handling.
 func requireFullPackument(body []byte) error {
-	var hasTime, hasModified bool
-	err := jsonscan.EachMember(body, func(m jsonscan.Member) error {
-		switch key := m.Key(body); {
-		case jsonscan.KeyIs(key, "time"):
-			hasTime = true
-		case jsonscan.KeyIs(key, "modified"):
-			hasModified = true
-		}
-		return nil
-	})
-	if err == nil && hasModified && !hasTime {
+	if npm.Abbreviated(body) {
 		return errAbbreviatedPackument
 	}
 	return nil
