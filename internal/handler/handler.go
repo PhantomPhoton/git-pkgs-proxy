@@ -44,6 +44,18 @@ func containsPathTraversal(path string) bool {
 	return false
 }
 
+// rejectQueryChars refuses a decoded path containing '?' or '#', which would cut
+// the upstream URL short and cache one file under another's name.
+func rejectQueryChars(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.ContainsAny(r.URL.Path, "?#") {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func hasDotDotSegment(path string) bool {
 	path = strings.ReplaceAll(path, "\\", "/")
 	for segment := range strings.SplitSeq(path, "/") {
