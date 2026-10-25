@@ -99,6 +99,7 @@ func TestMirrorVersionsURL(t *testing.T) {
 	custom.Cargo = "https://index.example.com"
 	custom.Conda = "https://conda.example.com"
 	custom.Julia = "https://julia.example.com"
+	custom.Swift = "https://swift.example.com/registry/"
 
 	tests := []struct {
 		name      string
@@ -129,7 +130,7 @@ func TestMirrorVersionsURL(t *testing.T) {
 		{"julia default", config.Default().Upstream, "julia", "JSON", "", ""},
 		{"julia server", custom, "julia", "JSON", "", "upstream.julia"},
 		{"helm", custom, "helm", "nginx", "", "give a version"},
-		{"swift", custom, "swift", "apple/swift-nio", "", "give a version"},
+		{"swift", custom, "swift", "apple.swift-nio", "https://swift.example.com/registry", ""},
 		{"apk", custom, "apk", "curl", "", "give a version"},
 	}
 	for _, tt := range tests {

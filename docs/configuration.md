@@ -1328,6 +1328,8 @@ Some metadata never changes once published, and is cached like an artifact, with
 
 Composer archive downloads look up their upstream URL in the same cached metadata, so an archive is resolved without asking Packagist again and stays installable while it is down. Only a version or file the cached metadata does not list yet is looked up upstream. With or without `cache_metadata`, a cached archive of a tagged release from the default repository is served without any metadata lookup; with cooldown enabled it is checked against the publish time recorded when the archive was first resolved. Branch (dev) versions, routed packages and archives picked by a query string such as `?sha=` are always resolved from the metadata.
 
+Swift release lists and manifests are cached with the upstream's `Link` header, which carries the release list's pages and the version-specific manifests a client chooses from.
+
 The `proxy mirror` command always enables metadata caching regardless of this setting.
 
 ### Metadata TTL
@@ -1565,6 +1567,8 @@ A conda version is mirrored with every build anaconda.org lists for it, across a
 
 A Composer release is mirrored with the dist archive `upstream.composer` lists for it, checked against its shasum when one is listed, and cached under the name `/composer/files/...` serves it as. Give the version as the repository lists it, for example `pkg:composer/monolog/monolog@3.8.1`. Branches such as `dev-main` aren't mirrored, since their archive changes with every push, and neither are packages in `upstream.composer_routes`.
 
+A Swift release is mirrored from `upstream.swift` with its source archive, checked against the SHA-256 checksum in the release metadata and cached under the key `/swift/{scope}/{name}/{version}.zip` serves. Give the registry scope as the namespace, for example `pkg:swift/apple/swift-argument-parser@1.5.0` for `apple.swift-argument-parser`. A PURL whose namespace is a source repository, such as `pkg:swift/github.com/apple/swift-argument-parser`, doesn't name a registry identity and is refused. The release metadata, the package's release list and the release's `Package.swift` with its version-specific manifests are stored in the metadata cache too, so `swift package resolve` works with the upstream unreachable. Serving them, and the archive, offline needs `cache_metadata` on the server, since the archive is served with the checksum from the release metadata.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |
@@ -1585,7 +1589,7 @@ proxy mirror pkg:npm/lodash@4.17.21 pkg:cargo/serde@1.0.0
 
 ### Unversioned PURLs
 
-A PURL without a version, here or in a mirror API job, mirrors every version the configured upstream lists, through the same client, so `upstream.auth` and `upstream.allow_private_hosts` apply. npm packages in `upstream.npm_routes` are listed from their route. Listing works for npm, gem, golang, hex (from `upstream.hex_api`), pub, pypi, maven, nuget, composer, cran and brew. For cargo, conda and julia the upstream doesn't serve the API used for listing, so versions come from the public registry while the upstream is the default one; with another upstream, and for Composer packages in `upstream.composer_routes` or any other ecosystem, give a version.
+A PURL without a version, here or in a mirror API job, mirrors every version the configured upstream lists, through the same client, so `upstream.auth` and `upstream.allow_private_hosts` apply. npm packages in `upstream.npm_routes` are listed from their route. Listing works for npm, gem, golang, hex (from `upstream.hex_api`), pub, pypi, maven, nuget, composer, cran, brew and swift. For cargo, conda and julia the upstream doesn't serve the API used for listing, so versions come from the public registry while the upstream is the default one; with another upstream, and for Composer packages in `upstream.composer_routes` or any other ecosystem, give a version.
 
 ### Container images
 

@@ -57,6 +57,12 @@ func (r RegistryVersions) FindVersion(ctx context.Context, ecosystem, name, vers
 }
 
 func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name string) ([]registries.Version, error) {
+	if ecosystem == "swift" {
+		var err error
+		if name, err = swiftIdentity(name); err != nil {
+			return nil, err
+		}
+	}
 	purlType := purl.EcosystemToPURLType(ecosystem)
 	var baseURL string
 	if r.URL != nil {

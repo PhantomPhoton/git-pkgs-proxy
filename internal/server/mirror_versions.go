@@ -80,6 +80,8 @@ func mirrorVersionsURL(u config.UpstreamConfig, purlType, name string) (string, 
 		return "", nil
 	case "julia":
 		return publicOnly("upstream.julia", u.Julia, d.Julia)
+	case "swift":
+		return upstreamOr(u.Swift, d.Swift), nil
 	default:
 		return "", fmt.Errorf("listing %s versions isn't supported; give a version", purlType)
 	}
