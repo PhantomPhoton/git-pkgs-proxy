@@ -308,7 +308,7 @@ HTTP protocol handlers for each registry type.
 **GitHandler:**
 - Serves `/git/{name}/{repo}` from `internal/gitcache`, read-only over smart HTTP
 - Validates repository paths and the `repos` allowlist, and maps cache errors to statuses
-- Serves the Git LFS API under `{repo}.git/info/lfs/`: forwards download batches upstream and points each object at `objects/{oid}/{size}`, which is served from the artifact cache (ecosystem `git`, name `{name}/{repo}`, version the object ID); a miss asks the upstream batch API for a fresh download URL and checks the object against its sha256 ID
+- Serves the Git LFS API under `{repo}.git/info/lfs/`: forwards download batches upstream and points each object at `objects/{oid}/{size}`, which is served from the artifact cache (ecosystem `git`, name `{name}/{repo}`, version the object ID); a miss asks the upstream batch API for a fresh download URL, recorded without its signed query, and checks the object against its sha256 ID; a batch the upstream can't answer is answered from the cache
 
 ### `internal/gitcache`
 

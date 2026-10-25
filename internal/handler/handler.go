@@ -2332,9 +2332,59 @@ type observedFetcher interface {
 	FetchObservedWithHeaders(ctx context.Context, url string, headers http.Header) (*fetch.ObservedArtifact, error)
 }
 
-// fetchUpstream fetches downloadURL, reporting its Last-Modified when ctx
-// asks for it.
+type signedDownloadKey struct{}
+
+// signedDownload is a download URL carrying a signature, and the URL without
+// its query that stands for it everywhere but the request itself.
+type signedDownload struct {
+	signed, recorded string
+}
+
+// withSignedDownload returns a context under which a fetch of the returned
+// URL requests signedURL instead. The returned URL, signedURL without its
+// query and fragment, is what is logged, recorded with the artifact and used
+// to coalesce fetches, so a signature that grants access to the object
+// stays out of logs and the database.
+func withSignedDownload(ctx context.Context, signedURL string) (context.Context, string) {
+	u, err := url.Parse(signedURL)
+	if err != nil {
+		return ctx, signedURL
+	}
+	u.User = nil
+	u.RawQuery, u.ForceQuery = "", false
+	u.Fragment, u.RawFragment = "", ""
+	recorded := u.String()
+	return context.WithValue(ctx, signedDownloadKey{}, signedDownload{signed: signedURL, recorded: recorded}), recorded
+}
+
+// redactedFetchError is a fetch error whose text names the recorded URL
+// rather than the signed one.
+type redactedFetchError struct {
+	err      error
+	download signedDownload
+}
+
+func (e *redactedFetchError) Error() string {
+	return strings.ReplaceAll(e.err.Error(), e.download.signed, e.download.recorded)
+}
+
+func (e *redactedFetchError) Unwrap() error { return e.err }
+
+// fetchUpstream fetches downloadURL, or the signed URL ctx gives for it,
+// reporting its Last-Modified when ctx asks for it.
 func (p *Proxy) fetchUpstream(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
+	download, ok := ctx.Value(signedDownloadKey{}).(signedDownload)
+	if !ok || download.recorded != downloadURL {
+		return p.fetchUpstreamURL(ctx, downloadURL, headers)
+	}
+	artifact, err := p.fetchUpstreamURL(ctx, download.signed, headers)
+	if err != nil {
+		return nil, &redactedFetchError{err: err, download: download}
+	}
+	return artifact, nil
+}
+
+func (p *Proxy) fetchUpstreamURL(ctx context.Context, downloadURL string, headers http.Header) (*fetch.Artifact, error) {
 	report, _ := ctx.Value(upstreamLastModifiedKey{}).(func(time.Time))
 	observer, ok := p.Fetcher.(observedFetcher)
 	if report == nil || !ok {

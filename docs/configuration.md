@@ -847,9 +847,15 @@ a fresh batch request returns. That URL is often on another host than the
 Git server, such as GitHub's or Hugging Face's object storage; the proxy
 fetches from whatever host the upstream names, with the usual address checks,
 and `upstream.auth` credentials only go to the hosts they are configured for.
-An object is only cached once its content matches its sha256 object ID.
-Objects are cached per repository, so one repository's objects are never
-served for another.
+Download URLs are often signed; only the URL without its query is logged
+and recorded with the object. An object is only cached once its content
+matches its sha256 object ID. Objects are cached per repository, so one
+repository's objects are never served for another. When the upstream can't
+be reached or fails, a batch is answered with the objects cached for the
+repository, and the others are reported as unavailable; a batch the upstream
+refuses is refused. A cached object stays available after it is removed
+upstream, until retention removes it or you delete it through the
+[cache delete API](#cache-delete-api).
 
 Pushing, LFS uploads and locking, and the dumb HTTP protocol are not
 supported. The settings

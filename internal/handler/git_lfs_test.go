@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,17 +20,25 @@ import (
 
 const lfsTestContent = "large file content"
 
+// lfsSignature is the signature in the upstream's download URLs, which must
+// not reach logs or the database.
+const lfsSignature = "s3cr3t-signature"
+
 // lfsUpstream is a Git host with an LFS batch API whose download hrefs point
 // at a separate object store, as GitHub's do. The store only serves objects
-// to requests carrying the header the batch response gave.
+// to requests carrying the header and signed URL the batch response gave.
 type lfsUpstream struct {
 	git, store *httptest.Server
 	oid        string
 	content    atomic.Value // string the store serves for oid
 	batches    atomic.Int32
 	downloads  atomic.Int32
+	// batchStatus, when set, is the status the batch API fails with.
+	batchStatus atomic.Int32
 	// lastBatch is the last batch request the upstream got.
 	lastBatch atomic.Value
+	// logs is what the proxy logged.
+	logs bytes.Buffer
 }
 
 func newLFSUpstream(t *testing.T) *lfsUpstream {
@@ -37,7 +47,8 @@ func newLFSUpstream(t *testing.T) *lfsUpstream {
 	u := &lfsUpstream{oid: hex.EncodeToString(sum[:])}
 	u.content.Store(lfsTestContent)
 	u.store = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/objects/"+u.oid || r.Header.Get("X-Signed") != "token" {
+		if r.URL.Path != "/objects/"+u.oid || r.Header.Get("X-Signed") != "token" ||
+			r.URL.Query().Get("Signature") != lfsSignature {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -50,6 +61,10 @@ func newLFSUpstream(t *testing.T) *lfsUpstream {
 			return
 		}
 		u.batches.Add(1)
+		if status := u.batchStatus.Load(); status != 0 {
+			http.Error(w, "failing", int(status))
+			return
+		}
 		var req lfsBatchRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -65,7 +80,7 @@ func newLFSUpstream(t *testing.T) *lfsUpstream {
 			}
 			resp.Objects = append(resp.Objects, lfsObjectResponse{OID: object.OID, Size: object.Size,
 				Actions: map[string]lfsAction{"download": {
-					Href:   u.store.URL + "/objects/" + u.oid,
+					Href:   u.store.URL + "/objects/" + u.oid + "?Expires=1&Signature=" + lfsSignature,
 					Header: map[string]string{"X-Signed": "token"},
 				}}})
 		}
@@ -84,6 +99,7 @@ func newLFSHandler(t *testing.T, u *lfsUpstream, repos ...string) *GitHandler {
 	t.Helper()
 	proxy, _, store, _ := setupTestProxy(t)
 	store.seekable = true
+	proxy.Logger = slog.New(slog.NewTextHandler(&u.logs, nil))
 	proxy.HTTPClient = u.git.Client()
 	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(u.store.Client()), fetch.WithMaxRetries(0))
 	proxy.Fetcher = fetcher
@@ -209,5 +225,106 @@ func TestGitLFSRefusals(t *testing.T) {
 	}
 	if u.downloads.Load() != 0 {
 		t.Errorf("downloads = %d, want none", u.downloads.Load())
+	}
+}
+
+func TestGitLFSKeepsSignedURLsOutOfLogsAndDatabase(t *testing.T) {
+	u := newLFSUpstream(t)
+	h := newLFSHandler(t, u)
+	path := fmt.Sprintf("/up/acme/widget.git/info/lfs/objects/%s/%d", u.oid, len(lfsTestContent))
+
+	if w := lfsRequest(h, http.MethodGet, path, ""); w.Code != http.StatusOK {
+		t.Fatalf("GET: status %d, body %s", w.Code, w.Body)
+	}
+	_, versionPURL, err := packagePURLStrings(gitEcosystem, "up/acme/widget", u.oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := h.proxy.DB.GetArtifact(versionPURL, u.oid)
+	if err != nil || record == nil {
+		t.Fatalf("artifact record: %v, %v", record, err)
+	}
+	if want := u.store.URL + "/objects/" + u.oid; record.UpstreamURL != want {
+		t.Errorf("recorded upstream URL %q, want %q", record.UpstreamURL, want)
+	}
+
+	// A failed download is logged without the signature too, although the
+	// connection error names the URL.
+	other := newLFSUpstream(t)
+	other.store.Close()
+	h = newLFSHandler(t, other)
+	if w := lfsRequest(h, http.MethodGet, path, ""); w.Code == http.StatusOK {
+		t.Fatalf("GET from an unreachable store: status %d", w.Code)
+	}
+	if !strings.Contains(other.logs.String(), other.store.URL+"/objects/"+other.oid) {
+		t.Fatalf("logs don't name the failed download:\n%s", other.logs.String())
+	}
+	for _, logs := range []string{u.logs.String(), other.logs.String()} {
+		if strings.Contains(logs, lfsSignature) {
+			t.Errorf("logs contain the download URL's signature:\n%s", logs)
+		}
+	}
+}
+
+func TestGitLFSBatchFromCacheWhenUpstreamFails(t *testing.T) {
+	u := newLFSUpstream(t)
+	h := newLFSHandler(t, u)
+	size := int64(len(lfsTestContent))
+	missing := strings.Repeat("0", 64)
+	batch := lfsBatchBody("download", lfsObject{OID: u.oid, Size: size}, lfsObject{OID: missing, Size: 3})
+	const batchPath = "/up/acme/widget.git/info/lfs/objects/batch"
+
+	// Nothing cached yet: a failing upstream fails the batch.
+	u.batchStatus.Store(http.StatusServiceUnavailable)
+	if w := lfsRequest(h, http.MethodPost, batchPath, batch); w.Code != http.StatusBadGateway {
+		t.Fatalf("batch with nothing cached: status %d, body %s; want 502", w.Code, w.Body)
+	}
+	u.batchStatus.Store(0)
+	if w := lfsRequest(h, http.MethodGet, fmt.Sprintf("/up/acme/widget.git/info/lfs/objects/%s/%d", u.oid, size), ""); w.Code != http.StatusOK {
+		t.Fatalf("GET: status %d, body %s", w.Code, w.Body)
+	}
+
+	// A refusal is the upstream's answer, not an outage.
+	u.batchStatus.Store(http.StatusForbidden)
+	if w := lfsRequest(h, http.MethodPost, batchPath, batch); w.Code != http.StatusBadGateway {
+		t.Errorf("batch the upstream refused: status %d, body %s; want 502", w.Code, w.Body)
+	}
+
+	u.git.Close()
+	w := lfsRequest(h, http.MethodPost, batchPath, batch)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch with the upstream down: status %d, body %s", w.Code, w.Body)
+	}
+	var resp lfsBatchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Objects) != 2 {
+		t.Fatalf("objects = %+v, want the two requested", resp.Objects)
+	}
+	want := fmt.Sprintf("http://proxy.test/git/up/acme/widget.git/info/lfs/objects/%s/%d", u.oid, size)
+	if got := resp.Objects[0]; got.Actions["download"].Href != want || !got.Authenticated || got.Error != nil {
+		t.Errorf("cached object = %+v, want a download from %s", got, want)
+	}
+	if got := resp.Objects[1]; got.Actions != nil || got.Error == nil {
+		t.Errorf("uncached object = %+v, want an error", got)
+	}
+}
+
+func TestGitLFSHeadDoesNotDownload(t *testing.T) {
+	u := newLFSUpstream(t)
+	h := newLFSHandler(t, u)
+	path := fmt.Sprintf("/up/acme/widget.git/info/lfs/objects/%s/%d", u.oid, len(lfsTestContent))
+
+	w := lfsRequest(h, http.MethodHead, path, "")
+	if w.Code != http.StatusOK || w.Header().Get("Content-Length") != fmt.Sprint(len(lfsTestContent)) {
+		t.Errorf("HEAD: status %d, Content-Length %q", w.Code, w.Header().Get("Content-Length"))
+	}
+	if u.downloads.Load() != 0 {
+		t.Errorf("downloads = %d, want none for a HEAD", u.downloads.Load())
+	}
+	missing := fmt.Sprintf("/up/acme/widget.git/info/lfs/objects/%s/3", strings.Repeat("0", 64))
+	if w := lfsRequest(h, http.MethodHead, missing, ""); w.Code != http.StatusNotFound {
+		t.Errorf("HEAD of a missing object: status %d, want 404", w.Code)
 	}
 }
