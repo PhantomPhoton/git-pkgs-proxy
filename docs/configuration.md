@@ -39,6 +39,10 @@ scanning:
 
 These are independent limits, not reserved time slices: a download approaching 10 minutes followed by a 16-minute scan would still exceed an 18-minute response deadline. Any reverse proxy in front of the server also needs sufficient timeout allowance. The upstream transport's existing response-header timeout remains unchanged.
 
+### Memory limit
+
+On Linux, when the process runs under a cgroup memory limit, such as a container's `--memory` or a Kubernetes memory limit, `proxy serve` sets Go's soft memory limit to 80% of it and log the value at startup (`set Go memory limit from cgroup`). The garbage collector then runs more often as memory use approaches the limit, rather than letting the heap grow until the container is killed. The remaining 20% is left for memory Go doesn't manage, such as `git` processes the proxy runs. Set the `GOMEMLIMIT` environment variable to choose the value yourself, or `GOMEMLIMIT=off` to disable it.
+
 ## Storage
 
 The proxy stores cached artifacts using gocloud.dev/blob, supporting local filesystem and S3-compatible storage.

@@ -330,6 +330,10 @@ HTTP server setup, web UI, and API handlers.
 - Enrichment API for package metadata, vulnerability scanning, and outdated detection
 - Health, stats, and Prometheus metrics endpoints. `/health` runs an active write → size-check → read → verify → delete probe against the storage backend and returns a structured JSON response (`HealthResponse`) with `"ok"` / `"error"` status per subsystem. Probe results are cached (default 30 s, configurable via `health.storage_probe_interval`) to avoid overwhelming remote backends. The response also carries a `circuit_breakers` map reporting each upstream's artifact-fetch breaker as `"open"` or `"closed"`, keyed by the host fetched from (or an opaque placeholder where the fetch URL has no host to read); the same state is published as the `proxy_circuit_breaker_state` gauge on each `/metrics` scrape. An open breaker leaves the overall status `"ok"` — it describes an upstream, not this proxy.
 
+### `internal/memlimit`
+
+Sets Go's soft memory limit to 80% of the cgroup memory limit at startup on Linux, unless `GOMEMLIMIT` is set. See "Memory limit" in the configuration docs.
+
 ### `internal/metrics`
 
 Prometheus metrics for cache performance, upstream latency, storage operations, and active requests. See the Monitoring section of the README for the full metric list.

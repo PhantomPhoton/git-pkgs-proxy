@@ -125,6 +125,7 @@ import (
 	"github.com/git-pkgs/proxy/internal/config"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
+	"github.com/git-pkgs/proxy/internal/memlimit"
 	"github.com/git-pkgs/proxy/internal/mirror"
 	"github.com/git-pkgs/proxy/internal/server"
 	"github.com/git-pkgs/proxy/internal/storage"
@@ -323,6 +324,7 @@ func runServe() {
 
 	// Setup logger
 	logger := setupLogger(cfg.Log.Level, cfg.Log.Format)
+	memlimit.Apply(logger)
 
 	// Create and start server
 	srv, err := server.New(cfg, logger, server.BuildInfo{
