@@ -393,7 +393,7 @@ func (h *ContainerHandler) handleBlobDownload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	h.proxy.Logger.Info("container blob request", "name", upstreamName, "digest", digest)
+	h.proxy.Logger.Debug("container blob request", "name", upstreamName, "digest", digest)
 
 	filename := digest
 	cached, err := h.proxy.GetCachedArtifact(r.Context(), "oci", cacheName, digest, filename)
@@ -481,7 +481,7 @@ func (h *ContainerHandler) handleManifest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	h.proxy.Logger.Info("container manifest request", "name", upstreamName, "reference", reference)
+	h.proxy.Logger.Debug("container manifest request", "name", upstreamName, "reference", reference)
 	if h.manifestDenied(w, cacheName, reference) {
 		return
 	}

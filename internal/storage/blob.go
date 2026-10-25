@@ -255,6 +255,11 @@ func (b *Blob) Open(ctx context.Context, path string) (io.ReadCloser, error) {
 	return r, nil
 }
 
+// ReadsSeekable reports that Open returns seekable readers: an *os.File for
+// file:// buckets and a *blob.Reader, which seeks with a ranged read,
+// otherwise.
+func (b *Blob) ReadsSeekable() bool { return true }
+
 func (b *Blob) Exists(ctx context.Context, path string) (bool, error) {
 	exists, err := b.bucket.Exists(ctx, path)
 	if err != nil {

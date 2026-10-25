@@ -1364,6 +1364,8 @@ hosted:
 
 `hosted.enabled` cannot be combined with `storage.cache_artifacts: false`.
 
+With `hosted.enabled` off, archives pushed earlier stay in storage but are not served as hosted packages: package metadata doesn't list them, `/generic/hosted/` isn't served, and npm and Composer downloads take the normal proxy path, cooldown included. An upstream copy still never replaces a pushed archive.
+
 ### Pushing a patched package
 
 1. Build the archive with the original package name and the version you push in its manifest (`package.json` or `composer.json`), e.g. `request-2.88.3.tgz`.

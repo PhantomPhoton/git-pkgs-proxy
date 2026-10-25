@@ -9,6 +9,7 @@ import (
 
 	"github.com/git-pkgs/proxy/internal/accesslog"
 	"github.com/git-pkgs/proxy/internal/config"
+	"github.com/git-pkgs/proxy/internal/handler"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -35,6 +36,19 @@ func RequestIDMiddleware(next http.Handler) http.Handler {
 // GetRequestID retrieves the request ID from context.
 func GetRequestID(ctx context.Context) string {
 	return accesslog.RequestID(ctx)
+}
+
+// markRequestContext marks each client request so upstream fetches it starts
+// outlive a client that hangs up, and so a HEAD answered from the cache does
+// not open the stored object.
+func markRequestContext(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := handler.DetachUpstreamFetch(r.Context())
+		if r.Method == http.MethodHead {
+			ctx = handler.ServingHead(ctx)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // LoggerMiddleware logs HTTP requests with request ID correlation.

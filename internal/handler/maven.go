@@ -236,7 +236,7 @@ func (h *MavenHandler) handleDownload(w http.ResponseWriter, r *http.Request, so
 	// Maven uses group:artifact as the package name
 	name := fmt.Sprintf("%s:%s", group, artifact)
 
-	h.proxy.Logger.Info("maven download request", "repository", source.name,
+	h.proxy.Logger.Debug("maven download request", "repository", source.name,
 		"group", group, "artifact", artifact, "version", version, "filename", filename)
 
 	upstreamURL := fmt.Sprintf("%s/%s", source.upstreamURL, urlPath)

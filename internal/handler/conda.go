@@ -124,7 +124,7 @@ func (h *CondaHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Include channel in package name
 	packageName := channel + "/" + name
 
-	h.proxy.Logger.Info("conda download request",
+	h.proxy.Logger.Debug("conda download request",
 		"channel", channel, "arch", arch, "name", name, "version", version)
 
 	upstreamURL := h.upstreamURL + r.URL.Path

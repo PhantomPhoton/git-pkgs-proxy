@@ -143,7 +143,7 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 	pkg := parts[1]
 	packageName := vendor + "/" + pkg
 
-	h.proxy.Logger.Info("composer metadata request", "package", packageName)
+	h.proxy.Logger.Debug("composer metadata request", "package", packageName)
 
 	repoURL, cacheKey := h.sourceFor(packageName)
 	upstreamURL := fmt.Sprintf("%s/p2/%s/%s.json", repoURL, vendor, pkg)
@@ -621,7 +621,7 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 
 	packageName := vendor + "/" + pkg
 
-	h.proxy.Logger.Info("composer download request",
+	h.proxy.Logger.Debug("composer download request",
 		"package", packageName, "version", version, "filename", filename)
 
 	local, err := h.proxy.GetLocalArtifact(r.Context(), "composer", packageName, version, filename)

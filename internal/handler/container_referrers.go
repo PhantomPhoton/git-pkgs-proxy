@@ -55,7 +55,7 @@ func (h *ContainerHandler) handleReferrers(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	h.proxy.Logger.Info("container referrers request", "name", upstreamName, "digest", digest)
+	h.proxy.Logger.Debug("container referrers request", "name", upstreamName, "digest", digest)
 	h.serveReferrers(w, r, registryURL, upstreamName, digest)
 }
 
