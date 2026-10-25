@@ -265,6 +265,34 @@ func (db *DB) GetCachedArtifact(packagePURL, versionPURL, filename string) (*Cac
 	return row.artifact(versionPURL, filename), nil
 }
 
+// StoredContent is a stored object with a given content hash.
+type StoredContent struct {
+	StoragePath string         `db:"storage_path"`
+	Size        int64          `db:"size"`
+	ContentType sql.NullString `db:"content_type"`
+}
+
+// FindStoredContent returns a cached artifact whose content has the sha256
+// hash, under any name, or nil if none is stored. Pushed artifacts are left
+// out.
+func (db *DB) FindStoredContent(hash string) (*StoredContent, error) {
+	var found StoredContent
+	query := db.Rebind(`
+		SELECT storage_path, size, content_type FROM artifacts
+		WHERE content_hash = ? AND storage_path IS NOT NULL AND fetched_at IS NOT NULL
+		  AND size IS NOT NULL AND source <> 'local'
+		LIMIT 1
+	`)
+	err := db.Get(&found, query, hash)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &found, nil
+}
+
 type cachedArtifactRow struct {
 	Ecosystem   string         `db:"ecosystem"`
 	StoragePath string         `db:"storage_path"`

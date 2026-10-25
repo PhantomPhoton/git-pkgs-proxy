@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -64,8 +66,10 @@ type lfsObjectResponse struct {
 }
 
 type lfsAction struct {
-	Href   string            `json:"href"`
-	Header map[string]string `json:"header,omitempty"`
+	Href      string            `json:"href"`
+	Header    map[string]string `json:"header,omitempty"`
+	ExpiresIn int64             `json:"expires_in,omitempty"`
+	ExpiresAt string            `json:"expires_at,omitempty"`
 }
 
 type lfsObjectError struct {
@@ -176,6 +180,9 @@ func (h *GitHandler) serveLFSBatch(w http.ResponseWriter, r *http.Request, repo 
 		if download, ok := object.Actions["download"]; ok && object.Error == nil && download.Href != "" {
 			out.Authenticated = true
 			out.Actions = map[string]lfsAction{"download": {Href: h.lfsObjectURL(repo, object.OID, object.Size)}}
+			// Kept so the client's GET for the object needs no second
+			// batch request.
+			h.lfsDownloads.put(repo.key, lfsObject{OID: object.OID, Size: object.Size}, download, time.Now())
 		}
 		resp.Objects = append(resp.Objects, out)
 	}
@@ -226,50 +233,114 @@ func writeLFSBatch(w http.ResponseWriter, resp lfsBatchResponse) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// serveLFSObject serves an object from the artifact cache, or on a miss asks
-// the upstream batch API for a fresh download URL, fetches it and checks it
-// against its object ID before caching it.
+// serveLFSObject serves an object from the artifact cache. On a miss it
+// takes the download URL from the client's batch, or asks the upstream batch
+// API for a fresh one, and caches the object from there, or from a copy
+// already stored under another repository, once its content matches its
+// object ID.
 func (h *GitHandler) serveLFSObject(w http.ResponseWriter, r *http.Request, repo gitRepository, object lfsObject) {
-	name := repo.lfsName()
-	cached, err := h.proxy.GetCachedArtifact(r.Context(), gitEcosystem, name, object.OID, object.OID)
+	cached, err := h.proxy.GetCachedArtifact(r.Context(), gitEcosystem, repo.lfsName(), object.OID, object.OID)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to read cached LFS object")
 		return
 	}
 	if cached == nil {
-		upstream, err := h.lfsBatch(r.Context(), repo, nil, []lfsObject{object})
-		if err != nil {
-			h.serveLFSUpstreamError(w, r, repo, err)
-			return
-		}
-		download, status, msg := lfsDownload(upstream, object)
-		if status != 0 {
-			lfsError(w, status, msg)
-			return
-		}
-		if r.Method == http.MethodHead {
-			// The upstream has the object, and a HEAD needs no more than
-			// that: fetching it is left to a GET.
-			w.Header().Set("Content-Type", gitLFSObjectMediaType)
-			w.Header().Set("Content-Length", strconv.FormatInt(object.Size, 10))
-			return
-		}
-		header := make(http.Header, len(download.Header))
-		for key, value := range download.Header {
-			header.Set(key, value)
-		}
-		// Download URLs are often signed, granting access to the object
-		// until they expire, so only the URL without its query is logged
-		// and recorded.
-		ctx, recorded := withSignedDownload(r.Context(), download.Href)
-		cached, err = h.proxy.getOrFetchArtifactFromURL(ctx, gitEcosystem, name, object.OID, object.OID,
-			recorded, header, object.OID, "")
-		if err != nil {
-			h.proxy.serveArtifactError(w, err, "failed to fetch LFS object")
+		var ok bool
+		if cached, ok = h.fetchLFSObject(w, r, repo, object); !ok {
 			return
 		}
 	}
 	serveGenericArtifact(w, r, cached)
+}
+
+// fetchLFSObject caches an object the cache doesn't have. When it can't, or
+// the request is a HEAD, it answers the request and returns false.
+func (h *GitHandler) fetchLFSObject(w http.ResponseWriter, r *http.Request, repo gitRepository, object lfsObject) (*CacheResult, bool) {
+	download, kept := h.lfsDownloads.get(repo.key, object, time.Now())
+	if !kept {
+		var ok bool
+		if download, ok = h.lfsFreshDownload(w, r, repo, object); !ok {
+			return nil, false
+		}
+	}
+	if r.Method == http.MethodHead {
+		// The upstream has the object, and a HEAD needs no more than that:
+		// fetching it is left to a GET.
+		w.Header().Set("Content-Type", gitLFSObjectMediaType)
+		w.Header().Set("Content-Length", strconv.FormatInt(object.Size, 10))
+		return nil, false
+	}
+	h.lfsDownloads.drop(repo.key, object.OID)
+	cached, err := h.cacheLFSObject(r.Context(), repo, object, download)
+	if err != nil && kept && retryLFSDownload(r.Context(), err) {
+		// The kept URL may have expired early or been revoked.
+		var ok bool
+		if download, ok = h.lfsFreshDownload(w, r, repo, object); !ok {
+			return nil, false
+		}
+		cached, err = h.cacheLFSObject(r.Context(), repo, object, download)
+	}
+	if err != nil {
+		h.proxy.serveArtifactError(w, err, "failed to fetch LFS object")
+		return nil, false
+	}
+	return cached, true
+}
+
+// lfsFreshDownload asks the upstream batch API for object's download. When
+// there is none it answers the request and returns false.
+func (h *GitHandler) lfsFreshDownload(w http.ResponseWriter, r *http.Request, repo gitRepository, object lfsObject) (lfsAction, bool) {
+	upstream, err := h.lfsBatch(r.Context(), repo, nil, []lfsObject{object})
+	if err != nil {
+		h.serveLFSUpstreamError(w, r, repo, err)
+		return lfsAction{}, false
+	}
+	download, status, msg := lfsDownload(upstream, object)
+	if status != 0 {
+		lfsError(w, status, msg)
+		return lfsAction{}, false
+	}
+	return download, true
+}
+
+// cacheLFSObject caches object, which the upstream offers as download. A
+// copy already stored under another name, such as by a fork of the
+// repository, saves the download.
+func (h *GitHandler) cacheLFSObject(ctx context.Context, repo gitRepository, object lfsObject, download lfsAction) (*CacheResult, error) {
+	header := make(http.Header, len(download.Header))
+	for key, value := range download.Header {
+		header.Set(key, value)
+	}
+	// Download URLs are often signed, granting access to the object until
+	// they expire, so only the URL without its query is logged and
+	// recorded. The object must have the size the client asked for.
+	ctx, recorded := withSignedDownload(ctx, download.Href, object.Size)
+	if !h.proxy.StreamArtifacts {
+		stored, err := h.proxy.DB.FindStoredContent(object.OID)
+		if err != nil {
+			h.proxy.Logger.Warn("git: looking up a stored copy of an LFS object failed", "oid", object.OID, "error", err)
+		}
+		if stored != nil && stored.Size == object.Size {
+			cached, err := h.proxy.cacheStoredCopy(ctx, gitEcosystem, repo.lfsName(), object.OID, object.OID,
+				recorded, object.OID, stored)
+			if err == nil {
+				return cached, nil
+			}
+			h.proxy.Logger.Warn("git: copying a stored LFS object failed, downloading it", "oid", object.OID, "error", err)
+		}
+	}
+	return h.proxy.getOrFetchArtifactFromURL(ctx, gitEcosystem, repo.lfsName(), object.OID, object.OID,
+		recorded, header, object.OID, "")
+}
+
+// retryLFSDownload reports whether a download from a kept URL failed in a way
+// a fresh URL might not.
+func retryLFSDownload(ctx context.Context, err error) bool {
+	return ctx.Err() == nil &&
+		!errors.Is(err, ErrArtifactDigestMismatch) &&
+		!errors.Is(err, errDownloadSize) &&
+		!errors.Is(err, ErrVersionDenied) &&
+		!errors.Is(err, ErrArtifactBlocked)
 }
 
 // lfsDownload returns the download action the upstream gave for object, or
@@ -286,13 +357,18 @@ func lfsDownload(resp *lfsBatchResponse, object lfsObject) (lfsAction, int, stri
 			return lfsAction{}, http.StatusBadGateway, "upstream refused the object"
 		}
 		download, ok := got.Actions["download"]
-		u, err := url.Parse(download.Href)
-		if !ok || err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		if !ok || !validLFSHref(download.Href) {
 			return lfsAction{}, http.StatusBadGateway, "upstream gave no download for the object"
 		}
 		return download, 0, ""
 	}
 	return lfsAction{}, http.StatusNotFound, "object not found"
+}
+
+// validLFSHref reports whether href is an absolute HTTP(S) URL.
+func validLFSHref(href string) bool {
+	u, err := url.Parse(href)
+	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != ""
 }
 
 // lfsBatch asks the upstream's LFS batch API for download actions for
@@ -382,4 +458,102 @@ func lfsError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", gitLFSMediaType)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": msg})
+}
+
+const (
+	// gitLFSKeptDownloads bounds how many download URLs from batch responses
+	// are kept for the GETs that follow them.
+	gitLFSKeptDownloads = 4096
+	// gitLFSKeptTTL is how long a download URL is kept when the upstream
+	// gives no expiry, and gitLFSKeptMaxTTL how long at most.
+	gitLFSKeptTTL    = 5 * time.Minute
+	gitLFSKeptMaxTTL = time.Hour
+	// gitLFSExpiryMargin is how long before its expiry a URL is no longer
+	// used, so a download started with it can finish.
+	gitLFSExpiryMargin = 30 * time.Second
+)
+
+// lfsDownloads keeps the download actions of recent batch responses, so the
+// GET for an object a client just got in a batch needs no second batch
+// request. They stay in memory, never reach a client and expire with the
+// URLs.
+type lfsDownloads struct {
+	mu      sync.Mutex
+	entries map[lfsDownloadKey]lfsKeptDownload
+}
+
+type lfsDownloadKey struct {
+	repo, oid string
+}
+
+type lfsKeptDownload struct {
+	size    int64
+	action  lfsAction
+	expires time.Time
+}
+
+// put keeps action for object of repo until shortly before it expires.
+func (d *lfsDownloads) put(repo string, object lfsObject, action lfsAction, now time.Time) {
+	if !validLFSHref(action.Href) {
+		return
+	}
+	expires := now.Add(gitLFSKeptTTL)
+	if action.ExpiresIn > 0 || action.ExpiresAt != "" {
+		expires = now.Add(gitLFSKeptMaxTTL)
+	}
+	if action.ExpiresIn > 0 {
+		expires = minTime(expires, now.Add(time.Duration(action.ExpiresIn)*time.Second))
+	}
+	if at, err := time.Parse(time.RFC3339, action.ExpiresAt); err == nil {
+		expires = minTime(expires, at)
+	}
+	expires = expires.Add(-gitLFSExpiryMargin)
+	if !expires.After(now) {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.entries == nil {
+		d.entries = make(map[lfsDownloadKey]lfsKeptDownload)
+	}
+	if len(d.entries) >= gitLFSKeptDownloads {
+		for key, kept := range d.entries {
+			if !kept.expires.After(now) {
+				delete(d.entries, key)
+			}
+		}
+	}
+	if len(d.entries) >= gitLFSKeptDownloads {
+		// Still full: make room by dropping any one.
+		for key := range d.entries {
+			delete(d.entries, key)
+			break
+		}
+	}
+	d.entries[lfsDownloadKey{repo, object.OID}] = lfsKeptDownload{size: object.Size, action: action, expires: expires}
+}
+
+// get returns the action kept for object of repo, if it hasn't expired.
+func (d *lfsDownloads) get(repo string, object lfsObject, now time.Time) (lfsAction, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	kept, ok := d.entries[lfsDownloadKey{repo, object.OID}]
+	if !ok || kept.size != object.Size || !kept.expires.After(now) {
+		return lfsAction{}, false
+	}
+	return kept.action, true
+}
+
+// drop forgets the action kept for oid of repo, once a GET has used it.
+func (d *lfsDownloads) drop(repo, oid string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.entries, lfsDownloadKey{repo, oid})
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }

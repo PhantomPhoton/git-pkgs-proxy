@@ -843,10 +843,16 @@ API under the rewritten remote, at `/git/{name}/{repo}.git/info/lfs`, with no
 further configuration. A batch request is passed to the upstream, which
 decides which objects the repository has, and each download is pointed at
 the proxy. An object the cache doesn't have is fetched from the download URL
-a fresh batch request returns. That URL is often on another host than the
-Git server, such as GitHub's or Hugging Face's object storage; the proxy
-fetches from whatever host the upstream names, with the usual address checks,
-and `upstream.auth` credentials only go to the hosts they are configured for.
+the batch returned, which the proxy keeps in memory until shortly before it
+expires, or else from one a fresh batch request returns. That URL is often
+on another host than the Git server, such as GitHub's or Hugging Face's
+object storage; the proxy fetches from whatever host the upstream names,
+with the usual address checks, and `upstream.auth` credentials only go to
+the hosts they are configured for. A download that isn't the object's size
+is cut off. If the object's content is already stored under another
+repository, such as a fork, it is copied from there instead of downloaded,
+once the upstream has confirmed this repository has it; the copy takes its
+own space.
 Download URLs are often signed; only the URL without its query is logged
 and recorded with the object. An object is only cached once its content
 matches its sha256 object ID. Objects are cached per repository, so one

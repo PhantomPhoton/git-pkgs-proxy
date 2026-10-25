@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/git-pkgs/proxy/internal/config"
 	"github.com/git-pkgs/registries/fetch"
@@ -35,6 +37,9 @@ type lfsUpstream struct {
 	downloads  atomic.Int32
 	// batchStatus, when set, is the status the batch API fails with.
 	batchStatus atomic.Int32
+	// signature is the signature the batch API hands out and the store
+	// accepts; changing it expires the URLs handed out before.
+	signature atomic.Value
 	// lastBatch is the last batch request the upstream got.
 	lastBatch atomic.Value
 	// logs is what the proxy logged.
@@ -46,9 +51,10 @@ func newLFSUpstream(t *testing.T) *lfsUpstream {
 	sum := sha256.Sum256([]byte(lfsTestContent))
 	u := &lfsUpstream{oid: hex.EncodeToString(sum[:])}
 	u.content.Store(lfsTestContent)
+	u.signature.Store(lfsSignature)
 	u.store = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/objects/"+u.oid || r.Header.Get("X-Signed") != "token" ||
-			r.URL.Query().Get("Signature") != lfsSignature {
+			r.URL.Query().Get("Signature") != u.signature.Load().(string) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -56,7 +62,11 @@ func newLFSUpstream(t *testing.T) *lfsUpstream {
 		_, _ = io.WriteString(w, u.content.Load().(string))
 	}))
 	u.git = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/acme/widget.git/info/lfs/objects/batch" {
+		// acme/widget has the object, as does its fork; stranger/widget
+		// exists but doesn't have it.
+		repo, _, _ := strings.Cut(r.URL.Path, ".git/info/lfs/objects/batch")
+		hasObject, exists := map[string]bool{"/acme/widget": true, "/fork/widget": true, "/stranger/widget": false}[repo]
+		if r.Method != http.MethodPost || !exists {
 			http.NotFound(w, r)
 			return
 		}
@@ -73,14 +83,14 @@ func newLFSUpstream(t *testing.T) *lfsUpstream {
 		u.lastBatch.Store(req)
 		resp := lfsBatchResponse{Transfer: "basic"}
 		for _, object := range req.Objects {
-			if object.OID != u.oid {
+			if object.OID != u.oid || !hasObject {
 				resp.Objects = append(resp.Objects, lfsObjectResponse{OID: object.OID, Size: object.Size,
 					Error: &lfsObjectError{Code: http.StatusNotFound, Message: "Object does not exist"}})
 				continue
 			}
 			resp.Objects = append(resp.Objects, lfsObjectResponse{OID: object.OID, Size: object.Size,
 				Actions: map[string]lfsAction{"download": {
-					Href:   u.store.URL + "/objects/" + u.oid + "?Expires=1&Signature=" + lfsSignature,
+					Href:   u.store.URL + "/objects/" + u.oid + "?Expires=1&Signature=" + u.signature.Load().(string),
 					Header: map[string]string{"X-Signed": "token"},
 				}}})
 		}
@@ -326,5 +336,148 @@ func TestGitLFSHeadDoesNotDownload(t *testing.T) {
 	missing := fmt.Sprintf("/up/acme/widget.git/info/lfs/objects/%s/3", strings.Repeat("0", 64))
 	if w := lfsRequest(h, http.MethodHead, missing, ""); w.Code != http.StatusNotFound {
 		t.Errorf("HEAD of a missing object: status %d, want 404", w.Code)
+	}
+}
+
+func TestGitLFSObjectAfterBatchNeedsNoSecondBatch(t *testing.T) {
+	u := newLFSUpstream(t)
+	h := newLFSHandler(t, u)
+	size := int64(len(lfsTestContent))
+	path := fmt.Sprintf("/up/acme/widget.git/info/lfs/objects/%s/%d", u.oid, size)
+	batch := lfsBatchBody("download", lfsObject{OID: u.oid, Size: size})
+
+	if w := lfsRequest(h, http.MethodPost, "/up/acme/widget.git/info/lfs/objects/batch", batch); w.Code != http.StatusOK {
+		t.Fatalf("batch: status %d, body %s", w.Code, w.Body)
+	}
+	if w := lfsRequest(h, http.MethodGet, path, ""); w.Code != http.StatusOK || w.Body.String() != lfsTestContent {
+		t.Fatalf("GET: status %d, body %q", w.Code, w.Body)
+	}
+	if u.batches.Load() != 1 || u.downloads.Load() != 1 {
+		t.Errorf("batches %d, downloads %d; want the client's batch and one download", u.batches.Load(), u.downloads.Load())
+	}
+
+	// A URL that stopped working before its time is replaced by a fresh one.
+	other := newLFSUpstream(t)
+	h = newLFSHandler(t, other)
+	if w := lfsRequest(h, http.MethodPost, "/up/acme/widget.git/info/lfs/objects/batch", batch); w.Code != http.StatusOK {
+		t.Fatalf("batch: status %d, body %s", w.Code, w.Body)
+	}
+	other.signature.Store("rotated")
+	if w := lfsRequest(h, http.MethodGet, path, ""); w.Code != http.StatusOK || w.Body.String() != lfsTestContent {
+		t.Fatalf("GET with a revoked URL: status %d, body %q", w.Code, w.Body)
+	}
+	if other.batches.Load() != 2 {
+		t.Errorf("batches = %d, want a second one for a fresh URL", other.batches.Load())
+	}
+}
+
+func TestGitLFSKeptDownloadsExpire(t *testing.T) {
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	object := lfsObject{OID: strings.Repeat("a", 64), Size: 3}
+	href := "https://objects.example/a?sig=1"
+	tests := []struct {
+		name   string
+		action lfsAction
+		at     time.Duration
+		kept   bool
+	}{
+		{"no expiry", lfsAction{Href: href}, 4 * time.Minute, true},
+		{"no expiry, later", lfsAction{Href: href}, 5 * time.Minute, false},
+		{"expires_in", lfsAction{Href: href, ExpiresIn: 600}, 9 * time.Minute, true},
+		{"expires_in, within the margin", lfsAction{Href: href, ExpiresIn: 600}, 10*time.Minute - 10*time.Second, false},
+		{"expires_in too short to use", lfsAction{Href: href, ExpiresIn: 10}, 0, false},
+		{"expires_at", lfsAction{Href: href, ExpiresAt: now.Add(20 * time.Minute).Format(time.RFC3339)}, 19 * time.Minute, true},
+		{"expires_at, past", lfsAction{Href: href, ExpiresAt: now.Add(20 * time.Minute).Format(time.RFC3339)}, 20 * time.Minute, false},
+		{"long expiry capped", lfsAction{Href: href, ExpiresIn: 86400}, 2 * time.Hour, false},
+		{"relative href", lfsAction{Href: "/a"}, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var d lfsDownloads
+			d.put("repo", object, tt.action, now)
+			if _, kept := d.get("repo", object, now.Add(tt.at)); kept != tt.kept {
+				t.Errorf("kept = %v, want %v", kept, tt.kept)
+			}
+		})
+	}
+
+	var d lfsDownloads
+	d.put("repo", object, lfsAction{Href: href}, now)
+	if _, kept := d.get("repo", lfsObject{OID: object.OID, Size: 4}, now); kept {
+		t.Error("kept for another size")
+	}
+	if _, kept := d.get("other", object, now); kept {
+		t.Error("kept for another repository")
+	}
+	for i := range gitLFSKeptDownloads + 10 {
+		d.put("repo", lfsObject{OID: fmt.Sprintf("%064x", i), Size: 1}, lfsAction{Href: href}, now)
+	}
+	if len(d.entries) > gitLFSKeptDownloads {
+		t.Errorf("%d entries kept, want at most %d", len(d.entries), gitLFSKeptDownloads)
+	}
+}
+
+func TestGitLFSObjectOfAnotherSizeIsRefused(t *testing.T) {
+	u := newLFSUpstream(t)
+	h := newLFSHandler(t, u)
+	path := fmt.Sprintf("/up/acme/widget.git/info/lfs/objects/%s/%d", u.oid, len(lfsTestContent)-1)
+
+	if w := lfsRequest(h, http.MethodGet, path, ""); w.Code == http.StatusOK {
+		t.Fatalf("GET at the wrong size: status %d, body %q", w.Code, w.Body)
+	}
+	if u.downloads.Load() != 1 || u.batches.Load() != 1 {
+		t.Errorf("downloads %d, batches %d; want one of each, without a retry", u.downloads.Load(), u.batches.Load())
+	}
+}
+
+func TestExactSizeBody(t *testing.T) {
+	for _, tt := range []struct {
+		body string
+		size int64
+		ok   bool
+	}{
+		{"abcdef", 6, true},
+		{"abcdef", 5, false},
+		{"abcdef", 7, false},
+		{"", 0, true},
+		{"a", 0, false},
+	} {
+		got, err := io.ReadAll(&exactSizeBody{ReadCloser: io.NopCloser(strings.NewReader(tt.body)), left: tt.size})
+		if (err == nil) != tt.ok || (err != nil && !errors.Is(err, errDownloadSize)) {
+			t.Errorf("%q at size %d: err %v, want ok %v", tt.body, tt.size, err, tt.ok)
+		}
+		if int64(len(got)) > tt.size+1 {
+			t.Errorf("%q at size %d: read %d bytes", tt.body, tt.size, len(got))
+		}
+	}
+}
+
+func TestGitLFSObjectCopiedFromAnotherRepository(t *testing.T) {
+	u := newLFSUpstream(t)
+	h := newLFSHandler(t, u)
+	object := func(repo string) string {
+		return fmt.Sprintf("/up/%s.git/info/lfs/objects/%s/%d", repo, u.oid, len(lfsTestContent))
+	}
+
+	if w := lfsRequest(h, http.MethodGet, object("acme/widget"), ""); w.Code != http.StatusOK {
+		t.Fatalf("GET: status %d, body %s", w.Code, w.Body)
+	}
+	w := lfsRequest(h, http.MethodGet, object("fork/widget"), "")
+	if w.Code != http.StatusOK || w.Body.String() != lfsTestContent {
+		t.Fatalf("GET from the fork: status %d, body %q", w.Code, w.Body)
+	}
+	if u.downloads.Load() != 1 || u.batches.Load() != 2 {
+		t.Errorf("downloads %d, batches %d; want the fork's object copied after its own batch", u.downloads.Load(), u.batches.Load())
+	}
+	cached, err := h.proxy.GetCachedArtifact(t.Context(), gitEcosystem, "up/fork/widget", u.oid, u.oid)
+	if err != nil || cached == nil {
+		t.Fatalf("fork's object not cached: %v, %v", cached, err)
+	}
+	_ = cached.Reader.Close()
+
+	// A repository the upstream says lacks the object doesn't get it, though
+	// a copy is stored.
+	if w := lfsRequest(h, http.MethodGet, object("stranger/widget"), ""); w.Code != http.StatusNotFound {
+		t.Errorf("GET from a repository without the object: status %d, body %s; want 404", w.Code, w.Body)
 	}
 }

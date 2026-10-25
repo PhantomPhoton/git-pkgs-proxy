@@ -41,6 +41,9 @@ type GitHandler struct {
 	upstreams map[string]gitUpstream
 	// baseURL is where clients reach the proxy, for LFS download URLs.
 	baseURL string
+	// lfsDownloads keeps upstream LFS download URLs between a batch and
+	// the GETs that follow it.
+	lfsDownloads *lfsDownloads
 	// writeStall is gitWriteStallTimeout, shorter in tests.
 	writeStall time.Duration
 }
@@ -58,10 +61,11 @@ type gitUpstream struct {
 // NewGitHandler creates a Git handler serving upstream.git from cache.
 func NewGitHandler(proxy *Proxy, cache *gitcache.Cache, upstream config.UpstreamConfig) *GitHandler {
 	h := &GitHandler{
-		proxy:      proxy,
-		cache:      cache,
-		upstreams:  make(map[string]gitUpstream, len(upstream.Git)),
-		writeStall: gitWriteStallTimeout,
+		proxy:        proxy,
+		cache:        cache,
+		upstreams:    make(map[string]gitUpstream, len(upstream.Git)),
+		writeStall:   gitWriteStallTimeout,
+		lfsDownloads: &lfsDownloads{},
 	}
 	for name, git := range upstream.Git {
 		git.URL = strings.TrimSuffix(git.URL, "/")
