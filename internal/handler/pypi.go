@@ -273,6 +273,30 @@ func ensureVaryAccept(header http.Header) {
 // doesn't know has no publish times to go by and gets an empty set; any other
 // failure to read them is an error.
 func (h *PyPIHandler) fetchFilteredVersions(r *http.Request, name string) (map[string]bool, error) {
+	times, err := h.fetchReleaseTimes(r, name)
+	if err != nil {
+		return nil, err
+	}
+
+	packagePURL := canonicalPackagePURL("pypi", name)
+	filtered := make(map[string]bool)
+
+	for version, publishedAt := range times {
+		if !publishedAt.IsZero() && !h.proxy.Cooldown.IsAllowed("pypi", packagePURL, publishedAt) {
+			filtered[version] = true
+		}
+	}
+
+	if len(filtered) == 0 {
+		return nil, nil
+	}
+	return filtered, nil
+}
+
+// fetchReleaseTimes reads the JSON API and returns each release's newest
+// upload time, zero for a release without one. A package the JSON API
+// doesn't know gets nil; any other failure is an error.
+func (h *PyPIHandler) fetchReleaseTimes(r *http.Request, name string) (map[string]time.Time, error) {
 	jsonURL := fmt.Sprintf("%s/pypi/%s/json", h.upstreamURL, name)
 
 	body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "pypi", name+"/json", jsonURL)
@@ -293,24 +317,15 @@ func (h *PyPIHandler) fetchFilteredVersions(r *http.Request, name string) (map[s
 		return nil, errors.New("pypi json metadata has no releases")
 	}
 
-	packagePURL := canonicalPackagePURL("pypi", name)
-	filtered := make(map[string]bool)
-
+	times := make(map[string]time.Time, len(releases))
 	for version, files := range releases {
 		filesArr, ok := files.([]any)
 		if !ok {
 			continue
 		}
-		publishedAt := h.newestUploadTime(filesArr)
-		if !publishedAt.IsZero() && !h.proxy.Cooldown.IsAllowed("pypi", packagePURL, publishedAt) {
-			filtered[version] = true
-		}
+		times[version] = h.newestUploadTime(filesArr)
 	}
-
-	if len(filtered) == 0 {
-		return nil, nil
-	}
-	return filtered, nil
+	return times, nil
 }
 
 // rewriteSimpleHTML rewrites package URLs in simple API HTML to point at this proxy.
@@ -513,13 +528,65 @@ func (h *PyPIHandler) shouldFilterRelease(packagePURL string, files any) bool {
 //
 // A release whose upload time cannot be determined is allowed through, matching
 // how fetchFilteredVersions treats it. Failing to read the times is an error.
+// The time read is stored for storedCooldown.
 func (h *PyPIHandler) versionInCooldown(r *http.Request, name, version string) (bool, error) {
 	if !h.proxy.cooldownApplies("pypi", name) {
 		return false, nil
 	}
 
-	filtered, err := h.fetchFilteredVersions(r, name)
-	return filtered[version], err
+	times, err := h.fetchReleaseTimes(r, name)
+	if err != nil {
+		return false, err
+	}
+	publishedAt := times[version]
+	if publishedAt.IsZero() {
+		return false, nil
+	}
+	h.storeUploadTime(name, version, publishedAt)
+	return !h.proxy.Cooldown.IsAllowed("pypi", canonicalPackagePURL("pypi", name), publishedAt), nil
+}
+
+// storeUploadTime records a release's newest upload time under the version
+// PURL the file is cached under, so storedCooldown finds it.
+func (h *PyPIHandler) storeUploadTime(name, version string, publishedAt time.Time) {
+	if h.proxy.DB == nil {
+		return
+	}
+	packagePURL, versionPURL, err := packagePURLStrings("pypi", name, version)
+	if err != nil {
+		return
+	}
+	if err := h.proxy.DB.SetVersionPublishedAt(versionPURL, packagePURL, publishedAt); err != nil {
+		h.proxy.Logger.Warn("cooldown: could not store pypi upload time",
+			"package", name, "version", version, "error", err)
+	}
+}
+
+// storedCooldown answers the cooldown check for a download from the upload
+// time stored for its release, without reading the JSON API, and reports
+// whether it could. A release's time is its newest file's, and files can be
+// added to a release later, so the stored time only ever moves forward:
+//   - a stored time inside the window withholds every file of the release;
+//   - a stored time outside it only lets through a file that is already
+//     cached. A file that is not cached may be one uploaded since, so it goes
+//     to the JSON API, which also stores the release's current time.
+func (h *PyPIHandler) storedCooldown(r *http.Request, name, version, filename string) (inCooldown, answered bool) {
+	if h.proxy.DB == nil || !h.proxy.cooldownApplies("pypi", name) {
+		return false, false
+	}
+	packagePURL, versionPURL, err := packagePURLStrings("pypi", name, version)
+	if err != nil {
+		return false, false
+	}
+	ver, err := h.proxy.DB.GetVersionByPURL(versionPURL)
+	if err != nil || ver == nil || !ver.PublishedAt.Valid {
+		return false, false
+	}
+	if !h.proxy.Cooldown.IsAllowed("pypi", packagePURL, ver.PublishedAt.Time) {
+		return true, true
+	}
+	cached, err := h.proxy.HasCachedArtifact(r.Context(), "pypi", name, version, filename)
+	return false, err == nil && cached
 }
 
 // rewriteFileEntries rewrites URLs in a list of file entries.
@@ -625,7 +692,11 @@ func (h *PyPIHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	name, version := h.parseFilename(filename)
 
 	if name != "" {
-		inCooldown, err := h.versionInCooldown(r, name, version)
+		inCooldown, answered := h.storedCooldown(r, name, version, filename)
+		var err error
+		if !answered {
+			inCooldown, err = h.versionInCooldown(r, name, version)
+		}
 		if err != nil {
 			if !h.proxy.serveCachedDespiteCooldownError(w, r, "pypi", name, version, filename, err) {
 				h.proxy.writeCooldownLookupError(w, "pypi", name, err)

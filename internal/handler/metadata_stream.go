@@ -21,11 +21,21 @@ import (
 // buffered path instead: no fresh row, a row without a digest or size, a
 // document over the metadata size limit, or one that can't be opened.
 func (p *Proxy) serveCachedMetadata(w http.ResponseWriter, r *http.Request, ecosystem, cacheKey string) bool {
-	if p.DB == nil || p.Storage == nil || p.MetadataTTL <= 0 || containsPathTraversal(cacheKey) {
+	return p.serveStoredMetadata(w, r, ecosystem, cacheKey, false)
+}
+
+// serveStoredMetadata is serveCachedMetadata. With immutable set the row is
+// served whatever its age and never marked stale, for documents that can't
+// change upstream (see proxyImmutable).
+func (p *Proxy) serveStoredMetadata(w http.ResponseWriter, r *http.Request, ecosystem, cacheKey string, immutable bool) bool {
+	if p.DB == nil || p.Storage == nil || (!immutable && p.MetadataTTL <= 0) || containsPathTraversal(cacheKey) {
 		return false
 	}
 	entry, err := p.DB.GetMetadataCache(ecosystem, cacheKey)
-	if err != nil || entry == nil || !entry.FetchedAt.Valid || time.Since(entry.FetchedAt.Time) >= p.MetadataTTL {
+	if err != nil || entry == nil || !entry.FetchedAt.Valid {
+		return false
+	}
+	if !immutable && time.Since(entry.FetchedAt.Time) >= p.MetadataTTL {
 		return false
 	}
 	limit := p.MetadataMaxSize
@@ -64,6 +74,9 @@ func (p *Proxy) serveCachedMetadata(w http.ResponseWriter, r *http.Request, ecos
 	metrics.RecordMetadataCacheHit(ecosystem, int(entry.Size.Int64))
 
 	cm := p.cachedMetaFor(entry)
+	if immutable {
+		cm.stale = false
+	}
 	if writeMetadataValidators(w, r, cm) {
 		return true
 	}
