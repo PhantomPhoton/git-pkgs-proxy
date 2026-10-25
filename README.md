@@ -925,7 +925,8 @@ git config --global url."http://localhost:8080/git/github/".insteadOf https://gi
 ```
 
 Each repository is cached as a bare clone and refreshed whenever its branches
-or tags change upstream. See [configuration](docs/configuration.md#git-repositories)
+or tags change upstream. Git LFS objects are cached in the artifact cache;
+git-lfs uses the proxy for them with no further setup. See [configuration](docs/configuration.md#git-repositories)
 for setting the rewrite through environment variables, size limits, private
 repositories and outage behavior.
 
