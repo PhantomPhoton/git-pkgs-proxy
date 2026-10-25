@@ -1,0 +1,320 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+const (
+	// gitLFSPath separates a repository from the Git LFS API below it, as
+	// git-lfs derives the API URL from a remote: {remote}.git/info/lfs.
+	gitLFSPath      = "/info/lfs/"
+	gitLFSMediaType = "application/vnd.git-lfs+json"
+	gitLFSTransfer  = "basic"
+	gitLFSHashAlgo  = "sha256"
+
+	// gitLFSMaxBatchRequest bounds a client's batch request. git-lfs sends
+	// 100 objects per batch by default, a few kilobytes.
+	gitLFSMaxBatchRequest = 1 << 20
+	// gitLFSMaxBatchResponse bounds an upstream batch response, which holds
+	// an href and headers per object.
+	gitLFSMaxBatchResponse = 16 << 20
+
+	gitLFSOIDLength = 64
+)
+
+// lfsBatchRequest is a Git LFS batch API request.
+type lfsBatchRequest struct {
+	Operation string          `json:"operation"`
+	Transfers []string        `json:"transfers,omitempty"`
+	Ref       json.RawMessage `json:"ref,omitempty"`
+	Objects   []lfsObject     `json:"objects"`
+	HashAlgo  string          `json:"hash_algo,omitempty"`
+}
+
+type lfsObject struct {
+	OID  string `json:"oid"`
+	Size int64  `json:"size"`
+}
+
+// lfsBatchResponse is a Git LFS batch API response.
+type lfsBatchResponse struct {
+	Transfer string              `json:"transfer,omitempty"`
+	Objects  []lfsObjectResponse `json:"objects"`
+	HashAlgo string              `json:"hash_algo,omitempty"`
+}
+
+type lfsObjectResponse struct {
+	OID           string               `json:"oid"`
+	Size          int64                `json:"size"`
+	Authenticated bool                 `json:"authenticated,omitempty"`
+	Actions       map[string]lfsAction `json:"actions,omitempty"`
+	Error         *lfsObjectError      `json:"error,omitempty"`
+}
+
+type lfsAction struct {
+	Href   string            `json:"href"`
+	Header map[string]string `json:"header,omitempty"`
+}
+
+type lfsObjectError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// lfsUpstreamError is a batch request the upstream answered with an error
+// status.
+type lfsUpstreamError struct {
+	status int
+}
+
+func (e *lfsUpstreamError) Error() string {
+	return fmt.Sprintf("LFS batch API answered %d", e.status)
+}
+
+// WithBaseURL sets the URL clients reach the proxy at, which LFS batch
+// responses send them back to for each object.
+func (h *GitHandler) WithBaseURL(baseURL string) *GitHandler {
+	h.baseURL = strings.TrimSuffix(baseURL, "/")
+	return h
+}
+
+// serveLFS answers a request to the Git LFS API of a repository: batch
+// downloads, and the objects the batch responses point at. Objects are
+// stored in the artifact cache, checked against their sha256 object ID.
+// Uploads and locking are refused.
+func (h *GitHandler) serveLFS(w http.ResponseWriter, r *http.Request, repoPath, endpoint string) {
+	repo, status, msg := h.repository(repoPath)
+	if status != 0 {
+		lfsError(w, status, msg)
+		return
+	}
+	if endpoint == "objects/batch" {
+		if r.Method != http.MethodPost {
+			lfsError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.serveLFSBatch(w, r, repo)
+		return
+	}
+	oid, sizeText, ok := strings.Cut(strings.TrimPrefix(endpoint, "objects/"), "/")
+	size, err := strconv.ParseInt(sizeText, 10, 64)
+	if !strings.HasPrefix(endpoint, "objects/") || !ok || err != nil || size < 0 || !validLFSOID(oid) {
+		lfsError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		lfsError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	h.serveLFSObject(w, r, repo, lfsObject{OID: oid, Size: size})
+}
+
+// serveLFSBatch forwards a download batch upstream and points every object
+// the upstream offers at this proxy. The upstream answers for the
+// repository, so a client only gets objects it could get from there.
+func (h *GitHandler) serveLFSBatch(w http.ResponseWriter, r *http.Request, repo gitRepository) {
+	var req lfsBatchRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, gitLFSMaxBatchRequest)).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			lfsError(w, http.StatusRequestEntityTooLarge, "batch request too large")
+			return
+		}
+		lfsError(w, http.StatusBadRequest, "invalid batch request")
+		return
+	}
+	switch {
+	case req.Operation != "download":
+		lfsError(w, http.StatusForbidden, "pushing is not supported")
+		return
+	case req.HashAlgo != "" && req.HashAlgo != gitLFSHashAlgo:
+		lfsError(w, http.StatusConflict, "only sha256 objects are supported")
+		return
+	case len(req.Transfers) > 0 && !slices.Contains(req.Transfers, gitLFSTransfer):
+		lfsError(w, http.StatusUnprocessableEntity, "only the basic transfer is supported")
+		return
+	}
+	requested := make(map[string]int64, len(req.Objects))
+	for _, object := range req.Objects {
+		if !validLFSOID(object.OID) || object.Size < 0 {
+			lfsError(w, http.StatusUnprocessableEntity, "invalid object")
+			return
+		}
+		requested[object.OID] = object.Size
+	}
+
+	upstream, err := h.lfsBatch(r.Context(), repo, req.Ref, req.Objects)
+	if err != nil {
+		h.serveLFSUpstreamError(w, r, repo, err)
+		return
+	}
+	resp := lfsBatchResponse{Transfer: gitLFSTransfer, Objects: []lfsObjectResponse{}, HashAlgo: gitLFSHashAlgo}
+	for _, object := range upstream.Objects {
+		// Only objects the client asked for, at the size it gave, so a
+		// response can't point the client at anything else.
+		size, ok := requested[object.OID]
+		if !ok || size != object.Size {
+			continue
+		}
+		out := lfsObjectResponse{OID: object.OID, Size: object.Size, Error: object.Error}
+		if download, ok := object.Actions["download"]; ok && object.Error == nil && download.Href != "" {
+			out.Authenticated = true
+			out.Actions = map[string]lfsAction{"download": {Href: h.lfsObjectURL(repo, object.OID, object.Size)}}
+		}
+		resp.Objects = append(resp.Objects, out)
+	}
+	w.Header().Set("Content-Type", gitLFSMediaType)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// serveLFSObject serves an object from the artifact cache, or on a miss asks
+// the upstream batch API for a fresh download URL, fetches it and checks it
+// against its object ID before caching it.
+func (h *GitHandler) serveLFSObject(w http.ResponseWriter, r *http.Request, repo gitRepository, object lfsObject) {
+	// Objects are cached per repository: having one cached for another
+	// repository says nothing about whether this one has it.
+	name := repo.name + "/" + repo.repo
+	cached, err := h.proxy.GetCachedArtifact(r.Context(), gitEcosystem, name, object.OID, object.OID)
+	if err != nil {
+		h.proxy.serveArtifactError(w, err, "failed to read cached LFS object")
+		return
+	}
+	if cached == nil {
+		upstream, err := h.lfsBatch(r.Context(), repo, nil, []lfsObject{object})
+		if err != nil {
+			h.serveLFSUpstreamError(w, r, repo, err)
+			return
+		}
+		download, status, msg := lfsDownload(upstream, object)
+		if status != 0 {
+			lfsError(w, status, msg)
+			return
+		}
+		header := make(http.Header, len(download.Header))
+		for key, value := range download.Header {
+			header.Set(key, value)
+		}
+		cached, err = h.proxy.getOrFetchArtifactFromURL(r.Context(), gitEcosystem, name, object.OID, object.OID,
+			download.Href, header, object.OID, "")
+		if err != nil {
+			h.proxy.serveArtifactError(w, err, "failed to fetch LFS object")
+			return
+		}
+	}
+	serveGenericArtifact(w, r, cached)
+}
+
+// lfsDownload returns the download action the upstream gave for object, or
+// the status and message to answer with when it gave none.
+func lfsDownload(resp *lfsBatchResponse, object lfsObject) (lfsAction, int, string) {
+	for _, got := range resp.Objects {
+		if got.OID != object.OID {
+			continue
+		}
+		if got.Error != nil {
+			if got.Error.Code == http.StatusNotFound || got.Error.Code == http.StatusGone {
+				return lfsAction{}, http.StatusNotFound, "object not found"
+			}
+			return lfsAction{}, http.StatusBadGateway, "upstream refused the object"
+		}
+		download, ok := got.Actions["download"]
+		u, err := url.Parse(download.Href)
+		if !ok || err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return lfsAction{}, http.StatusBadGateway, "upstream gave no download for the object"
+		}
+		return download, 0, ""
+	}
+	return lfsAction{}, http.StatusNotFound, "object not found"
+}
+
+// lfsBatch asks the upstream's LFS batch API for download actions for
+// objects. upstream.auth applies to it as to the repository.
+func (h *GitHandler) lfsBatch(ctx context.Context, repo gitRepository, ref json.RawMessage, objects []lfsObject) (*lfsBatchResponse, error) {
+	body, err := json.Marshal(lfsBatchRequest{
+		Operation: "download",
+		Transfers: []string{gitLFSTransfer},
+		Ref:       ref,
+		Objects:   objects,
+		HashAlgo:  gitLFSHashAlgo,
+	})
+	if err != nil {
+		return nil, err
+	}
+	batchURL := strings.TrimSuffix(repo.url, ".git") + ".git" + gitLFSPath + "objects/batch"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, batchURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", gitLFSMediaType)
+	req.Header.Set("Content-Type", gitLFSMediaType)
+	resp, err := h.proxy.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &lfsUpstreamError{status: resp.StatusCode}
+	}
+	var batch lfsBatchResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, gitLFSMaxBatchResponse)).Decode(&batch); err != nil {
+		return nil, fmt.Errorf("reading LFS batch response: %w", err)
+	}
+	if batch.Transfer != "" && batch.Transfer != gitLFSTransfer {
+		return nil, fmt.Errorf("LFS batch response uses the %q transfer", batch.Transfer)
+	}
+	return &batch, nil
+}
+
+// serveLFSUpstreamError answers a request whose upstream batch request
+// failed.
+func (h *GitHandler) serveLFSUpstreamError(w http.ResponseWriter, r *http.Request, repo gitRepository, err error) {
+	if r.Context().Err() != nil {
+		return
+	}
+	h.proxy.Logger.Warn("git: LFS batch request failed", "repository", repo.key, "error", err)
+	var upstream *lfsUpstreamError
+	switch {
+	case errors.As(err, &upstream) && upstream.status == http.StatusNotFound:
+		lfsError(w, http.StatusNotFound, "repository not found")
+	case errors.As(err, &upstream) && upstream.status < http.StatusInternalServerError:
+		lfsError(w, http.StatusBadGateway, "upstream refused the request")
+	default:
+		lfsError(w, http.StatusBadGateway, "upstream unavailable")
+	}
+}
+
+// lfsObjectURL is where this proxy serves an object of repo.
+func (h *GitHandler) lfsObjectURL(repo gitRepository, oid string, size int64) string {
+	return fmt.Sprintf("%s/git/%s/%s.git%sobjects/%s/%d",
+		h.baseURL, url.PathEscape(repo.name), repo.escapedRepo, gitLFSPath, oid, size)
+}
+
+// validLFSOID reports whether oid is a sha256 object ID in lowercase hex.
+func validLFSOID(oid string) bool {
+	if len(oid) != gitLFSOIDLength {
+		return false
+	}
+	for _, c := range oid {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// lfsError answers with a Git LFS error document, which git-lfs shows.
+func lfsError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", gitLFSMediaType)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": msg})
+}
