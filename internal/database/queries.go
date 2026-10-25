@@ -1290,6 +1290,35 @@ func (db *DB) RefreshMetadataCache(ecosystem, name, digest string, fetchedAt tim
 	return n > 0, err
 }
 
+// MoveMetadataCache points the metadata cache row for ecosystem and name at
+// to, provided it is still at from and records digest, and reports whether
+// it did. The caller has copied the document from from to to.
+func (db *DB) MoveMetadataCache(ecosystem, name, from, to, digest string) (bool, error) {
+	res, err := db.Exec(db.Rebind(`
+		UPDATE metadata_cache SET storage_path = ?, updated_at = ?
+		WHERE ecosystem = ? AND name = ? AND storage_path = ? AND content_digest = ?
+	`), to, time.Now(), ecosystem, name, from, digest)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// ForgetMetadataDocument points the metadata cache row for ecosystem and name
+// at to, provided it is still at from, and clears what described the document
+// at from: its digest, validators and fetch time. The row stays, so the next
+// lookup fetches the document again rather than serving or revalidating it.
+func (db *DB) ForgetMetadataDocument(ecosystem, name, from, to string) error {
+	_, err := db.Exec(db.Rebind(`
+		UPDATE metadata_cache
+		SET storage_path = ?, content_digest = NULL, etag = NULL, last_modified = NULL,
+		    fetched_at = NULL, updated_at = ?
+		WHERE ecosystem = ? AND name = ? AND storage_path = ?
+	`), to, time.Now(), ecosystem, name, from)
+	return err
+}
+
 // UpsertMetadataCache writes entry and marks it accessed now, since a
 // document is stored because a request asked for it.
 func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
