@@ -39,6 +39,7 @@ type mockStorage struct {
 	signErr   error
 	seekable  bool
 	stores    int
+	opens     int
 }
 
 func newMockStorage() *mockStorage {
@@ -63,6 +64,7 @@ func (s *mockStorage) Store(_ context.Context, path string, r io.Reader) (int64,
 func (s *mockStorage) Open(_ context.Context, path string) (io.ReadCloser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.opens++
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
@@ -75,6 +77,9 @@ func (s *mockStorage) Open(_ context.Context, path string) (io.ReadCloser, error
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
+
+// ReadsSeekable reports what Open returns, as storage.Blob does.
+func (s *mockStorage) ReadsSeekable() bool { return s.seekable }
 
 type mockSeekableReadCloser struct {
 	*bytes.Reader

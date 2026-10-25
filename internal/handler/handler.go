@@ -279,6 +279,9 @@ type CacheResult struct {
 	Artifact    artifacts.Artifact
 	Cached      bool
 	storagePath string
+	// rangeable is set on a HEAD cache hit, which has no Reader, when the
+	// stored object would open as a seekable reader.
+	rangeable bool
 }
 
 // GetOrFetchArtifact retrieves an artifact from cache or fetches from upstream.
@@ -472,6 +475,12 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 			p.Logger.Warn("failed to sign storage URL, falling back to streaming",
 				"path", artifact.StoragePath, "error", err)
 		}
+	}
+
+	if servingHead(ctx) {
+		result.rangeable = readsSeekable(p.Storage)
+		p.recordCacheHit(artifact.Ecosystem, versionPURL, filename)
+		return result, nil
 	}
 
 	start := time.Now()
@@ -892,6 +901,28 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	return p.openStoredArtifact(ctx, stored, path)
 }
 
+type servingHeadKey struct{}
+
+// ServingHead marks ctx as serving a HEAD request. A cache hit under it is
+// answered from the artifact's database record without opening the stored
+// object: on S3 or GCS opening it issues a GET whose unread body would only
+// be thrown away. The server sets it on every HEAD request.
+func ServingHead(ctx context.Context) context.Context {
+	return context.WithValue(ctx, servingHeadKey{}, true)
+}
+
+func servingHead(ctx context.Context) bool {
+	head, _ := ctx.Value(servingHeadKey{}).(bool)
+	return head
+}
+
+// readsSeekable reports whether store opens objects as seekable readers, so a
+// HEAD response can advertise byte ranges exactly as the GET would.
+func readsSeekable(store storage.Storage) bool {
+	s, ok := store.(storage.SeekableReads)
+	return ok && s.ReadsSeekable()
+}
+
 type detachUpstreamFetchKey struct{}
 
 // DetachUpstreamFetch marks ctx so that an artifact fetch started under it
@@ -1067,9 +1098,9 @@ func serveArtifactResponse(w http.ResponseWriter, method string, request *http.R
 	if result.Reader != nil {
 		seeker, _ = result.Reader.(io.Seeker)
 	}
-	if seeker != nil && result.Artifact.Size >= 0 {
+	if (seeker != nil || result.rangeable) && result.Artifact.Size >= 0 {
 		w.Header().Set("Accept-Ranges", "bytes")
-		if request != nil && serveArtifactRange(w, request, result, seeker) {
+		if seeker != nil && request != nil && serveArtifactRange(w, request, result, seeker) {
 			return
 		}
 	}
