@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	upstreamhttp "github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
@@ -364,7 +365,7 @@ func TestHealthEndpoint_ReportsUpstreamHolds(t *testing.T) {
 	if resp, err := gate.RoundTrip(req); err == nil {
 		_ = resp.Body.Close()
 	}
-	ts.server.rateLimits = gate
+	ts.server.rateLimits = upstreamhttp.NewSharedRateLimitGate(gate, nil, nil)
 
 	w := httptest.NewRecorder()
 	ts.handler.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))

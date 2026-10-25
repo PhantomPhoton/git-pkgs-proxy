@@ -26,7 +26,6 @@ import (
 	"github.com/git-pkgs/proxy/internal/scanner"
 	"github.com/git-pkgs/proxy/internal/storage"
 	"github.com/git-pkgs/purl"
-	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
 	"github.com/opencontainers/go-digest"
 )
@@ -233,7 +232,7 @@ type Proxy struct {
 
 	// RateLimits is the gate under the upstream clients. Artifact fetches
 	// check it before calling Fetcher, so held hosts never reach its breaker.
-	RateLimits *registryclient.RateLimitGate
+	RateLimits UpstreamHolds
 
 	// HostedNPMScopes and HostedComposerVendors name namespaces served from
 	// pushed packages alone, without asking the upstream.
@@ -631,7 +630,7 @@ func (p *Proxy) fetchAndCache(ctx context.Context, ecosystem, name, version, fil
 		}
 	}
 
-	if err := p.RateLimits.Held(info.URL); err != nil {
+	if err := p.upstreamHeld(info.URL); err != nil {
 		return artifacts.Artifact{}, "", err
 	}
 	p.Logger.Info("fetching from upstream",
@@ -921,7 +920,12 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	}
 	// With leaseFailed, release is a no-op and this instance fetches on its
 	// own, so a failing upstream costs each instance one attempt in
-	// parallel.
+	// parallel. A rate-limited holder has published its hold by now, and
+	// rereading it makes commit refuse the fetch with the holder's
+	// Retry-After instead of sending one more request to the limited host.
+	if outcome == leaseFailed {
+		p.reloadUpstreamHolds()
+	}
 	failed := true
 	defer func() { release(failed) }()
 
@@ -1510,7 +1514,10 @@ func (p *Proxy) coalescedMetadataMiss(ctx context.Context, ecosystem, cacheKey, 
 				return *hit
 			case leaseFailed:
 				// Serve the stale copy at once, as the holder did, rather
-				// than trying the failing upstream again. Without one, fetch.
+				// than trying the failing upstream again. Without one, fetch,
+				// unless the holder was rate limited: its hold, read here,
+				// refuses the fetch with its Retry-After.
+				p.reloadUpstreamHolds()
 				if entry != nil {
 					if res := p.staleMetadata(fetchCtx, ecosystem, cacheKey, validate, entry, errFetchFailedElsewhere); res.err == nil {
 						return res
@@ -2287,7 +2294,7 @@ func (p *Proxy) discardStaleArtifact(pkgPURL, versionPURL, filename, upstreamHas
 }
 
 func (p *Proxy) fetchAndCacheFromURL(ctx context.Context, ecosystem, name, version, filename, pkgPURL, versionPURL, downloadURL string, headers http.Header, upstreamHash, declared string) (artifacts.Artifact, string, error) {
-	if err := p.RateLimits.Held(downloadURL); err != nil {
+	if err := p.upstreamHeld(downloadURL); err != nil {
 		return artifacts.Artifact{}, "", err
 	}
 	p.Logger.Info("fetching from upstream",
@@ -2354,7 +2361,7 @@ func (p *Proxy) fetchUpstream(ctx context.Context, downloadURL string, headers h
 // after the bytes have been sent, and an unterminated chunked response is the
 // only way left to make the client reject them (see serveArtifact).
 func (p *Proxy) streamFromUpstream(ctx context.Context, ecosystem, name, version, filename, versionPURL, upstreamURL, upstreamHash, declared string, fetchArtifact func(context.Context) (*fetch.Artifact, error)) (*CacheResult, error) {
-	if err := p.RateLimits.Held(upstreamURL); err != nil {
+	if err := p.upstreamHeld(upstreamURL); err != nil {
 		return nil, err
 	}
 	p.Logger.Info("streaming from upstream",
