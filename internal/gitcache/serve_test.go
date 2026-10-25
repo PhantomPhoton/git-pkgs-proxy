@@ -246,7 +246,10 @@ func TestRefListingSlots(t *testing.T) {
 // TestReadRequest reads bodies kept in memory and, past maxMemoryRequest, in
 // a temporary file removed on Close.
 func TestReadRequest(t *testing.T) {
-	c := &Cache{maxRequestBody: 4 << 20}
+	c := &Cache{dir: t.TempDir(), maxRequestBody: 4 << 20}
+	if err := os.Mkdir(c.tmpDir(), dirPermissions); err != nil {
+		t.Fatal(err)
+	}
 	for _, size := range []int{0, 100, maxMemoryRequest, 3 << 20} {
 		body := strings.Repeat("x", size)
 		r, _ := http.NewRequest(http.MethodPost, "/", strings.NewReader(body))

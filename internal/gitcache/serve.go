@@ -221,7 +221,7 @@ func (c *Cache) ReadRequest(r *http.Request) (*Request, error) {
 		req.data = buf.Bytes()
 		return req, nil
 	}
-	file, err := os.CreateTemp("", "git-upload-pack-*")
+	file, err := os.CreateTemp(c.tmpDir(), "git-upload-pack-*")
 	if err != nil {
 		return nil, err
 	}
