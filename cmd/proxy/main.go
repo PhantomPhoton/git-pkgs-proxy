@@ -560,7 +560,7 @@ func runMirror() {
 
 	m := mirror.New(proxy, db, store, logger, *concurrency)
 	m.Images = images
-	m.Versions = server.NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
+	server.UseMirrorUpstreams(m, cfg.Upstream, proxy.HTTPClient)
 	switch s := source.(type) {
 	case *mirror.PURLSource:
 		s.Versions = m.Versions

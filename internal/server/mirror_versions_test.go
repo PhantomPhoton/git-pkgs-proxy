@@ -127,7 +127,7 @@ func TestMirrorVersionsURL(t *testing.T) {
 		{"conda default", config.Default().Upstream, "conda", "numpy", "", ""},
 		{"conda channel", custom, "conda", "numpy", "", "upstream.conda"},
 		{"julia default", config.Default().Upstream, "julia", "JSON", "", ""},
-		{"julia server", custom, "julia", "JSON", "", "upstream.julia"},
+		{"julia server lists from General", custom, "julia", "JSON", "", ""},
 		{"helm", custom, "helm", "nginx", "", "give a version"},
 		{"swift", custom, "swift", "apple/swift-nio", "", "give a version"},
 		{"apk", custom, "apk", "curl", "", "give a version"},

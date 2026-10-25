@@ -61,6 +61,7 @@ func mirrorWithVersions(t *testing.T, cfg *config.Config, versions mirror.Versio
 	proxy, _ := NewMirrorProxy(cfg, db, store, logger)
 	m := mirror.New(proxy, db, store, logger, 1)
 	m.Versions = versions
+	m.JuliaUpstream = cfg.Upstream.Julia
 	if versions == nil {
 		m.Versions = NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
 	}
