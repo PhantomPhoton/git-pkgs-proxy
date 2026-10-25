@@ -12,7 +12,7 @@ require (
 	github.com/git-pkgs/archives v0.9.0
 	github.com/git-pkgs/artifacts v0.2.1
 	github.com/git-pkgs/cooldown v0.3.0
-	github.com/git-pkgs/enrichment v0.7.4-0.20261024153145-1e2684f97ead
+	github.com/git-pkgs/enrichment v0.7.4
 	github.com/git-pkgs/gcs v0.1.0
 	github.com/git-pkgs/integrity v0.2.0
 	github.com/git-pkgs/magic v0.5.0
