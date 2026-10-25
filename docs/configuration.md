@@ -1530,6 +1530,8 @@ A conda version is mirrored with every build anaconda.org lists for it, across a
 
 A Composer release is mirrored with the dist archive `upstream.composer` lists for it, checked against its shasum when one is listed, and cached under the name `/composer/files/...` serves it as. Give the version as the repository lists it, for example `pkg:composer/monolog/monolog@3.8.1`. Branches such as `dev-main` aren't mirrored, since their archive changes with every push, and neither are packages in `upstream.composer_routes`.
 
+A Helm chart is mirrored from a repository in `upstream.helm`, named as the namespace, for example `pkg:helm/prometheus-community/prometheus@27.1.0` with `prometheus-community` configured. The chart is fetched from the first URL the repository's `index.yaml` lists for that version, checked against the listed digest, and cached under the repository and digest `/helm/{name}/charts/...` serves it from. The index is cached as well, so with [`cache_metadata`](#metadata-caching) on `helm pull` works while the repository is down. Without a version every version in the index is mirrored. Charts named without a repository, or from one that isn't configured, are refused, and so are charts the index lists in an OCI registry: helm pulls those through `/v2`, so mirror them as `pkg:oci` images.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |
