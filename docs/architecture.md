@@ -51,7 +51,9 @@ Metadata is not cached - always fetched fresh. This ensures clients see new vers
    - Open file from storage
    - Record hit (increment counter, update last_accessed_at)
    - Return reader to handler
-   - Handler streams file to client
+   - Handler streams file to client, checking it against the recorded
+     SHA-256 `content_hash` (the registry's own integrity was checked when the
+     file was stored); a mismatch aborts the response and clears the record
 
    **Cache Miss:**
    - Resolve download URL using Resolver

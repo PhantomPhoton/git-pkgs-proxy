@@ -49,6 +49,19 @@ func newIntegrityChecks(contentHash, native string) (integrityChecks, error) {
 	return checks, nil
 }
 
+// forStoredObject returns the checks to run when serving a stored object.
+// When the content hash is recorded it alone is checked. It was computed
+// from the bytes that were verified against the native integrity before
+// they were stored, so a match binds the bytes just as well, and serving a
+// cache hit costs one hash instead of two (SHA-256 plus SHA-512 for npm).
+// Without a content hash the native digests are all there is to check.
+func (c integrityChecks) forStoredObject() integrityChecks {
+	if len(c.contentHash) == 0 {
+		return c
+	}
+	return integrityChecks{contentHash: c.contentHash, algorithms: []integrity.Algorithm{integrity.SHA256}}
+}
+
 // verifyIntegrity wraps body to check it against the declared integrity as
 // it is read. verified, called once body has been read, reports a mismatch as
 // ErrArtifactDigestMismatch, and also a body that was not read to its end,

@@ -514,3 +514,37 @@ func checkFetchWithDigest(t *testing.T, stream bool, content, digest string, wan
 		t.Errorf("cached = %v, want %v", cached != nil, wantCached)
 	}
 }
+
+// BenchmarkStoredObjectVerification compares verifying a cache hit with
+// every recorded digest (SHA-256 content hash plus npm's SHA-512) against
+// the content hash alone.
+func BenchmarkStoredObjectVerification(b *testing.B) {
+	data := strings.Repeat("x", 8<<20)
+	checks, err := newIntegrityChecks(sha256Hex(data), sha512SRI(data))
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, bench := range []struct {
+		name   string
+		checks integrityChecks
+	}{
+		{"all digests", checks},
+		{"content hash", checks.forStoredObject()},
+	} {
+		b.Run(bench.name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			buf := make([]byte, 32<<10)
+			for b.Loop() {
+				reader, err := bench.checks.wrapFailOnMismatch(io.NopCloser(strings.NewReader(data)), func(reason string) {
+					b.Fatal(reason)
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := io.CopyBuffer(io.Discard, reader, buf); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
