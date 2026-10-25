@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"slices"
-	"strings"
 
 	"github.com/git-pkgs/proxy/internal/database"
 )
@@ -47,22 +45,8 @@ func isSHA256Hex(s string) bool {
 }
 
 // migrateLegacyMetadataEntry handles a cache row whose blob is still at its
-// legacy, unhashed path, and returns the row to use, or nil when there is
-// none. On a case-insensitive filesystem keys differing only in case shared
-// that blob, so it may hold another key's document. The blob is hashed and
-// compared with the row's digest, once per row:
-//
-//   - When it matches, the blob is this key's document. It is copied to the
-//     hashed path and the row moved there, so it keeps being served, as a
-//     stale fallback too. If the copy fails the row is served from where it
-//     is and checked again next time.
-//   - When it does not, or the row has no digest to check against, the row
-//     is pointed at the hashed path with its digest and validators cleared,
-//     so the document is fetched again and the blob never served.
-//   - When the blob cannot be read, nothing changes and nil is returned.
-//
-// Once no row's current path is a legacy blob of this key or a case variant
-// of it, those blobs are queued for deletion.
+// legacy, unhashed path. On a case-insensitive filesystem keys differing only
+// in case shared that blob, so it is served only if it matches the row's digest.
 func (p *Proxy) migrateLegacyMetadataEntry(ctx context.Context, ecosystem, cacheKey string, entry *database.MetadataCacheEntry) *database.MetadataCacheEntry {
 	if entry == nil || p.Storage == nil {
 		return entry
@@ -86,13 +70,13 @@ func (p *Proxy) migrateLegacyMetadataEntry(ctx context.Context, ecosystem, cache
 			p.Logger.Warn("failed to drop legacy metadata row", "ecosystem", ecosystem, "key", cacheKey, "error", err)
 			return nil
 		}
-		p.queueLegacyMetadataBlobs(ecosystem, cacheKey)
+		p.queueLegacyMetadataBlob(ecosystem, cacheKey, legacy)
 		return nil
 	}
 	if !p.moveLegacyMetadataBlob(ctx, entry, legacy, hashed) {
 		return entry
 	}
-	p.queueLegacyMetadataBlobs(ecosystem, cacheKey)
+	p.queueLegacyMetadataBlob(ecosystem, cacheKey, legacy)
 	moved := *entry
 	moved.StoragePath = hashed
 	return &moved
@@ -141,37 +125,10 @@ func (p *Proxy) moveLegacyMetadataBlob(ctx context.Context, entry *database.Meta
 	return moved
 }
 
-// queueLegacyMetadataBlobs queues the legacy blobs of cacheKey and its case
-// variants for deletion, unless a row still reads one of them: on a
-// case-insensitive filesystem a variant still at its legacy path is reading
-// the same file. The last variant to move off its legacy path queues them
-// all, so on a case-sensitive filesystem none is left behind. Reclaim also
-// skips a path a row points at again.
-func (p *Proxy) queueLegacyMetadataBlobs(ecosystem, cacheKey string) {
-	rows, err := p.DB.MetadataCaseVariants(ecosystem, cacheKey)
-	if err != nil {
-		p.Logger.Warn("failed to look up metadata case variants", "ecosystem", ecosystem, "key", cacheKey, "error", err)
-		return
-	}
-	for _, row := range rows {
-		legacy := legacyMetadataStoragePath(ecosystem, row.Name)
-		if legacy == metadataStoragePath(ecosystem, row.Name) {
-			continue
-		}
-		inUse := slices.ContainsFunc(rows, func(r database.MetadataPath) bool {
-			return strings.EqualFold(r.StoragePath, legacy)
-		})
-		if inUse {
-			return
-		}
-	}
-	for _, row := range rows {
-		legacy := legacyMetadataStoragePath(ecosystem, row.Name)
-		if legacy == metadataStoragePath(ecosystem, row.Name) {
-			continue
-		}
-		if err := p.DB.QueuePendingDelete(legacy); err != nil {
-			p.Logger.Warn("failed to queue legacy metadata blob for deletion", "ecosystem", ecosystem, "key", row.Name, "error", err)
-		}
+// queueLegacyMetadataBlob queues a row's legacy blob for deletion once the row
+// no longer reads it. Reclaim skips it while another row still points there.
+func (p *Proxy) queueLegacyMetadataBlob(ecosystem, cacheKey, legacy string) {
+	if err := p.DB.QueuePendingDelete(legacy); err != nil {
+		p.Logger.Warn("failed to queue legacy metadata blob for deletion", "ecosystem", ecosystem, "key", cacheKey, "error", err)
 	}
 }

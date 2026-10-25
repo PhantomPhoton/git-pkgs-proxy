@@ -1319,24 +1319,6 @@ func (db *DB) ForgetMetadataDocument(ecosystem, name, from, to string) error {
 	return err
 }
 
-// MetadataPath is a metadata cache row's name and storage path.
-type MetadataPath struct {
-	Name        string `db:"name"`
-	StoragePath string `db:"storage_path"`
-}
-
-// MetadataCaseVariants returns the name and storage path of every metadata
-// cache row in ecosystem whose name equals name ignoring case, name's own
-// row included. lower folds ASCII only on SQLite.
-func (db *DB) MetadataCaseVariants(ecosystem, name string) ([]MetadataPath, error) {
-	var rows []MetadataPath
-	err := db.Select(&rows, db.Rebind(`
-		SELECT name, storage_path FROM metadata_cache
-		WHERE ecosystem = ? AND lower(name) = lower(?)
-	`), ecosystem, name)
-	return rows, err
-}
-
 // UpsertMetadataCache writes entry and marks it accessed now, since a
 // document is stored because a request asked for it.
 func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {

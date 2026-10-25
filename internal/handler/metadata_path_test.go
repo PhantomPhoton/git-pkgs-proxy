@@ -236,34 +236,67 @@ func TestLegacyMetadataMismatchedBlobNotServed(t *testing.T) {
 	}
 }
 
-// TestLegacyMetadataSharedPathKeptForCaseVariant checks that a legacy blob is
-// not queued for deletion while a key differing only in case still reads its
-// own legacy path, which on a case-insensitive filesystem is the same file,
-// and that both are queued once neither does.
-func TestLegacyMetadataSharedPathKeptForCaseVariant(t *testing.T) {
+// caseFoldingStorage stores paths differing only in case as one file, as a
+// case-insensitive filesystem does.
+type caseFoldingStorage struct{ storage.Storage }
+
+func (s caseFoldingStorage) Store(ctx context.Context, path string, r io.Reader) (int64, string, error) {
+	return s.Storage.Store(ctx, strings.ToLower(path), r)
+}
+
+func (s caseFoldingStorage) Open(ctx context.Context, path string) (io.ReadCloser, error) {
+	return s.Storage.Open(ctx, strings.ToLower(path))
+}
+
+func (s caseFoldingStorage) Exists(ctx context.Context, path string) (bool, error) {
+	return s.Storage.Exists(ctx, strings.ToLower(path))
+}
+
+func (s caseFoldingStorage) Delete(ctx context.Context, path string) error {
+	return s.Storage.Delete(ctx, strings.ToLower(path))
+}
+
+func (s caseFoldingStorage) Size(ctx context.Context, path string) (int64, error) {
+	return s.Storage.Size(ctx, strings.ToLower(path))
+}
+
+// TestLegacyMetadataCaseVariantRefetchedAfterReclaim checks that on
+// case-insensitive storage, a key whose legacy blob was shared with a case
+// variant and deleted after that variant moved is fetched again rather than
+// served.
+func TestLegacyMetadataCaseVariantRefetchedAfterReclaim(t *testing.T) {
+	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
+		requests.Add(1)
+		_, _ = io.WriteString(w, "fresh")
 	}))
 	defer upstream.Close()
 	proxy, db := fileStorageProxy(t, upstream.Client())
+	proxy.Storage = caseFoldingStorage{proxy.Storage}
 
-	// Both rows hold the same document, so the test runs alike whether or
-	// not the filesystem folds case.
-	upper := seedLegacyMetadata(t, proxy, db, "github.com/Sirupsen/logrus", "doc", "doc", time.Now())
-	lower := seedLegacyMetadata(t, proxy, db, "github.com/sirupsen/logrus", "doc", "doc", time.Now())
+	const upper, lower = "github.com/Sirupsen/logrus", "github.com/sirupsen/logrus"
+	seedLegacyMetadata(t, proxy, db, upper, "doc", "doc", time.Now())
+	seedLegacyMetadata(t, proxy, db, lower, "doc", "doc", time.Now())
 
-	if _, _, err := proxy.FetchOrCacheMetadata(context.Background(), "go", "github.com/Sirupsen/logrus", upstream.URL+"/x"); err != nil {
+	if body, _, err := proxy.FetchOrCacheMetadata(context.Background(), "go", upper, upstream.URL+"/x"); err != nil || string(body) != "doc" {
+		t.Fatalf("FetchOrCacheMetadata(%s) = %q, %v; want the migrated document", upper, body, err)
+	}
+	// Reclaim deletes the queued legacy blob, which is also lower's.
+	for _, path := range pendingDeletes(t, db) {
+		if err := proxy.Storage.Delete(context.Background(), path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body, _, err := proxy.FetchOrCacheMetadata(context.Background(), "go", lower, upstream.URL+"/x")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if due := pendingDeletes(t, db); len(due) != 0 {
-		t.Fatalf("pending deletes = %v while a case variant still reads its legacy blob", due)
+	if string(body) != "fresh" || requests.Load() != 1 {
+		t.Errorf("served %q after %d upstream requests, want a fresh fetch", body, requests.Load())
 	}
-	if _, _, err := proxy.FetchOrCacheMetadata(context.Background(), "go", "github.com/sirupsen/logrus", upstream.URL+"/x"); err != nil {
-		t.Fatal(err)
-	}
-	due := pendingDeletes(t, db)
-	if !slices.Contains(due, upper) || !slices.Contains(due, lower) {
-		t.Errorf("pending deletes = %v, want %q and %q", due, upper, lower)
+	if got, want := metadataRowPath(t, db, lower), metadataStoragePath("go", lower); got != want {
+		t.Errorf("storage path = %q, want %q", got, want)
 	}
 }
 
