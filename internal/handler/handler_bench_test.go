@@ -136,6 +136,32 @@ func BenchmarkReadMetadata(b *testing.B) {
 	}
 }
 
+// BenchmarkReadMetadataSized reads a large document with and without its
+// size known, as for a cached document or a response with Content-Length.
+func BenchmarkReadMetadataSized(b *testing.B) {
+	const size = 64 << 20
+	payload := bytes.Repeat([]byte("x"), size)
+	proxy := &Proxy{MetadataMaxSize: 100 << 20}
+	for _, bench := range []struct {
+		name string
+		hint int64
+	}{
+		{"unknown size", -1},
+		{"known size", size},
+	} {
+		b.Run(bench.name, func(b *testing.B) {
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for b.Loop() {
+				data, err := proxy.ReadMetadataSized(bytes.NewReader(payload), bench.hint)
+				if err != nil || len(data) != size {
+					b.Fatalf("read %d bytes, %v", len(data), err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkArtifactPURLConstruction(b *testing.B) {
 	for _, tc := range []struct {
 		name      string

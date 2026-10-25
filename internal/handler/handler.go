@@ -149,13 +149,51 @@ var ErrMetadataTooLarge = errors.New("metadata response exceeds size limit")
 // from unexpectedly large responses. Returns ErrMetadataTooLarge if the response
 // is truncated by the limit.
 func (p *Proxy) ReadMetadata(r io.Reader) ([]byte, error) {
+	return p.ReadMetadataSized(r, -1)
+}
+
+// ReadMetadataSized is ReadMetadata for a body expected to be size bytes
+// long, such as a cached document or a response with a Content-Length.
+// Reading into a buffer of that size avoids io.ReadAll growing its buffer
+// step by step, which peaks at more than twice the document size. size is
+// only a hint: a negative one, or one above the limit, reads as ReadMetadata
+// does, and a body of a different length is still read correctly.
+func (p *Proxy) ReadMetadataSized(r io.Reader, size int64) ([]byte, error) {
 	limit := p.MetadataMaxSize
 	if limit <= 0 {
 		limit = defaultMetadataMaxSize
 	}
-	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if size < 0 || size > limit {
+		return readLimited(r, nil, limit)
+	}
+	// One byte more than expected, so a body of exactly size bytes ends in
+	// the buffer and a longer one is noticed.
+	buf := make([]byte, size+1)
+	n, err := io.ReadFull(r, buf)
+	switch {
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		if int64(n) < size/2 {
+			// The hint was far off; don't keep the oversized buffer alive.
+			return bytes.Clone(buf[:n]), nil
+		}
+		return buf[:n], nil
+	case err != nil:
+		return nil, err
+	}
+	return readLimited(r, buf, limit)
+}
+
+// readLimited appends the rest of r to data, failing with
+// ErrMetadataTooLarge once the total exceeds limit.
+func readLimited(r io.Reader, data []byte, limit int64) ([]byte, error) {
+	rest, err := io.ReadAll(io.LimitReader(r, limit+1-int64(len(data))))
 	if err != nil {
 		return nil, err
+	}
+	if data == nil {
+		data = rest
+	} else {
+		data = append(data, rest...)
 	}
 	if int64(len(data)) > limit {
 		return nil, ErrMetadataTooLarge
@@ -494,7 +532,7 @@ func (p *Proxy) readStored(ctx context.Context, pkgPURL, versionPURL, filename s
 		return nil, nil
 	}
 
-	result.Reader, err = checks.wrapFailOnMismatch(reader,
+	result.Reader, err = checks.forStoredObject().wrapFailOnMismatch(reader,
 		func(reason string) {
 			p.Logger.Error("cached artifact failed integrity check",
 				"purl", versionPURL, "filename", filename,
@@ -1671,7 +1709,7 @@ func (p *Proxy) readCachedMetadata(ctx context.Context, entry *database.Metadata
 		return nil, "", err
 	}
 	defer func() { _ = cached.Close() }()
-	data, err := p.ReadMetadata(cached)
+	data, err := p.ReadMetadataSized(cached, metadataEntrySize(entry))
 	if err == nil && validate != nil {
 		err = validate(data)
 	}
@@ -1684,6 +1722,15 @@ func (p *Proxy) readCachedMetadata(ctx context.Context, entry *database.Metadata
 		ct = entry.ContentType.String
 	}
 	return data, ct, nil
+}
+
+// metadataEntrySize is the recorded size of a cached metadata document, or
+// -1 when none is recorded.
+func metadataEntrySize(entry *database.MetadataCacheEntry) int64 {
+	if !entry.Size.Valid {
+		return -1
+	}
+	return entry.Size.Int64
 }
 
 // recordMetadataRead marks a cached metadata document as used, so size
@@ -1747,7 +1794,7 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 			return nil, errStale304
 		}
 		defer func() { _ = cached.Close() }()
-		data, readErr := p.ReadMetadata(cached)
+		data, readErr := p.ReadMetadataSized(cached, metadataEntrySize(entry))
 		if readErr != nil {
 			return nil, errStale304
 		}
@@ -1772,7 +1819,9 @@ func (p *Proxy) fetchUpstreamMetadata(ctx context.Context, upstreamURL string, e
 		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
 
-	body, err := p.ReadMetadata(resp.Body)
+	// ContentLength is -1 when the transport decompresses the body, and
+	// otherwise the length of the bytes read here.
+	body, err := p.ReadMetadataSized(resp.Body, resp.ContentLength)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

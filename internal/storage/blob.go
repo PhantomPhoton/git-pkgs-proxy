@@ -22,6 +22,16 @@ import (
 
 const osWindows = "windows"
 
+// Upload buffering for cloud backends. The S3 driver otherwise allocates
+// (5+1) x 8 MiB part buffers up front for every object over 16 MiB, and the
+// Azure driver uses 5 x 8 MiB blocks; with several large artifacts being
+// cached at once that adds up to hundreds of MiB. 5 MiB is the smallest part
+// S3 accepts. The file backend ignores both.
+const (
+	uploadBufferSize  = 5 << 20
+	uploadConcurrency = 2
+)
+
 // attrsExt is fileblob's sidecar suffix, kept only to clear sidecars an
 // earlier version wrote.
 const attrsExt = ".attrs"
@@ -212,7 +222,10 @@ func (b *Blob) Store(ctx context.Context, path string, r io.Reader) (int64, stri
 	writeCtx, abort := context.WithCancel(ctx)
 	defer abort()
 
-	opts := &blob.WriterOptions{}
+	opts := &blob.WriterOptions{
+		BufferSize:     uploadBufferSize,
+		MaxConcurrency: uploadConcurrency,
+	}
 	w, err := b.bucket.NewWriter(writeCtx, path, opts)
 	if err != nil {
 		return 0, "", fmt.Errorf("creating writer: %w", err)
