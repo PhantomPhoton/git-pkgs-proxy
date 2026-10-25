@@ -649,13 +649,19 @@ var archiveExtensions = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".tar.Z", ".t
 // bdist_msi formats, which share a filename layout.
 var windowsInstallerExtensions = []string{".exe", ".msi"}
 
-// parseFilename extracts package name and version from a PyPI filename.
-// Handles wheels, sdists and legacy bdist formats:
+func (h *PyPIHandler) parseFilename(filename string) (name, version string) {
+	return PyPIFilenameIdentity(filename)
+}
+
+// PyPIFilenameIdentity extracts the package name and version a PyPI file is
+// cached under from its filename, so proxy mirror stores files where the
+// download handler looks for them. Handles wheels, sdists and legacy bdist
+// formats:
 // - requests-2.31.0-py3-none-any.whl
 // - requests-2.31.0.tar.gz
 // - numpy-1.8.0-py2.7-macosx-10.9-x86_64.egg
 // - numpy-1.8.0.win32-py2.7.exe
-func (h *PyPIHandler) parseFilename(filename string) (name, version string) {
+func PyPIFilenameIdentity(filename string) (name, version string) {
 	// PEP 658/714 core-metadata sidecars are the distribution filename plus
 	// ".metadata"; they describe the same name and version. Without this, pip's
 	// metadata-only fetches fall back to a hash-derived package identifier.

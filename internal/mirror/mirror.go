@@ -3,6 +3,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -226,6 +227,10 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "reason", m.RefusePackages)
 		return
 	}
+	if pv.Ecosystem == "pypi" {
+		m.mirrorFiles(ctx, pv, tracker)
+		return
+	}
 	result, err := m.proxy.GetOrFetchArtifact(ctx, pv.Ecosystem, pv.Name, pv.Version, "")
 	if err != nil {
 		tracker.failed.Add(1)
@@ -250,4 +255,71 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version,
 			"size", result.Artifact.Size)
 	}
+}
+
+// mirrorFiles mirrors every file of a PyPI version, or only the one named by
+// the file_name qualifier. Each file is cached under the name and version
+// the download handler reads from its filename, so clients are served it.
+func (m *Mirror) mirrorFiles(ctx context.Context, pv PackageVersion, tracker *progressTracker) {
+	fail := func(err error) {
+		tracker.failed.Add(1)
+		tracker.addError(pv.Ecosystem, pv.Name, pv.Version, err.Error())
+		m.logger.Warn("mirror failed",
+			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "error", err)
+	}
+	files, err := m.fileLister().ListFiles(ctx, pv.Ecosystem, pv.Name, pv.Version)
+	if err != nil {
+		fail(fmt.Errorf("listing files: %w", err))
+		return
+	}
+	wantFile := pv.Qualifiers["file_name"]
+	var matched, fetched int
+	var size int64
+	for _, file := range files {
+		if wantFile != "" && file.Filename != wantFile {
+			continue
+		}
+		matched++
+		name, version := handler.PyPIFilenameIdentity(file.Filename)
+		if name == "" {
+			name, version = pv.Name, pv.Version
+		}
+		result, err := m.proxy.GetOrFetchArtifactFromURLWithIntegrity(ctx, pv.Ecosystem, name, version, file.Filename, file.URL, file.Integrity)
+		if err != nil {
+			fail(fmt.Errorf("%s: %w", file.Filename, err))
+			return
+		}
+		if result.Reader != nil {
+			_ = result.Reader.Close()
+		}
+		if !result.Cached {
+			fetched++
+			size += result.Artifact.Size
+		}
+	}
+	switch {
+	case matched == 0 && wantFile != "":
+		fail(fmt.Errorf("no file named %q", wantFile))
+	case matched == 0:
+		fail(errors.New("version has no files"))
+	case fetched == 0:
+		tracker.skipped.Add(1)
+		m.logger.Debug("already cached",
+			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version)
+	default:
+		tracker.completed.Add(1)
+		tracker.bytes.Add(size)
+		m.logger.Info("mirrored",
+			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version,
+			"files", fetched, "size", size)
+	}
+}
+
+// fileLister lists files from where Versions lists versions, so both come
+// from the configured upstream.
+func (m *Mirror) fileLister() FileLister { //nolint:ireturn // any lister will do
+	if lister, ok := m.Versions.(FileLister); ok {
+		return lister
+	}
+	return RegistryVersions{}
 }

@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries"
@@ -22,8 +23,40 @@ type RegistryVersions struct {
 	URL func(purlType, name string) (string, error)
 }
 
+// FileLister lists the files of one package version, for ecosystems that
+// publish several files per version.
+type FileLister interface {
+	ListFiles(ctx context.Context, ecosystem, name, version string) ([]registries.Artifact, error)
+}
+
 // ListVersions implements VersionLister.
 func (r RegistryVersions) ListVersions(ctx context.Context, ecosystem, name string) ([]string, error) {
+	versions, err := r.fetchVersions(ctx, ecosystem, name)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, len(versions))
+	for i, v := range versions {
+		result[i] = v.Number
+	}
+	return result, nil
+}
+
+// ListFiles implements FileLister.
+func (r RegistryVersions) ListFiles(ctx context.Context, ecosystem, name, version string) ([]registries.Artifact, error) {
+	versions, err := r.fetchVersions(ctx, ecosystem, name)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range versions {
+		if v.Number == version {
+			return v.Artifacts, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s %s@%s", registries.ErrNotFound, ecosystem, name, version)
+}
+
+func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name string) ([]registries.Version, error) {
 	purlType := purl.EcosystemToPURLType(ecosystem)
 	var baseURL string
 	if r.URL != nil {
@@ -40,13 +73,5 @@ func (r RegistryVersions) ListVersions(ctx context.Context, ecosystem, name stri
 	if err != nil {
 		return nil, err
 	}
-	versions, err := reg.FetchVersions(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]string, len(versions))
-	for i, v := range versions {
-		result[i] = v.Number
-	}
-	return result, nil
+	return reg.FetchVersions(ctx, name)
 }
