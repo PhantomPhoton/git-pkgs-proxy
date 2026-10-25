@@ -853,6 +853,14 @@ is cut off. If the object's content is already stored under another
 repository, such as a fork, it is copied from there instead of downloaded,
 once the upstream has confirmed this repository has it; the copy takes its
 own space.
+
+Large LFS objects may need longer timeouts. The proxy downloads an object it
+doesn't have before sending any of it, within `artifact_timeout`, and the
+whole response, download included, must fit within `write_timeout`; both
+default to 5 minutes. git-lfs gives up on a response after 30 seconds without
+data (`lfs.activitytimeout`) and retries. A retry waits for the download still
+running, so the object is served once it is cached, but a download that
+outlasts git-lfs's retries fails that clone or pull until it finishes.
 Download URLs are often signed; only the URL without its query is logged
 and recorded with the object. An object is only cached once its content
 matches its sha256 object ID. Objects are cached per repository, so one
