@@ -3,6 +3,7 @@ package mirror
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/sbom"
@@ -14,7 +15,8 @@ type PackageVersion struct {
 	Name      string
 	Version   string
 	// Qualifiers are the PURL qualifiers. Images use repository_url, tag and
-	// arch; PyPI uses file_name to mirror one file of the version.
+	// arch; PyPI uses file_name, and conda subdir, build and type, to select
+	// which files of the version are mirrored.
 	Qualifiers map[string]string
 	// Platforms limit which platforms of an image index are mirrored.
 	Platforms []string
@@ -67,19 +69,20 @@ func (s *PURLSource) Enumerate(ctx context.Context, fn func(PackageVersion) erro
 
 		ecosystem := handlerEcosystem(p.Type)
 		name := p.Name
-		if p.Namespace != "" {
+		if ecosystem == "conda" {
+			name = condaName(p.Namespace, p.Name, p.Qualifier("channel"))
+		} else if p.Namespace != "" {
 			name = p.Namespace + "/" + p.Name
 		}
+		qualifiers := fileQualifiers(ecosystem, p.Qualifiers.Map())
 
-		if p.Version != "" || isImageEcosystem(ecosystem) {
-			// Images are never expanded to all tags; an unversioned image
-			// fails when it is mirrored.
-			pv := PackageVersion{Ecosystem: ecosystem, Name: name, Version: p.Version}
+		// Images are never expanded to all tags, and conda packages without
+		// a channel aren't listed; both fail when they are mirrored.
+		if p.Version != "" || isImageEcosystem(ecosystem) || (ecosystem == "conda" && !strings.Contains(name, "/")) {
+			pv := PackageVersion{Ecosystem: ecosystem, Name: name, Version: p.Version, Qualifiers: qualifiers}
 			if isImageEcosystem(ecosystem) {
 				pv.Qualifiers = p.Qualifiers.Map()
 				pv.Platforms = s.Platforms
-			} else if fileName := p.Qualifier("file_name"); fileName != "" && ecosystem == "pypi" {
-				pv.Qualifiers = map[string]string{"file_name": fileName}
 			}
 			if err := fn(pv); err != nil {
 				return err
@@ -93,7 +96,7 @@ func (s *PURLSource) Enumerate(ctx context.Context, fn func(PackageVersion) erro
 			return fmt.Errorf("fetching versions for %s/%s: %w", ecosystem, name, err)
 		}
 		for _, v := range listed {
-			if err := fn(PackageVersion{Ecosystem: ecosystem, Name: name, Version: v}); err != nil {
+			if err := fn(PackageVersion{Ecosystem: ecosystem, Name: name, Version: v, Qualifiers: qualifiers}); err != nil {
 				return err
 			}
 		}
