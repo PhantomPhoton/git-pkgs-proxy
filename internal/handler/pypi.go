@@ -1,14 +1,17 @@
 package handler
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"mime"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -40,11 +43,10 @@ const (
 
 // PyPIHandler handles PyPI registry protocol requests.
 type PyPIHandler struct {
-	proxy          *Proxy
-	upstreamURL    string
-	downloadURL    string
-	downloadHrefRe *regexp.Regexp
-	proxyURL       string
+	proxy       *Proxy
+	upstreamURL string
+	downloadURL string
+	proxyURL    string
 }
 
 // PyPI files are stored under pkg:pypi/{name}, the name taken from the
@@ -65,7 +67,6 @@ func NewPyPIHandlerWithUpstreams(proxy *Proxy, proxyURL, upstreamURL, downloadUR
 		downloadURL: configuredUpstreamURL(downloadURL, pypiDownloadUpstream),
 		proxyURL:    strings.TrimSuffix(proxyURL, "/"),
 	}
-	h.downloadHrefRe = regexp.MustCompile(`href="(` + regexp.QuoteMeta(h.downloadURL) + `/packages/[^"]+)"`)
 	return h
 }
 
@@ -107,8 +108,24 @@ func (h *PyPIHandler) handleSimplePackage(w http.ResponseWriter, r *http.Request
 	accept := selectPyPISimpleRepresentation(r.Header.Get("Accept"))
 	cacheKey := pypiSimpleCacheKey(name, accept)
 
-	body, contentType, err := h.proxy.FetchOrCacheMetadata(r.Context(), "pypi", cacheKey, upstreamURL, accept)
-	if err != nil {
+	// Rewritten pages go through the rewrite cache, keyed by the upstream
+	// page, its content type and the versions filtered out. Without cooldown
+	// the filtered versions are known up front, so a repeat request can be
+	// answered without reading the stored page.
+	cooldown := h.proxy.cooldownApplies("pypi", name)
+	if !cooldown {
+		denied := h.addDeniedVersions(name, nil)
+		if stored, contentType, ok := h.proxy.storedRewriteVariant("pypi", cacheKey, h.proxyURL, cacheKey, func(contentType string) []string {
+			return simpleRewriteVariant(contentType, denied)
+		}); ok {
+			ensureVaryAccept(w.Header())
+			serveRewrittenMetadataAs(w, r, stored, contentType)
+			return
+		}
+	}
+
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "pypi", cacheKey, upstreamURL, accept, nil)
+	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -120,44 +137,70 @@ func (h *PyPIHandler) handleSimplePackage(w http.ResponseWriter, r *http.Request
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
+	contentType := upstream.contentType
 
 	// When cooldown applies, fetch JSON metadata to get version timestamps
 	var filteredVersions map[string]bool
-	if h.proxy.cooldownApplies("pypi", name) {
+	if cooldown {
+		var err error
 		filteredVersions, err = h.fetchFilteredVersions(r, name)
 		if err != nil {
 			h.proxy.writeCooldownLookupError(w, "pypi", name, err)
 			return
 		}
 	}
-	for version := range h.proxy.Denylist.Versions(canonicalPackagePURL("pypi", name)) {
-		if filteredVersions == nil {
-			filteredVersions = make(map[string]bool)
-		}
-		filteredVersions[version] = true
-	}
+	filteredVersions = h.addDeniedVersions(name, filteredVersions)
 
-	var rewritten []byte
-	if isJSONMediaType(contentType) {
-		rewritten, err = h.rewriteSimpleJSON(body, filteredVersions)
-		if err != nil {
-			if len(filteredVersions) != 0 {
-				h.proxy.Logger.Error("failed to filter pypi simple json", "package", name, "error", err)
-				http.Error(w, "failed to filter package metadata", http.StatusBadGateway)
-				return
-			}
-			h.proxy.Logger.Warn("failed to rewrite pypi simple json, proxying original", "error", err)
-			rewritten = body
+	isJSON := isJSONMediaType(contentType)
+	digest := variantDigest(upstream.digest, upstream.body, simpleRewriteVariant(contentType, filteredVersions)...)
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "pypi", h.proxyURL, cacheKey, upstream.body, digest, func(body []byte) ([]byte, []string, error) {
+		if isJSON {
+			out, err := h.rewriteSimpleJSON(body, filteredVersions)
+			return out, nil, err
 		}
-	} else {
 		body = h.filterSimpleHTMLLinks(body, filteredVersions)
-		rewritten = h.rewriteSimpleHTML(body, filteredVersions)
+		return h.rewriteSimpleHTML(body, filteredVersions), nil, nil
+	})
+	if err != nil {
+		if r.Context().Err() != nil {
+			return // the client left while waiting on a shared rewrite
+		}
+		if len(filteredVersions) != 0 {
+			h.proxy.Logger.Error("failed to filter pypi simple json", "package", name, "error", err)
+			http.Error(w, "failed to filter package metadata", http.StatusBadGateway)
+			return
+		}
+		h.proxy.Logger.Warn("failed to rewrite pypi simple json, proxying original", "error", err)
+		w.Header().Set(headerContentType, contentType)
+		ensureVaryAccept(w.Header())
+		markStale(w, upstream.stale)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(upstream.body)
+		return
 	}
 
-	w.Header().Set(headerContentType, contentType)
 	ensureVaryAccept(w.Header())
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(rewritten)
+	markStale(w, upstream.stale)
+	serveRewrittenMetadataAs(w, r, rewritten, contentType)
+}
+
+// addDeniedVersions adds the package's denylisted versions to filtered,
+// allocating it when there are any and it is nil.
+func (h *PyPIHandler) addDeniedVersions(name string, filtered map[string]bool) map[string]bool {
+	for version := range h.proxy.Denylist.Versions(canonicalPackagePURL("pypi", name)) {
+		if filtered == nil {
+			filtered = make(map[string]bool)
+		}
+		filtered[version] = true
+	}
+	return filtered
+}
+
+// simpleRewriteVariant returns what a simple page rewrite depends on besides
+// the upstream page: its content type, which picks the HTML or JSON rewrite,
+// and the versions filtered out.
+func simpleRewriteVariant(contentType string, filtered map[string]bool) []string {
+	return append([]string{contentType}, slices.Sorted(maps.Keys(filtered))...)
 }
 
 func selectPyPISimpleRepresentation(accept string) string {
@@ -258,14 +301,7 @@ func isJSONMediaType(contentType string) bool {
 }
 
 func ensureVaryAccept(header http.Header) {
-	for _, value := range header.Values("Vary") {
-		for field := range strings.SplitSeq(value, ",") {
-			if strings.EqualFold(strings.TrimSpace(field), "Accept") {
-				return
-			}
-		}
-	}
-	header.Add("Vary", "Accept")
+	ensureVary(header, "Accept")
 }
 
 // fetchFilteredVersions fetches JSON metadata and returns a set of version
@@ -328,17 +364,21 @@ func (h *PyPIHandler) fetchReleaseTimes(r *http.Request, name string) (map[strin
 	return times, nil
 }
 
+var (
+	// simpleLinkRe matches a whole anchor tag: <a ...href="...">filename</a>.
+	simpleLinkRe = regexp.MustCompile(`<a[^>]+href="[^"]*"[^>]*>[^<]+</a>`)
+	// simpleLinkTextRe captures an anchor's text.
+	simpleLinkTextRe = regexp.MustCompile(`>([^<]+)</a>`)
+)
+
 // rewriteSimpleHTML rewrites package URLs in simple API HTML to point at this proxy.
 // If filteredVersions is non-nil, links for those versions are removed entirely.
 func (h *PyPIHandler) rewriteSimpleHTML(body []byte, filteredVersions map[string]bool) []byte {
 	// If cooldown filtering is active, remove entire <a> tags for filtered versions
 	if len(filteredVersions) > 0 {
-		// Match full anchor tags: <a ...href="...">filename</a>
-		linkRe := regexp.MustCompile(`<a[^>]+href="[^"]*"[^>]*>[^<]+</a>`)
-		body = linkRe.ReplaceAllFunc(body, func(match []byte) []byte {
+		body = simpleLinkRe.ReplaceAllFunc(body, func(match []byte) []byte {
 			// Extract filename from between tags
-			innerRe := regexp.MustCompile(`>([^<]+)</a>`)
-			innerMatch := innerRe.FindSubmatch(match)
+			innerMatch := simpleLinkTextRe.FindSubmatch(match)
 			if len(innerMatch) < minSubmatchParts {
 				return match
 			}
@@ -351,18 +391,49 @@ func (h *PyPIHandler) rewriteSimpleHTML(body []byte, filteredVersions map[string
 		})
 	}
 
-	// Match href attributes pointing to packages on the configured download host.
-	return h.downloadHrefRe.ReplaceAllFunc(body, func(match []byte) []byte {
-		submatch := h.downloadHrefRe.FindSubmatch(match)
-		if len(submatch) < minSubmatchParts {
-			return match
+	return h.rewriteDownloadHrefs(body)
+}
+
+// rewriteDownloadHrefs points href attributes for files on the configured
+// download host at the proxy. It makes the same replacements as the regular
+// expression `href="(<download URL>/packages/[^"]+)"` would: an href
+// whose URL starts with the download host's /packages/ and has at least one
+// more character before the closing quote. Finding the literal prefix is many
+// times faster than running the regular expression over every link.
+func (h *PyPIHandler) rewriteDownloadHrefs(body []byte) []byte {
+	from := []byte(`href="` + h.downloadURL + `/packages/`)
+	// The download route is /pypi/packages/{path...} and keeps the path
+	// from the download host, /packages/ included.
+	to := []byte(`href="` + h.proxyURL + `/pypi/packages/packages/`)
+
+	var out []byte
+	done := 0 // body[:done] is in out already
+	for search := 0; ; {
+		i := bytes.Index(body[search:], from)
+		if i < 0 {
+			break
 		}
-
-		origURL := string(submatch[1])
-
-		newURL := h.proxyURL + "/pypi/packages" + strings.TrimPrefix(origURL, h.downloadURL)
-		return []byte(fmt.Sprintf(`href="%s"`, newURL))
-	})
+		start := search + i
+		rest := start + len(from)
+		end := bytes.IndexByte(body[rest:], '"')
+		if end <= 0 {
+			// No closing quote, or nothing before it: not a match. The
+			// regular expression would go on looking from the next byte.
+			search = start + 1
+			continue
+		}
+		if out == nil {
+			out = make([]byte, 0, len(body)+len(body)/8)
+		}
+		out = append(out, body[done:start]...)
+		out = append(out, to...)
+		done = rest
+		search = rest + end + 1
+	}
+	if out == nil {
+		return body
+	}
+	return append(out, body[done:]...)
 }
 
 func (h *PyPIHandler) rewriteSimpleJSON(body []byte, filteredVersions map[string]bool) ([]byte, error) {
@@ -434,9 +505,15 @@ func (h *PyPIHandler) handleVersionJSON(w http.ResponseWriter, r *http.Request) 
 }
 
 // proxyAndRewriteJSON fetches JSON metadata and rewrites download URLs.
+// Rewrites go through the rewrite cache, as for npm.
 func (h *PyPIHandler) proxyAndRewriteJSON(w http.ResponseWriter, r *http.Request, upstreamURL, cacheKey string) {
-	body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "pypi", cacheKey, upstreamURL)
-	if err != nil {
+	if stored, ok := h.proxy.storedRewrite("pypi", cacheKey, h.proxyURL, cacheKey); ok {
+		serveRewrittenMetadata(w, r, stored)
+		return
+	}
+
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "pypi", cacheKey, upstreamURL, contentTypeJSON, nil)
+	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -449,29 +526,35 @@ func (h *PyPIHandler) proxyAndRewriteJSON(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	rewritten, err := h.rewriteJSONMetadata(body)
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), "pypi", h.proxyURL, cacheKey, upstream.body, upstream.digest, h.rewriteJSONMetadata)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return // the client left while waiting on a shared rewrite
+		}
 		if h.proxy.mustFilterMetadata("pypi", r.PathValue("name")) {
 			h.proxy.Logger.Error("failed to filter pypi metadata", "url", upstreamURL, "error", err)
 			http.Error(w, "failed to filter package metadata", http.StatusBadGateway)
 			return
 		}
 		h.proxy.Logger.Warn("failed to rewrite metadata, proxying original", "error", err)
+		markStale(w, upstream.stale)
 		w.Header().Set(headerContentType, "application/json")
-		_, _ = w.Write(body)
+		_, _ = w.Write(upstream.body)
 		return
 	}
 
-	w.Header().Set(headerContentType, "application/json")
-	_, _ = w.Write(rewritten)
+	markStale(w, upstream.stale)
+	serveRewrittenMetadata(w, r, rewritten)
 }
 
 // rewriteJSONMetadata rewrites download URLs in PyPI JSON metadata.
 // If cooldown is enabled, versions published too recently are filtered out.
-func (h *PyPIHandler) rewriteJSONMetadata(body []byte) ([]byte, error) {
+// It also returns what it kept: the releases, and the current version's files
+// unless they were dropped.
+func (h *PyPIHandler) rewriteJSONMetadata(body []byte) ([]byte, []string, error) {
 	var metadata map[string]any
 	if err := json.Unmarshal(body, &metadata); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	packageName, _ := extractPyPIName(metadata)
@@ -483,7 +566,17 @@ func (h *PyPIHandler) rewriteJSONMetadata(body []byte) ([]byte, error) {
 	h.filterAndRewriteReleases(metadata, packageName, packagePURL)
 	h.filterAndRewriteURLs(metadata, packagePURL)
 
-	return json.Marshal(metadata)
+	var kept []string
+	if releases, ok := metadata["releases"].(map[string]any); ok {
+		kept = slices.Collect(maps.Keys(releases))
+	}
+	if urls, ok := metadata["urls"].([]any); ok && len(urls) > 0 {
+		// Not a valid release key, so it can't be confused with one.
+		kept = append(kept, "\x00urls")
+	}
+
+	out, err := json.Marshal(metadata)
+	return out, kept, err
 }
 
 // filterAndRewriteReleases applies cooldown filtering and URL rewriting to the

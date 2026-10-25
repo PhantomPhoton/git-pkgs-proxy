@@ -374,27 +374,66 @@ func (p *Proxy) cooldownEnabled() bool {
 // again. When it reports false the caller takes the usual fetch and rewrite
 // path.
 func (p *Proxy) storedRewrite(ecosystem, cacheKey, proxyURL, name string) (rewrittenMetadata, bool) {
+	m, _, ok := p.storedRewriteVariant(ecosystem, cacheKey, proxyURL, name, nil)
+	return m, ok
+}
+
+// storedRewriteVariant is storedRewrite for a rewrite whose output depends on
+// more than the stored document. variant is given the stored content type
+// and returns the rest of what the rewrite depends on, as passed to
+// variantDigest; nil means nothing else. It also returns the stored content
+// type, as a fetch of the document would.
+func (p *Proxy) storedRewriteVariant(ecosystem, cacheKey, proxyURL, name string, variant func(contentType string) []string) (rewrittenMetadata, string, bool) {
 	if p.rewrites == nil {
-		return rewrittenMetadata{}, false
+		return rewrittenMetadata{}, "", false
 	}
 	if !p.CacheMetadata || p.DB == nil || p.MetadataTTL <= 0 {
-		return rewrittenMetadata{}, false
+		return rewrittenMetadata{}, "", false
 	}
 	entry, err := p.DB.GetMetadataCache(ecosystem, cacheKey)
 	if err != nil || entry == nil || !entry.ContentDigest.Valid || entry.ContentEncoding.String != "" {
-		return rewrittenMetadata{}, false
+		return rewrittenMetadata{}, "", false
 	}
 	if !entry.FetchedAt.Valid || time.Since(entry.FetchedAt.Time) >= p.MetadataTTL {
-		return rewrittenMetadata{}, false
+		return rewrittenMetadata{}, "", false
 	}
-	m, ok := p.rewrites.get(rewriteCacheKeyForDigest(ecosystem, proxyURL, name, entry.ContentDigest.String))
+	contentType := contentTypeJSON
+	if entry.ContentType.Valid {
+		contentType = entry.ContentType.String
+	}
+	digest := entry.ContentDigest.String
+	if variant != nil {
+		digest = variantDigest(digest, nil, variant(contentType)...)
+	}
+	m, ok := p.rewrites.get(rewriteCacheKeyForDigest(ecosystem, proxyURL, name, digest))
 	if !ok {
-		return rewrittenMetadata{}, false
+		return rewrittenMetadata{}, "", false
 	}
 	m.lastModified = p.metadataDate(ecosystem, proxyURL, name, m.etag)
 	metrics.RecordMetadataCacheHit(ecosystem, len(m.body))
 	p.recordMetadataRead(entry)
-	return m, true
+	return m, contentType, true
+}
+
+// variantDigest returns a digest for a rewrite of in that also depends on
+// parts, such as the content type or the versions a filter removes, so that
+// rewrites differing in them are cached apart. digest is in's digest as the
+// metadata cache records it, or empty to hash in. Passed to cachedRewrite in
+// place of the document's digest, it keeps the metadata date keyed by the
+// package alone.
+func variantDigest(digest string, in []byte, parts ...string) string {
+	if digest == "" {
+		sum := sha256.Sum256(in)
+		digest = "sha256:" + hex.EncodeToString(sum[:])
+	}
+	h := sha256.New()
+	var length []byte
+	for _, part := range parts {
+		length = binary.AppendUvarint(length[:0], uint64(len(part)))
+		_, _ = h.Write(length)
+		_, _ = io.WriteString(h, part)
+	}
+	return digest + "+" + hex.EncodeToString(h.Sum(nil))
 }
 
 // serveRewrittenMetadata writes rewritten metadata with its validators, or
@@ -413,7 +452,7 @@ func serveRewrittenMetadataAs(w http.ResponseWriter, r *http.Request, m rewritte
 	if compressed {
 		body, etag = m.gzipped, gzipETag(m.etag)
 	}
-	w.Header().Set("Vary", headerAcceptEncoding)
+	ensureVary(w.Header(), headerAcceptEncoding)
 	w.Header().Set(headerETag, etag)
 	if !m.lastModified.IsZero() {
 		w.Header().Set(headerLastModified, m.lastModified.UTC().Format(http.TimeFormat))
@@ -428,6 +467,18 @@ func serveRewrittenMetadataAs(w http.ResponseWriter, r *http.Request, m rewritte
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// ensureVary adds field to the Vary header unless it is listed already.
+func ensureVary(header http.Header, field string) {
+	for _, value := range header.Values("Vary") {
+		for listed := range strings.SplitSeq(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(listed), field) {
+				return
+			}
+		}
+	}
+	header.Add("Vary", field)
 }
 
 // gzipETag returns the ETag of the gzip representation of the document

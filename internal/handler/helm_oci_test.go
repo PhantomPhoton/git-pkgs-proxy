@@ -57,7 +57,7 @@ entries:
 	if !strings.Contains(response.Body.String(), ociURL) || !strings.Contains(response.Body.String(), h.chartProxyURL("mixed", digest, "demo-1.0.0.tgz")) {
 		t.Fatalf("incorrectly rewritten index: %s", response.Body.String())
 	}
-	download, err := h.findChartDownload(upstream.URL, []byte(index), digest, "demo-1.0.0.tgz")
+	download, err := h.findChartDownload("mixed", upstream.URL, metadataResult{body: []byte(index)}, digest, "demo-1.0.0.tgz")
 	if err != nil || download != upstream.URL+"/demo-1.0.0.tgz" {
 		t.Fatalf("HTTP chart lookup = %q, %v", download, err)
 	}
@@ -103,7 +103,7 @@ func TestHelmOCIReferenceRewriting(t *testing.T) {
 			}
 			h := NewHelmHandlerWithOCIRegistries(&Proxy{}, tt.proxyURL, nil, tt.defaultRegistry, tt.registries)
 			index := fmt.Sprintf("apiVersion: v1\nentries:\n  demo:\n    - digest: %s\n      urls: [%q]\n", strings.Repeat("a", 64), tt.reference)
-			rewritten, err := h.rewriteIndex("mixed", "https://charts.example", []byte(index))
+			rewritten, _, err := h.rewriteIndex("mixed", "https://charts.example", []byte(index))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -125,7 +125,7 @@ func TestHelmIndexOmitsMalformedChartReleases(t *testing.T) {
 		t.Run(reference, func(t *testing.T) {
 			h := NewHelmHandler(&Proxy{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, "https://proxy.example", nil)
 			index := fmt.Sprintf("apiVersion: v1\nentries:\n  demo:\n    - digest: %s\n      urls: [%q]\n    - digest: %s\n      urls: [demo-1.0.0.tgz]\n", strings.Repeat("b", 64), reference, goodDigest)
-			rewritten, err := h.rewriteIndex("mixed", "https://charts.example", []byte(index))
+			rewritten, _, err := h.rewriteIndex("mixed", "https://charts.example", []byte(index))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,11 +135,11 @@ func TestHelmIndexOmitsMalformedChartReleases(t *testing.T) {
 			if !strings.Contains(string(rewritten), h.chartProxyURL("mixed", goodDigest, "demo-1.0.0.tgz")) {
 				t.Fatalf("valid release missing from rewritten index: %s", rewritten)
 			}
-			download, err := h.findChartDownload("https://charts.example", []byte(index), goodDigest, "demo-1.0.0.tgz")
+			download, err := h.findChartDownload("mixed", "https://charts.example", metadataResult{body: []byte(index)}, goodDigest, "demo-1.0.0.tgz")
 			if err != nil || download != "https://charts.example/demo-1.0.0.tgz" {
 				t.Fatalf("chart lookup = %q, %v", download, err)
 			}
-			if _, err := h.findChartDownload("https://charts.example", []byte(index), strings.Repeat("b", 64), "demo-1.0.0.tgz"); !errors.Is(err, errHelmChartNotFound) {
+			if _, err := h.findChartDownload("mixed", "https://charts.example", metadataResult{body: []byte(index)}, strings.Repeat("b", 64), "demo-1.0.0.tgz"); !errors.Is(err, errHelmChartNotFound) {
 				t.Fatalf("omitted release lookup error = %v, want errHelmChartNotFound", err)
 			}
 		})
@@ -160,7 +160,7 @@ entries:
       urls: [oci://ghcr.io/owner/demo:2.0.0]
 `, strings.Repeat("a", 64), time.Now().Add(-7*24*time.Hour).Format(time.RFC3339),
 		strings.Repeat("b", 64), time.Now().Add(-time.Hour).Format(time.RFC3339))
-	rewritten, err := h.rewriteIndex("mixed", "https://charts.example", []byte(index))
+	rewritten, _, err := h.rewriteIndex("mixed", "https://charts.example", []byte(index))
 	if err != nil {
 		t.Fatal(err)
 	}

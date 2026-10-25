@@ -290,7 +290,7 @@ entries:
 `, time.Now().Add(-10*24*time.Hour).Format(time.RFC3339), oldDigest,
 		time.Now().Add(-time.Hour).Format(time.RFC3339), newDigest)
 
-	rewritten, err := h.rewriteIndex("test", "https://charts.example", []byte(body))
+	rewritten, _, err := h.rewriteIndex("test", "https://charts.example", []byte(body))
 	if err != nil {
 		t.Fatalf("rewriteIndex() error = %v", err)
 	}
