@@ -200,7 +200,7 @@ metadata_dates (
 )
 ```
 
-`metadata_dates` holds the `Last-Modified` served with rewritten npm and Composer metadata. A package's date is the second it started serving its current representation, and a new representation is only dated in a later second. Keeping it in the database means replicas sharing one serve the same date, and never give one representation's date to another, so `If-Modified-Since` cannot return 304 for a body the client does not have.
+`metadata_dates` holds the `Last-Modified` served with rewritten metadata, such as npm packuments, Composer documents, PyPI simple pages and Helm indexes. A package's date is the second it started serving its current representation, and a new representation is only dated in a later second. Keeping it in the database means replicas sharing one serve the same date, and never give one representation's date to another, so `If-Modified-Since` cannot return 304 for a body the client does not have.
 
 On PostgreSQL, `INTEGER PRIMARY KEY` becomes `SERIAL`, `DATETIME` becomes `TIMESTAMP`, `INTEGER DEFAULT 0` booleans become `BOOLEAN DEFAULT FALSE`, and size/count columns use `BIGINT`.
 

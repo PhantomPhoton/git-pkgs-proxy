@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -38,6 +39,10 @@ type HelmHandler struct {
 	proxyURL      string
 	repositories  map[string]string
 	ociRegistries []helmOCIRegistry
+
+	lookupMu sync.Mutex
+	// lookups holds the charts of each repository's last parsed index.
+	lookups map[string]*helmChartLookup
 }
 
 // NewHelmHandler creates a Helm chart repository protocol handler.
@@ -68,20 +73,36 @@ func (h *HelmHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, contentType, err := h.fetchIndex(r, repository, upstreamURL)
-	if err != nil {
-		h.serveIndexError(w, err)
+	// Parsing and encoding a large index costs far more than serving it, so
+	// rewrites go through the rewrite cache like npm packuments. The cache
+	// key holds the repository and upstream URL, both part of cacheKey.
+	cacheKey := h.indexCacheKey(repository, upstreamURL)
+	if stored, contentType, ok := h.proxy.storedRewriteVariant(helmMetadataEcosystem, cacheKey, h.proxyURL, cacheKey, nil); ok {
+		serveRewrittenMetadataAs(w, r, stored, contentType)
 		return
 	}
 
-	rewritten, err := h.rewriteIndex(repository, upstreamURL, body)
+	index := h.fetchIndex(r, repository, upstreamURL)
+	if index.err != nil {
+		h.serveIndexError(w, index.err)
+		return
+	}
+
+	rewritten, err := h.proxy.cachedRewrite(r.Context(), helmMetadataEcosystem, h.proxyURL, cacheKey, index.body, index.digest,
+		func(body []byte) ([]byte, []string, error) {
+			return h.rewriteIndex(repository, upstreamURL, body)
+		})
 	if err != nil {
+		if r.Context().Err() != nil {
+			return // the client left while waiting on a shared rewrite
+		}
 		h.proxy.Logger.Warn("failed to rewrite Helm index", "repository", repository, "error", err)
 		http.Error(w, "invalid Helm repository index", http.StatusBadGateway)
 		return
 	}
 
-	h.proxy.writeMetadataCachedResponse(w, r, helmMetadataEcosystem, h.indexCacheKey(repository, upstreamURL), rewritten, contentType)
+	markStale(w, index.stale)
+	serveRewrittenMetadataAs(w, r, rewritten, index.contentType)
 }
 
 func (h *HelmHandler) handleChart(w http.ResponseWriter, r *http.Request) {
@@ -109,13 +130,13 @@ func (h *HelmHandler) handleChart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, _, err := h.fetchIndex(r, repository, upstreamURL)
-	if err != nil {
-		h.serveIndexError(w, err)
+	index := h.fetchIndex(r, repository, upstreamURL)
+	if index.err != nil {
+		h.serveIndexError(w, index.err)
 		return
 	}
 
-	downloadURL, err := h.findChartDownload(upstreamURL, body, digest, filename)
+	downloadURL, err := h.findChartDownload(repository, upstreamURL, index, digest, filename)
 	if err != nil {
 		if errors.Is(err, errHelmChartNotFound) {
 			http.NotFound(w, r)
@@ -161,13 +182,14 @@ func (h *HelmHandler) repositoryForRequest(r *http.Request) (name, upstreamURL s
 	return name, upstreamURL, ok
 }
 
-func (h *HelmHandler) fetchIndex(r *http.Request, repository, upstreamURL string) ([]byte, string, error) {
-	return h.proxy.FetchOrCacheMetadata(
+func (h *HelmHandler) fetchIndex(r *http.Request, repository, upstreamURL string) metadataResult {
+	return h.proxy.fetchMetadataDocument(
 		r.Context(),
 		helmMetadataEcosystem,
 		h.indexCacheKey(repository, upstreamURL),
 		upstreamURL+"/"+helmIndexFilename,
 		"application/x-yaml, text/yaml;q=0.9, */*;q=0.1",
+		nil,
 	)
 }
 
@@ -189,17 +211,21 @@ func (h *HelmHandler) serveIndexError(w http.ResponseWriter, err error) {
 	http.Error(w, "failed to fetch Helm repository index", http.StatusBadGateway)
 }
 
-func (h *HelmHandler) rewriteIndex(repository, upstreamURL string, body []byte) ([]byte, error) {
+// rewriteIndex points the index's chart URLs at the proxy and drops releases
+// in cooldown. It also returns the releases it kept, by chart name and
+// digest, which together with the index fix its output.
+func (h *HelmHandler) rewriteIndex(repository, upstreamURL string, body []byte) ([]byte, []string, error) {
 	document, entries, err := parseHelmIndex(body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	var kept []string
 	for i := 0; i < len(entries.Content); i += 2 {
 		chartName := entries.Content[i].Value
 		releases := entries.Content[i+1]
 		if releases.Kind != yaml.SequenceNode {
-			return nil, fmt.Errorf("chart %q releases must be a sequence", chartName)
+			return nil, nil, fmt.Errorf("chart %q releases must be a sequence", chartName)
 		}
 
 		filtered := make([]*yaml.Node, 0, len(releases.Content))
@@ -221,42 +247,109 @@ func (h *HelmHandler) rewriteIndex(repository, upstreamURL string, body []byte) 
 				}
 			}
 			filtered = append(filtered, release)
+			kept = append(kept, chartName+"@"+chart.digest)
 		}
 		releases.Content = filtered
 	}
 
-	return yaml.Marshal(document)
+	out, err := yaml.Marshal(document)
+	return out, kept, err
 }
 
-func (h *HelmHandler) findChartDownload(upstreamURL string, body []byte, digest, filename string) (string, error) {
-	_, entries, err := parseHelmIndex(body)
+// findChartDownload returns the upstream URL of a chart in the index. Parsing
+// a large index takes a while, so the charts it lists are kept per
+// repository for as long as the stored index stays the same.
+func (h *HelmHandler) findChartDownload(repository, upstreamURL string, index metadataResult, digest, filename string) (string, error) {
+	charts, err := h.chartLookup(repository, upstreamURL, index)
 	if err != nil {
 		return "", err
 	}
+	for _, chart := range charts.byDigest[digest] {
+		if h.chartOnCooldown(chart.name, chart.created) {
+			continue
+		}
+		for _, download := range chart.downloads {
+			if download.filename == filename {
+				return download.url, nil
+			}
+		}
+	}
+	return "", errHelmChartNotFound
+}
 
+// helmChartLookup holds the HTTP chart downloads an index lists, by chart
+// digest, in index order.
+type helmChartLookup struct {
+	indexDigest string
+	byDigest    map[string][]helmChartEntry
+}
+
+type helmChartEntry struct {
+	name      string
+	created   time.Time
+	downloads []helmChartDownload
+}
+
+// chartLookup returns the charts the index lists, parsing it only when the
+// last lookup built for the repository came from other bytes. An index
+// without a digest, read with the metadata cache off, is parsed every time.
+func (h *HelmHandler) chartLookup(repository, upstreamURL string, index metadataResult) (*helmChartLookup, error) {
+	key := repository + "\x00" + upstreamURL
+	if index.digest != "" {
+		h.lookupMu.Lock()
+		cached := h.lookups[key]
+		h.lookupMu.Unlock()
+		if cached != nil && cached.indexDigest == index.digest {
+			return cached, nil
+		}
+	}
+
+	lookup, err := h.buildChartLookup(upstreamURL, index.body)
+	if err != nil {
+		return nil, err
+	}
+	if index.digest != "" {
+		lookup.indexDigest = index.digest
+		h.lookupMu.Lock()
+		if h.lookups == nil {
+			h.lookups = make(map[string]*helmChartLookup)
+		}
+		h.lookups[key] = lookup
+		h.lookupMu.Unlock()
+	}
+	return lookup, nil
+}
+
+func (h *HelmHandler) buildChartLookup(upstreamURL string, body []byte) (*helmChartLookup, error) {
+	_, entries, err := parseHelmIndex(body)
+	if err != nil {
+		return nil, err
+	}
+
+	lookup := &helmChartLookup{byDigest: make(map[string][]helmChartEntry)}
 	for i := 0; i < len(entries.Content); i += 2 {
 		chartName := entries.Content[i].Value
 		releases := entries.Content[i+1]
 		if releases.Kind != yaml.SequenceNode {
-			return "", fmt.Errorf("chart %q releases must be a sequence", chartName)
+			return nil, fmt.Errorf("chart %q releases must be a sequence", chartName)
 		}
 		for _, release := range releases.Content {
 			chart, err := h.parseChartRelease(chartName, upstreamURL, release)
 			if err != nil {
 				continue
 			}
-			if chart.digest != digest || h.chartOnCooldown(chartName, chart.created) {
-				continue
-			}
+			entry := helmChartEntry{name: chartName, created: chart.created}
 			for _, download := range chart.downloads {
-				if !download.oci && download.filename == filename {
-					return download.url, nil
+				if !download.oci {
+					// Drop the YAML node, so the lookup doesn't keep the
+					// parsed index alive.
+					entry.downloads = append(entry.downloads, helmChartDownload{url: download.url, filename: download.filename})
 				}
 			}
+			lookup.byDigest[chart.digest] = append(lookup.byDigest[chart.digest], entry)
 		}
 	}
-
-	return "", errHelmChartNotFound
+	return lookup, nil
 }
 
 func (h *HelmHandler) chartOnCooldown(chartName string, created time.Time) bool {
