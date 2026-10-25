@@ -1510,6 +1510,8 @@ Packages are downloaded from the configured upstreams: npm, cargo, gem, golang, 
 
 A PyPI version is mirrored with every file `upstream.pypi` lists for it: the sdist and each wheel, checked against the listed sha256 and cached under the name and version the download handler reads from the filename. Add the `file_name` qualifier to mirror one file, for example `pkg:pypi/zope.interface@7.2?file_name=zope.interface-7.2-cp312-cp312-macosx_11_0_arm64.whl`.
 
+A conda version is mirrored with every build anaconda.org lists for it, across all subdirs, and each build is cached the way `/conda/{channel}/{subdir}/{file}` serves it. Give the channel as the namespace or the `channel` qualifier, for example `pkg:conda/conda-forge/numpy@2.1.0`; a package without one is refused. The `subdir`, `build` and `type` qualifiers select builds, for example `pkg:conda/conda-forge/numpy@2.1.0?subdir=linux-64&type=conda`. Builds with a listed sha256 are checked against it. Files are listed from anaconda.org, so mirroring conda fails while `upstream.conda` points somewhere else.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |

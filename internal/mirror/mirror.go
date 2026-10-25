@@ -228,8 +228,8 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "reason", m.RefusePackages)
 		return
 	}
-	if pv.Ecosystem == "pypi" {
-		m.mirrorFiles(ctx, pv, tracker)
+	if eco, ok := fileEcosystems[pv.Ecosystem]; ok {
+		m.mirrorFiles(ctx, pv, eco, tracker)
 		return
 	}
 	result, err := m.proxy.GetOrFetchArtifact(ctx, pv.Ecosystem, pv.Name, pv.Version, "")
@@ -258,34 +258,39 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 	}
 }
 
-// mirrorFiles mirrors every file of a PyPI version, or only the one named by
-// the file_name qualifier. Each file is cached under the name and version
-// the download handler reads from its filename, so clients are served it.
-func (m *Mirror) mirrorFiles(ctx context.Context, pv PackageVersion, tracker *progressTracker) {
+// mirrorFiles mirrors every file of a version, or those its qualifiers
+// select. Each file is cached under the name and version the download
+// handler reads from its filename, so clients are served it.
+func (m *Mirror) mirrorFiles(ctx context.Context, pv PackageVersion, eco fileEcosystem, tracker *progressTracker) {
 	fail := func(err error) {
 		tracker.failed.Add(1)
 		tracker.addError(pv.Ecosystem, pv.Name, pv.Version, err.Error())
 		m.logger.Warn("mirror failed",
 			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "error", err)
 	}
+	if eco.check != nil {
+		if err := eco.check(pv); err != nil {
+			fail(err)
+			return
+		}
+	}
 	files, err := m.fileLister().ListFiles(ctx, pv.Ecosystem, pv.Name, pv.Version)
 	if err != nil {
 		fail(fmt.Errorf("listing files: %w", err))
 		return
 	}
-	wantFile := pv.Qualifiers["file_name"]
 	var matched, fetched int
 	var size int64
 	for _, file := range files {
-		if wantFile != "" && file.Filename != wantFile {
+		if !eco.selects(pv, file) {
+			continue
+		}
+		name, version, filename, ok := eco.cacheKey(pv, file)
+		if !ok {
 			continue
 		}
 		matched++
-		name, version := handler.PyPIFilenameIdentity(file.Filename)
-		if name == "" {
-			name, version = pv.Name, pv.Version
-		}
-		result, err := m.proxy.GetOrFetchArtifactFromURLWithDigest(ctx, pv.Ecosystem, name, version, file.Filename, file.URL, fileDigest(file.Integrity))
+		result, err := m.proxy.GetOrFetchArtifactFromURLWithDigest(ctx, pv.Ecosystem, name, version, filename, file.URL, fileDigest(file.Integrity))
 		if err != nil {
 			fail(fmt.Errorf("%s: %w", file.Filename, err))
 			return
@@ -298,9 +303,9 @@ func (m *Mirror) mirrorFiles(ctx context.Context, pv PackageVersion, tracker *pr
 			size += result.Artifact.Size
 		}
 	}
-	switch {
-	case matched == 0 && wantFile != "":
-		fail(fmt.Errorf("no file named %q", wantFile))
+	switch selection := eco.selection(pv); {
+	case matched == 0 && selection != "":
+		fail(fmt.Errorf("no file matches %s", selection))
 	case matched == 0:
 		fail(errors.New("version has no files"))
 	case fetched == 0:

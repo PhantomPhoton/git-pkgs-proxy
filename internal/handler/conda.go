@@ -142,9 +142,15 @@ func (h *CondaHandler) isPackageFile(filename string) bool {
 }
 
 // parseFilename extracts name and version from a Conda package filename.
+func (h *CondaHandler) parseFilename(filename string) (name, version string) {
+	return CondaFilenameIdentity(filename)
+}
+
+// CondaFilenameIdentity returns the name and version a download of filename
+// is cached under, or empty strings when it is not a package file name.
 // Conda filenames are: {name}-{version}-{build}.{ext}
 // e.g., "numpy-1.24.0-py311h64a7726_0.conda"
-func (h *CondaHandler) parseFilename(filename string) (name, version string) {
+func CondaFilenameIdentity(filename string) (name, version string) {
 	// Remove extension
 	base := filename
 	for _, ext := range []string{".conda", ".tar.bz2"} {
