@@ -142,8 +142,11 @@ func sqliteReaderConns() int {
 	return min(max(runtime.GOMAXPROCS(0), sqliteMinReaders), sqliteMaxReaders)
 }
 
+// isMemoryPath reports whether path names an in-memory database, as
+// ":memory:" or a URI such as "file::memory:?cache=shared" or
+// "file:x?mode=memory".
 func isMemoryPath(path string) bool {
-	return path == "" || strings.HasPrefix(path, ":memory:") || strings.Contains(path, "mode=memory")
+	return path == "" || strings.Contains(path, ":memory:") || strings.Contains(path, "mode=memory")
 }
 
 func OpenOrCreate(path string) (*DB, error) {

@@ -3,10 +3,12 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -277,5 +279,115 @@ func TestPostgresSharesOnePool(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	if db.reader != db.DB {
 		t.Fatal("postgres got a separate reader pool")
+	}
+}
+
+func TestIsMemoryPath(t *testing.T) {
+	for path, want := range map[string]bool{
+		"":                           true,
+		":memory:":                   true,
+		"file::memory:":              true,
+		"file::memory:?cache=shared": true,
+		"file:cache?mode=memory":     true,
+		"/var/lib/proxy/cache.db":    false,
+		"cache.db":                   false,
+	} {
+		if got := isMemoryPath(path); got != want {
+			t.Errorf("isMemoryPath(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+// TestSQLiteExistingRollbackJournalDatabase opens a database file left in
+// rollback-journal mode, as an older or foreign tool may leave it. The
+// writer must switch it to WAL before readers open it, or reads would block
+// on writes.
+func TestSQLiteExistingRollbackJournalDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := Create(path)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	seedOnePackage(t, db)
+	if _, err := db.Exec("PRAGMA journal_mode = DELETE"); err != nil {
+		t.Fatalf("leaving WAL: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var mode string
+	if err := db.reader.Get(&mode, "PRAGMA journal_mode"); err != nil || mode != "wal" {
+		t.Fatalf("reader journal_mode = %q, %v; want wal", mode, err)
+	}
+	art, err := db.GetCachedArtifact("pkg:npm/left-pad", "pkg:npm/left-pad@1.3.0", "left-pad-1.3.0.tgz")
+	if err != nil || art == nil {
+		t.Fatalf("GetCachedArtifact = %v, %v", art, err)
+	}
+}
+
+// TestSQLiteConcurrentReadsAndWrites runs the writes a busy proxy makes
+// (recording artifacts and hits) alongside request lookups and stats scans.
+// None may fail with a busy, locked or read-only error.
+func TestSQLiteConcurrentReadsAndWrites(t *testing.T) {
+	db := newTestDB(t)
+	seedOnePackage(t, db)
+	deadline := time.Now().Add(time.Second)
+	errs := make(chan error, 64)
+	var wg sync.WaitGroup
+	run := func(f func(i int) error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; time.Now().Before(deadline); i++ {
+				if err := f(i); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	for w := range 2 {
+		run(func(i int) error {
+			name := fmt.Sprintf("pkg-%d-%d", w, i)
+			pkg := &Package{PURL: "pkg:npm/" + name, Ecosystem: "npm", Name: name}
+			ver := &Version{PURL: pkg.PURL + "@1.0.0", PackagePURL: pkg.PURL}
+			art := &Artifact{
+				VersionPURL: ver.PURL,
+				Filename:    name + ".tgz",
+				UpstreamURL: "https://registry.npmjs.org/" + name,
+				StoragePath: sql.NullString{String: "npm/" + name, Valid: true},
+				Size:        sql.NullInt64{Int64: 10, Valid: true},
+				FetchedAt:   sql.NullTime{Time: time.Now(), Valid: true},
+			}
+			return db.RecordCachedArtifact(pkg, ver, art)
+		})
+	}
+	run(func(int) error { return db.RecordArtifactHit("pkg:npm/left-pad@1.3.0", "left-pad-1.3.0.tgz") })
+	for range 4 {
+		run(func(int) error {
+			art, err := db.GetCachedArtifact("pkg:npm/left-pad", "pkg:npm/left-pad@1.3.0", "left-pad-1.3.0.tgz")
+			if err == nil && art == nil {
+				err = errors.New("seeded artifact not found")
+			}
+			return err
+		})
+	}
+	run(func(int) error {
+		if _, err := db.GetCacheStats(); err != nil {
+			return err
+		}
+		_, err := db.GetEcosystemStats()
+		return err
+	})
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }
