@@ -161,6 +161,8 @@ export AWS_SECRET_ACCESS_KEY=your-secret
 export AWS_REGION=us-east-1
 ```
 
+Objects up to 16 MiB are buffered in memory and sent in one request. Larger ones are uploaded in 5 MiB parts, two at a time, so a large artifact being cached holds about 30 MiB of upload buffers. Azure Blob Storage uploads use the same part size and concurrency.
+
 ### S3-Compatible (MinIO, etc.)
 
 ```yaml
