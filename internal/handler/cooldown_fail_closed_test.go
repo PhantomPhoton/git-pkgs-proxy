@@ -225,6 +225,48 @@ func TestNPMDownloadCooldownFailsClosed(t *testing.T) {
 	}
 }
 
+// TestDownloadCooldownErrorServesCachedFile checks that a file already in the
+// cache is still served when its publish time can't be read, while an uncached
+// one fails.
+func TestDownloadCooldownErrorServesCachedFile(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	tests := []struct {
+		ecosystem, name, version, filename, path string
+		handler                                  func(*Proxy) http.Handler
+	}{
+		{"pypi", "newpkg", "2.0.0", "newpkg-2.0.0.tar.gz", "/packages/packages/ab/cd/ef0123456789/newpkg-2.0.0.tar.gz",
+			func(p *Proxy) http.Handler {
+				return (&PyPIHandler{proxy: p, upstreamURL: upstream.URL, downloadURL: upstream.URL, proxyURL: "http://localhost"}).Routes()
+			}},
+		{"npm", "leftpad", "2.0.0", "leftpad-2.0.0.tgz", "/leftpad/-/leftpad-2.0.0.tgz",
+			func(p *Proxy) http.Handler { return NewNPMHandler(p, "http://proxy.test", upstream.URL).Routes() }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.ecosystem, func(t *testing.T) {
+			proxy, db, store, fetcher := setupTestProxy(t)
+			proxy.Cooldown = &cooldown.Config{Default: "7d"}
+			h := tt.handler(proxy)
+
+			seedPackage(t, db, store, tt.ecosystem, tt.name, tt.version, tt.filename, "cached file")
+			w := serveGet(t, h, tt.path)
+			wantStatus(t, w, http.StatusOK, "")
+			if w.Body.String() != "cached file" {
+				t.Errorf("body = %q, want the cached file", w.Body.String())
+			}
+
+			other := strings.ReplaceAll(tt.path, "2.0.0", "3.0.0")
+			wantStatus(t, serveGet(t, h, other), http.StatusBadGateway, "")
+			if fetcher.fetchCalled {
+				t.Error("fetched a file whose publish time couldn't be checked")
+			}
+		})
+	}
+}
+
 // TestCooldownRewriteFailureFailsClosed checks that a metadata document the
 // cooldown rewrite can't parse is refused rather than passed on, and still
 // passed on when cooldown doesn't apply.

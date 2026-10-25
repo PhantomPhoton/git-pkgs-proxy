@@ -627,7 +627,9 @@ func (h *PyPIHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if name != "" {
 		inCooldown, err := h.versionInCooldown(r, name, version)
 		if err != nil {
-			h.proxy.writeCooldownLookupError(w, "pypi", name, err)
+			if !h.proxy.serveCachedDespiteCooldownError(w, r, "pypi", name, version, filename, err) {
+				h.proxy.writeCooldownLookupError(w, "pypi", name, err)
+			}
 			return
 		}
 		if inCooldown {

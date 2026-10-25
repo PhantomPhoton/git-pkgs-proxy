@@ -927,6 +927,9 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	})
 	inCooldown, err := h.versionInCooldown(packageName, version, metadata)
 	if err != nil {
+		if h.proxy.serveCachedDespiteCooldownError(w, r, "npm", packageName, version, h.routes.cacheFilename(packageName, filename), err) {
+			return
+		}
 		if writeUpstreamHeld(w, err) {
 			return
 		}
