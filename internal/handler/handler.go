@@ -1935,7 +1935,12 @@ func (p *Proxy) writeMetadataCachedResponse(w http.ResponseWriter, r *http.Reque
 // missing or stale when the metadata cache write failed and would otherwise
 // mislabel the bytes.
 func (p *Proxy) writeMetadataCachedResponseWithEncoding(w http.ResponseWriter, r *http.Request, ecosystem, cacheKey string, body []byte, contentType, contentEncoding string) {
-	cm := p.lookupCachedMeta(ecosystem, cacheKey)
+	writeMetadataBody(w, r, p.lookupCachedMeta(ecosystem, cacheKey), body, contentType, contentEncoding)
+}
+
+// writeMetadataBody writes a metadata document with the validators and
+// staleness in cm.
+func writeMetadataBody(w http.ResponseWriter, r *http.Request, cm cachedMeta, body []byte, contentType, contentEncoding string) {
 	if writeMetadataValidators(w, r, cm) {
 		return
 	}
