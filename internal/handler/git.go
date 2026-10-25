@@ -39,6 +39,11 @@ type GitHandler struct {
 	proxy     *Proxy
 	cache     *gitcache.Cache
 	upstreams map[string]gitUpstream
+	// baseURL is where clients reach the proxy, for LFS download URLs.
+	baseURL string
+	// lfsDownloads keeps upstream LFS download URLs between a batch and
+	// the GETs that follow it.
+	lfsDownloads *lfsDownloads
 	// writeStall is gitWriteStallTimeout, shorter in tests.
 	writeStall time.Duration
 }
@@ -56,10 +61,11 @@ type gitUpstream struct {
 // NewGitHandler creates a Git handler serving upstream.git from cache.
 func NewGitHandler(proxy *Proxy, cache *gitcache.Cache, upstream config.UpstreamConfig) *GitHandler {
 	h := &GitHandler{
-		proxy:      proxy,
-		cache:      cache,
-		upstreams:  make(map[string]gitUpstream, len(upstream.Git)),
-		writeStall: gitWriteStallTimeout,
+		proxy:        proxy,
+		cache:        cache,
+		upstreams:    make(map[string]gitUpstream, len(upstream.Git)),
+		writeStall:   gitWriteStallTimeout,
+		lfsDownloads: &lfsDownloads{},
 	}
 	for name, git := range upstream.Git {
 		git.URL = strings.TrimSuffix(git.URL, "/")
@@ -90,6 +96,10 @@ type gitRequest struct {
 }
 
 func (h *GitHandler) serve(w http.ResponseWriter, r *http.Request) {
+	if repoPath, endpoint, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), gitLFSPath); ok {
+		h.serveLFS(w, r, repoPath, endpoint)
+		return
+	}
 	req, status, msg := h.parse(r)
 	if status != 0 {
 		http.Error(w, msg, status)
@@ -168,10 +178,38 @@ func (h *GitHandler) parse(r *http.Request) (gitRequest, int, string) {
 		return req, http.StatusNotFound, "not found"
 	}
 
+	repo, status, msg := h.repository(path)
+	if status != 0 {
+		return req, status, msg
+	}
+	req.key = repo.key
+	req.repoURL = repo.url
+	req.fetchWants = repo.upstream.fetchWants
+	return req, 0, ""
+}
+
+// gitRepository is a repository of an upstream.git host, as a request path
+// names it.
+type gitRepository struct {
+	// name is the upstream's name and repo the path under it, without .git.
+	name, repo string
+	upstream   gitUpstream
+	// key names the repository in the cache: {name}-{URL hash}/{repo}.git,
+	// with any .git the client gave removed from repo first, so both
+	// spellings share one copy.
+	key string
+	// url is the upstream repository, spelled as the client spelled it, and
+	// escapedRepo is repo escaped for a URL path.
+	url, escapedRepo string
+}
+
+// repository resolves {name}/{repo} to an upstream repository, or returns
+// the status and message to refuse it with.
+func (h *GitHandler) repository(path string) (gitRepository, int, string) {
 	name, repoPath, _ := strings.Cut(path, "/")
 	upstream, ok := h.upstreams[name]
 	if !ok {
-		return req, http.StatusNotFound, "unknown upstream"
+		return gitRepository{}, http.StatusNotFound, "unknown upstream"
 	}
 	segments := strings.Split(repoPath, "/")
 	last := len(segments) - 1
@@ -182,7 +220,7 @@ func (h *GitHandler) parse(r *http.Request) (gitRequest, int, string) {
 	escaped := make([]string, len(segments))
 	for i, segment := range segments {
 		if !validGitSegment(segment, i == last) {
-			return req, http.StatusNotFound, "invalid repository path"
+			return gitRepository{}, http.StatusNotFound, "invalid repository path"
 		}
 		escaped[i] = url.PathEscape(segment)
 	}
@@ -190,12 +228,17 @@ func (h *GitHandler) parse(r *http.Request) (gitRequest, int, string) {
 	if !upstream.AllowsRepo(repo) {
 		// As for a missing repository, so a prober learns nothing about
 		// the allowlist.
-		return req, http.StatusNotFound, "repository not found"
+		return gitRepository{}, http.StatusNotFound, "repository not found"
 	}
-	req.key = upstream.dir + "/" + repo + ".git"
-	req.repoURL = upstream.URL + "/" + strings.Join(escaped, "/") + suffix
-	req.fetchWants = upstream.fetchWants
-	return req, 0, ""
+	escapedRepo := strings.Join(escaped, "/")
+	return gitRepository{
+		name:        name,
+		repo:        repo,
+		upstream:    upstream,
+		key:         upstream.dir + "/" + repo + ".git",
+		url:         upstream.URL + "/" + escapedRepo + suffix,
+		escapedRepo: escapedRepo,
+	}, 0, ""
 }
 
 // validGitSegment checks one segment of a repository path, which becomes both

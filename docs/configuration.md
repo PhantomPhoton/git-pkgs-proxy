@@ -837,7 +837,42 @@ those yourself. The proxy locks `cache_dir` while it runs, through a
 `.gitcache-lock` file in it, so a second process given the same directory,
 such as another replica on a shared volume, fails to start; give each its own.
 
-Pushing, the dumb HTTP protocol and Git LFS are not supported. The settings
+Git LFS objects are cached in the artifact cache, so they use the configured
+storage backend and retention rather than `cache_dir`. git-lfs finds the LFS
+API under the rewritten remote, at `/git/{name}/{repo}.git/info/lfs`, with no
+further configuration. A batch request is passed to the upstream, which
+decides which objects the repository has, and each download is pointed at
+the proxy. An object the cache doesn't have is fetched from the download URL
+the batch returned, which the proxy keeps in memory until shortly before it
+expires, or else from one a fresh batch request returns. That URL is often
+on another host than the Git server, such as GitHub's or Hugging Face's
+object storage; the proxy fetches from whatever host the upstream names,
+with the usual address checks, and `upstream.auth` credentials only go to
+the hosts they are configured for. A download that isn't the object's size
+is cut off. If the object's content is already stored under another
+repository, such as a fork, it is copied from there instead of downloaded,
+once the upstream has confirmed this repository has it; the copy takes its
+own space.
+
+Large LFS objects may need longer timeouts. The proxy downloads an object it
+doesn't have before sending any of it, within `artifact_timeout`, and the
+whole response, download included, must fit within `write_timeout`; both
+default to 5 minutes. git-lfs gives up on a response after 30 seconds without
+data (`lfs.activitytimeout`) and retries. A retry waits for the download still
+running, so the object is served once it is cached, but a download that
+outlasts git-lfs's retries fails that clone or pull until it finishes.
+Download URLs are often signed; only the URL without its query is logged
+and recorded with the object. An object is only cached once its content
+matches its sha256 object ID. Objects are cached per repository, so one
+repository's objects are never served for another. When the upstream can't
+be reached or fails, a batch is answered with the objects cached for the
+repository, and the others are reported as unavailable; a batch the upstream
+refuses is refused. A cached object stays available after it is removed
+upstream, until retention removes it or you delete it through the
+[cache delete API](#cache-delete-api).
+
+Pushing, LFS uploads and locking, and the dumb HTTP protocol are not
+supported. The settings
 under `git` can also be set with `PROXY_GIT_CACHE_DIR`, `PROXY_GIT_MAX_SIZE`,
 `PROXY_GIT_MAX_REPO_SIZE`, `PROXY_GIT_REFRESH_WAIT` and
 `PROXY_GIT_STALE_MAX_AGE`.

@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -220,6 +221,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -320,6 +322,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -343,6 +346,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -457,6 +461,7 @@ var migrations = []migration{
 	{"014_add_metadata_last_accessed", migrateAddMetadataLastAccessed},
 	{"015_add_job_runs", migrateAddJobRuns},
 	{"016_add_fetch_leases", migrateAddFetchLeases},
+	{"017_add_artifact_content_hash_index", migrateAddArtifactContentHashIndex},
 	{"018_add_upstream_holds", migrateAddUpstreamHolds},
 }
 
@@ -816,6 +821,16 @@ func migrateAddPendingDeletesQueuedAtIndex(db *DB) error {
 	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at)`)
 	if err != nil {
 		return fmt.Errorf("creating pending_deletes queued_at index: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactContentHashIndex indexes artifacts by content, so an
+// artifact already stored under another name can be found by its hash.
+func migrateAddArtifactContentHashIndex(db *DB) error {
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)`)
+	if err != nil {
+		return fmt.Errorf("creating artifacts content_hash index: %w", err)
 	}
 	return nil
 }
