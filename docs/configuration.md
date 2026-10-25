@@ -72,6 +72,14 @@ storage:
 
 `storage.max_size` counts cached artifacts and cached metadata documents (`cache_metadata`). When the total goes over the limit, the least recently served entries of either kind are evicted first; an evicted metadata document is fetched from upstream again on the next request for it. Pushed artifacts are not counted or evicted. An artifact replaced by a refetch stays in storage for at least an hour, or `storage.direct_serve_ttl` if longer, so requests already reading it can finish, and storage use can exceed the limit by what was replaced in that time.
 
+### Cache misses
+
+On a cache miss the proxy sends the artifact to the client while it stores it, so the client gets its first bytes as soon as the upstream sends them, rather than after the whole artifact is stored. Clients that give up after a while without data, such as git-lfs (30 seconds) or pacman (10 seconds), no longer time out on large artifacts. The response goes out chunked, without `Content-Length`, as with `cache_artifacts: false`; once stored, the artifact is served with its size.
+
+The bytes are checked against the digest the upstream declares, where it declares one, as they are sent. On a mismatch the connection is aborted before the response completes, so the client never receives a tampered artifact as a good one, and nothing is cached. If the client goes away, the artifact is still stored. If storing it fails, for example because the disk is full, the client still gets the whole artifact; the failure is logged at error level and counted in `proxy_artifacts_served_uncached_total`, so a cache that has stopped filling doesn't go unnoticed while every request succeeds.
+
+Requests for the same artifact that arrive while it is being stored wait for the stored copy, as do `HEAD` requests and requests with a `Range` header, which are answered from it with its size. With a `block`-mode scanner configured for the ecosystem, a miss is stored and scanned before anything is sent, as before (see [Artifact Scanning](#artifact-scanning)).
+
 ### Serving artifacts without storing them
 
 With `storage.cache_artifacts: false` the proxy streams every artifact download from upstream to the client and stores no artifacts. Metadata is still filtered and cached, so cooldown and the denylist apply as usual, and the database still holds the publish times cooldown needs. Use it when another caching layer, such as an Artifactory remote repository, sits in front of the proxy and caching artifacts twice only costs storage.
@@ -854,13 +862,10 @@ repository, such as a fork, it is copied from there instead of downloaded,
 once the upstream has confirmed this repository has it; the copy takes its
 own space.
 
-Large LFS objects may need longer timeouts. The proxy downloads an object it
-doesn't have before sending any of it, within `artifact_timeout`, and the
-whole response, download included, must fit within `write_timeout`; both
-default to 5 minutes. git-lfs gives up on a response after 30 seconds without
-data (`lfs.activitytimeout`) and retries. A retry waits for the download still
-running, so the object is served once it is cached, but a download that
-outlasts git-lfs's retries fails that clone or pull until it finishes.
+Large LFS objects may need longer timeouts. An object the proxy doesn't
+have is sent to git-lfs as it is downloaded (see [Cache misses](#cache-misses)),
+but the download must finish within `artifact_timeout` and the whole response
+within `write_timeout`; both default to 5 minutes.
 Download URLs are often signed; only the URL without its query is logged
 and recorded with the object. An object is only cached once its content
 matches its sha256 object ID. Objects are cached per repository, so one
@@ -1248,7 +1253,7 @@ scanning:
 
 ### How caching defers to a scan verdict
 
-The proxy never uploads artifact bytes to a scanner. When an artifact is fetched from upstream, it's stored to the configured storage backend first, exactly as without scanning. If scanning is enabled for the artifact's ecosystem, the proxy then notifies each applicable scanner with package metadata and a short-lived, HMAC-signed URL pointing at the internal `/_internal/scan-fetch` route; each scanner GETs that URL itself to pull the exact bytes staged in storage and runs its own scan against them.
+The proxy never uploads artifact bytes to a scanner. When an artifact is fetched from upstream, it's stored to the configured storage backend first, exactly as without scanning. If scanning is enabled for the artifact's ecosystem, the proxy then notifies each applicable scanner with package metadata and a short-lived, HMAC-signed URL pointing at the internal `/_internal/scan-fetch` route; each scanner GETs that URL itself to pull the exact bytes staged in storage and runs its own scan against them. With a `block`-mode scanner for the ecosystem, the client gets nothing before the verdict; with only `monitor`-mode scanners, a cache miss is sent to the client while it is stored, and the scan runs after (see [Cache misses](#cache-misses)).
 
 Scanners configured for the same ecosystem all run concurrently, never sequentially. The moment any `block`-mode scanner reports a not-allowed verdict (or errors, unless `fail_open` is set), the proxy cancels the in-flight calls to the other scanners and deletes the staged artifact — it's never committed to the cache database, so it was never visible to a client. If nothing blocks, the proxy waits for every `block`-mode scanner to finish before caching the artifact and serving it. A `monitor`-mode scanner's findings are logged and never gate the wait or the caching decision, even when it reports not-allowed.
 
