@@ -145,6 +145,32 @@ func (db *DB) EvictMetadataCache(ecosystem, name, storagePath string, lastAccess
 	return true, tx.Commit()
 }
 
+// DiscardMetadataCache deletes a metadata cache row whose stored document
+// failed its integrity check, if it still points at storagePath with digest,
+// and queues the path for deletion in the same transaction. A row a newer
+// fetch has rewritten is left alone.
+func (db *DB) DiscardMetadataCache(ecosystem, name, storagePath, digest string) error {
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(db.Rebind(`
+		DELETE FROM metadata_cache
+		WHERE ecosystem = ? AND name = ? AND storage_path = ? AND content_digest = ?`),
+		ecosystem, name, storagePath, digest)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return err
+	}
+	if _, err := tx.Exec(db.Rebind(queuePendingDeleteQuery), storagePath, time.Now().UTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // RecordMetadataHit marks a cached metadata document as served now. Like
 // RecordArtifactHit it is buffered when BatchHits is on.
 func (db *DB) RecordMetadataHit(ecosystem, name string) error {

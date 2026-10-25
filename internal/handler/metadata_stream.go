@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,7 +14,8 @@ import (
 // cache row by streaming the stored document, rather than reading it into
 // memory first, so concurrent hits on a large document don't each hold a copy
 // of it. The bytes are checked against the row's digest as they are sent, and
-// a mismatch aborts the response the way a corrupt cached artifact does.
+// a mismatch aborts the response and drops the row, the way a corrupt cached
+// artifact is handled.
 //
 // It reports false, having written nothing, when the request should take the
 // buffered path instead: no fresh row, a row without a digest or size, a
@@ -45,6 +47,12 @@ func (p *Proxy) serveCachedMetadata(w http.ResponseWriter, r *http.Request, ecos
 	body, err := checks.wrapFailOnMismatch(stored, func(reason string) {
 		p.Logger.Error("cached metadata failed integrity check",
 			"ecosystem", ecosystem, "key", cacheKey, "path", entry.StoragePath, "reason", reason)
+		metrics.RecordIntegrityFailure(ecosystem, metrics.FailureDetail{
+			Path: entry.StoragePath, Err: errors.New(reason)})
+		// Drop the row so the next request fetches the document again.
+		if err := p.DB.DiscardMetadataCache(ecosystem, cacheKey, entry.StoragePath, entry.ContentDigest.String); err != nil {
+			p.Logger.Warn("failed to clear corrupt metadata from cache", "error", err)
+		}
 	})
 	if err != nil {
 		_ = stored.Close()

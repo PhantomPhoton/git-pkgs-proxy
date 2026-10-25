@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,22 +53,24 @@ func (r *stallingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// cachedMetadataServer serves ProxyCached for one document, cached on the
-// first request.
-func cachedMetadataServer(t *testing.T, doc []byte) (*Proxy, *mockStorage, *httptest.Server) {
+// cachedMetadataServer serves doc through ProxyCached and caches it with one
+// request. upstreamHits counts the requests that reached the upstream.
+func cachedMetadataServer(t *testing.T, doc []byte) (proxy *Proxy, store *mockStorage, srv *httptest.Server, upstreamHits *atomic.Int32) {
 	t.Helper()
+	upstreamHits = &atomic.Int32{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
 		w.Header().Set(headerContentType, "application/x-test")
 		w.Header().Set(headerETag, `"v1"`)
 		_, _ = w.Write(doc)
 	}))
 	t.Cleanup(upstream.Close)
 
-	proxy, _, store, _ := setupTestProxy(t)
+	proxy, _, store, _ = setupTestProxy(t)
 	proxy.CacheMetadata = true
 	proxy.MetadataTTL = time.Hour
 	proxy.HTTPClient = upstream.Client()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxy.ProxyCached(w, r, upstream.URL+"/doc", "test", "doc", "*/*")
 	}))
 	t.Cleanup(srv.Close)
@@ -81,13 +84,13 @@ func cachedMetadataServer(t *testing.T, doc []byte) (*Proxy, *mockStorage, *http
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("populating cache: status %d", resp.StatusCode)
 	}
-	return proxy, store, srv
+	return proxy, store, srv, upstreamHits
 }
 
 func TestConcurrentMetadataCacheHitsStream(t *testing.T) {
 	const callers = 10
 	doc := bytes.Repeat([]byte("0123456789abcdef"), 1<<18) // 4 MB
-	proxy, store, srv := cachedMetadataServer(t, doc)
+	proxy, store, srv, _ := cachedMetadataServer(t, doc)
 
 	gate := &stallingStorage{Storage: store, head: 64 << 10, release: make(chan struct{})}
 	proxy.Storage = gate
@@ -179,7 +182,7 @@ func TestConcurrentMetadataCacheHitsStream(t *testing.T) {
 
 func TestCachedMetadataHitAbortsOnDigestMismatch(t *testing.T) {
 	doc := bytes.Repeat([]byte("metadata "), 1<<14)
-	_, store, srv := cachedMetadataServer(t, doc)
+	_, store, srv, upstreamHits := cachedMetadataServer(t, doc)
 
 	corrupt := bytes.Clone(doc)
 	corrupt[len(corrupt)-1] ^= 0xff
@@ -198,5 +201,23 @@ func TestCachedMetadataHitAbortsOnDigestMismatch(t *testing.T) {
 	}
 	if len(body) >= len(doc) {
 		t.Errorf("aborted response still delivered %d of %d bytes", len(body), len(doc))
+	}
+
+	// The corrupt row is dropped, so the next request fetches the document
+	// from upstream again instead of aborting until the TTL runs out.
+	resp, err = http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("request after abort: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("request after abort: %v", err)
+	}
+	if !bytes.Equal(body, doc) {
+		t.Errorf("request after abort got %d bytes, want the upstream document (%d bytes)", len(body), len(doc))
+	}
+	if got := upstreamHits.Load(); got != 2 {
+		t.Errorf("upstream requests = %d, want 2 (populate, then refetch after the corrupt hit)", got)
 	}
 }
