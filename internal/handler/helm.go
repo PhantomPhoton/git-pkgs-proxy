@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -82,7 +83,7 @@ func (h *HelmHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	index := h.fetchIndex(r, repository, upstreamURL)
+	index := h.fetchIndex(r.Context(), repository, upstreamURL)
 	if index.err != nil {
 		h.serveIndexError(w, index.err)
 		return
@@ -130,7 +131,7 @@ func (h *HelmHandler) handleChart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	index := h.fetchIndex(r, repository, upstreamURL)
+	index := h.fetchIndex(r.Context(), repository, upstreamURL)
 	if index.err != nil {
 		h.serveIndexError(w, index.err)
 		return
@@ -182,9 +183,9 @@ func (h *HelmHandler) repositoryForRequest(r *http.Request) (name, upstreamURL s
 	return name, upstreamURL, ok
 }
 
-func (h *HelmHandler) fetchIndex(r *http.Request, repository, upstreamURL string) metadataResult {
+func (h *HelmHandler) fetchIndex(ctx context.Context, repository, upstreamURL string) metadataResult {
 	return h.proxy.fetchMetadataDocument(
-		r.Context(),
+		ctx,
 		helmMetadataEcosystem,
 		h.indexCacheKey(repository, upstreamURL),
 		upstreamURL+"/"+helmIndexFilename,
@@ -278,16 +279,27 @@ func (h *HelmHandler) findChartDownload(repository, upstreamURL string, index me
 }
 
 // helmChartLookup holds the HTTP chart downloads an index lists, by chart
-// digest, in index order.
+// digest, in index order, and each release by chart name and version.
 type helmChartLookup struct {
 	indexDigest string
 	byDigest    map[string][]helmChartEntry
+	byRelease   map[helmRelease]helmReleaseDownload
 }
 
 type helmChartEntry struct {
 	name      string
 	created   time.Time
 	downloads []helmChartDownload
+}
+
+type helmRelease struct{ chart, version string }
+
+// helmReleaseDownload is what helm downloads for a release: the first URL
+// the index lists for it, checked against its digest.
+type helmReleaseDownload struct {
+	digest  string
+	created time.Time
+	first   helmChartDownload
 }
 
 // chartLookup returns the charts the index lists, parsing it only when the
@@ -326,7 +338,7 @@ func (h *HelmHandler) buildChartLookup(upstreamURL string, body []byte) (*helmCh
 		return nil, err
 	}
 
-	lookup := &helmChartLookup{byDigest: make(map[string][]helmChartEntry)}
+	lookup := &helmChartLookup{byDigest: make(map[string][]helmChartEntry), byRelease: make(map[helmRelease]helmReleaseDownload)}
 	for i := 0; i < len(entries.Content); i += 2 {
 		chartName := entries.Content[i].Value
 		releases := entries.Content[i+1]
@@ -339,6 +351,18 @@ func (h *HelmHandler) buildChartLookup(upstreamURL string, body []byte) (*helmCh
 				continue
 			}
 			entry := helmChartEntry{name: chartName, created: chart.created}
+			if version := helmMappingValue(release, "version"); version != nil && version.Value != "" {
+				// helm takes the first release listed for a version.
+				key := helmRelease{chartName, version.Value}
+				if _, listed := lookup.byRelease[key]; !listed {
+					first := chart.downloads[0]
+					lookup.byRelease[key] = helmReleaseDownload{
+						digest:  chart.digest,
+						created: chart.created,
+						first:   helmChartDownload{url: first.url, filename: first.filename, oci: first.oci},
+					}
+				}
+			}
 			for _, download := range chart.downloads {
 				if !download.oci {
 					// Drop the YAML node, so the lookup doesn't keep the

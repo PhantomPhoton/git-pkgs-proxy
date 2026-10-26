@@ -52,8 +52,8 @@ func TestRelayRoutes(t *testing.T) {
 		"/upstream", "/file", "/metadata", "/nuget/query",
 		"/conan/v2/conans/demo/1.0/user/stable/revisions/rev/files/other.txt",
 		"/composer/search.json", "/pypi/simple/", "/gem/api/v1/dependencies",
-		"/gem/info/demo", "/conda/conda-forge/noarch/repodata.json",
-		"/hex/packages/demo", "/swift/scope/demo/1.0.0/Package.swift",
+		"/conda/conda-forge/noarch/repodata.json",
+		"/swift/scope/demo/1.0.0/Package.swift",
 		"/v2/library/demo/manifests/latest", "/v2/library/demo/tags/list",
 		"/npm/-/npm/v1/keys",
 	} {
@@ -82,10 +82,9 @@ func testRelayRoute(t *testing.T, route string, truncated bool) {
 		if !truncated {
 			_, _ = fmt.Fprint(rw, "0\r\nX-Checksum: verified\r\nX-Late: discovered-at-eof\r\nX-Private: still-secret\r\n\r\n")
 		}
-		// Two of these routes fan out a second upstream request for cooldown
-		// timestamps and abandon its body on a non-200, so this may be writing to
-		// a connection the proxy has already dropped. What the proxy made of the
-		// response under test is asserted downstream.
+		// The proxy may drop the connection before reading the whole
+		// response. What it made of the response under test is asserted
+		// downstream.
 		_ = rw.Flush()
 	}))
 	defer upstream.Close()

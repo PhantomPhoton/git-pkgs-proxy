@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
-	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -144,6 +142,12 @@ func gemVersionAndPlatform(s string) bool {
 
 // handleCompactIndex serves the compact index for a gem, filtering versions
 // based on cooldown when enabled.
+//
+// With cooldown the index and the versions API's publish times are read
+// through the metadata cache, so a bundle install within metadata_ttl of the
+// last one asks rubygems.org nothing, and one after it revalidates both with
+// their ETags. The filtered index is kept in the rewrite cache and served
+// with an ETag of its own.
 func (h *GemHandler) handleCompactIndex(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
@@ -157,122 +161,118 @@ func (h *GemHandler) handleCompactIndex(w http.ResponseWriter, r *http.Request) 
 
 	h.proxy.Logger.Info("gem compact index request with cooldown", "name", name)
 
-	indexResp, filteredVersions, versionsErr, err := h.fetchIndexAndVersions(r, name)
-	if err != nil {
-		if writeUpstreamHeld(w, err) {
-			return
-		}
-		h.proxy.Logger.Error("upstream compact index request failed", "error", err)
-		http.Error(w, "upstream request failed", http.StatusBadGateway)
+	docs, err := h.proxy.fetchTimedMetadata(r.Context(), h.timedIndex(name), h.indexVersions)
+	switch {
+	case docs.doc.err != nil:
+		h.proxy.writeMetadataFetchError(w, docs.doc.err)
 		return
-	}
-	defer func() { _ = indexResp.Body.Close() }()
-
-	if indexResp.StatusCode != http.StatusOK {
-		h.proxy.relayResponse(w, r, indexResp, nil)
+	case docs.times.err != nil:
+		h.proxy.writeCooldownLookupError(w, "gem", name, docs.times.err)
 		return
-	}
-
-	if versionsErr != nil {
-		h.proxy.writeCooldownLookupError(w, "gem", name, versionsErr)
-		return
-	}
-
-	h.writeFilteredIndex(w, indexResp, name, filteredVersions)
-}
-
-// fetchIndexAndVersions fetches the compact index and versions API
-// concurrently. It returns the index response and the set of versions to
-// filter, the versions API's error, and the index fetch's error.
-func (h *GemHandler) fetchIndexAndVersions(r *http.Request, name string) (*http.Response, map[string]bool, error, error) {
-	type versionsResult struct {
-		filtered map[string]bool
-		err      error
-	}
-
-	versionsCh := make(chan versionsResult, 1)
-	go func() {
-		filtered, err := h.fetchFilteredVersions(r, name)
-		versionsCh <- versionsResult{filtered: filtered, err: err}
-	}()
-
-	indexResp, err := h.fetchCompactIndex(r, name)
-
-	versionsRes := <-versionsCh
-
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return indexResp, versionsRes.filtered, versionsRes.err, nil
-}
-
-// fetchCompactIndex fetches the compact index from upstream.
-func (h *GemHandler) fetchCompactIndex(r *http.Request, name string) (*http.Response, error) {
-	indexURL := h.upstreamURL + "/info/" + name
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, indexURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	// Only Accept is passed on. The client's Accept-Encoding would turn off
-	// the transport's transparent decompression and leave a gzip body to
-	// filter, and its validators belong to the filtered copy it was served,
-	// not to upstream's file.
-	if v := r.Header.Get(headerAccept); v != "" {
-		req.Header.Set(headerAccept, v)
-	}
-	return h.proxy.HTTPClient.Do(req)
-}
-
-// gemFilteredIndexDroppedHeaders describe upstream's file as a whole, so
-// they are wrong for a copy with versions removed. Bundler checks the digest
-// headers against the body it receives.
-var gemFilteredIndexDroppedHeaders = []string{
-	headerContentLength, headerContentEncoding, headerETag, headerLastModified,
-	"Digest", "Repr-Digest", "Content-Digest", "Accept-Ranges", "Content-Range",
-}
-
-// writeFilteredIndex writes the compact index response with cooldown-filtered
-// versions removed. The body is read in full first, so a read error or an
-// oversized index answers 502 instead of a truncated 200.
-func (h *GemHandler) writeFilteredIndex(w http.ResponseWriter, resp *http.Response, name string, filtered map[string]bool) {
-	body, err := h.proxy.ReadMetadata(resp.Body)
-	if err != nil {
+	case err != nil:
 		h.proxy.Logger.Error("failed to read gem compact index", "gem", name, "error", err)
 		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
 		return
 	}
 
+	packagePURL := canonicalPackagePURL("gem", name)
+	m, err := h.proxy.cachedRewrite(r.Context(), "gem", h.proxyURL, "info/"+name, docs.doc.body, docs.rewriteDigest(),
+		func([]byte) ([]byte, []string, error) {
+			body, err := h.proxy.decodedMetadataBody(docs.doc)
+			if err != nil {
+				return nil, nil, err
+			}
+			out, kept := h.filterIndex(body, name, func(version string) bool {
+				return docs.withheld(h.proxy, "gem", packagePURL, version)
+			})
+			return out, kept, nil
+		})
+	if err != nil {
+		h.proxy.Logger.Error("failed to filter gem compact index", "gem", name, "error", err)
+		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
+		return
+	}
+
+	// Served as identity, as upstream's index was: Bundler checks digest
+	// headers against the bytes it receives, and asks for ranges of it.
+	m.gzipped = nil
+	contentType := docs.doc.contentType
+	if contentType == "" || contentType == contentTypeJSON {
+		contentType = "text/plain; charset=utf-8"
+	}
+	markStale(w, docs.doc.stale || docs.times.stale)
+	serveRewrittenMetadataAs(w, r, m, contentType)
+}
+
+// timedIndex describes a gem's compact index and the versions API it takes
+// publish times from.
+func (h *GemHandler) timedIndex(name string) timedMetadata {
+	return timedMetadata{
+		ecosystem:   "gem",
+		docKey:      "info/" + name,
+		docURL:      h.upstreamURL + "/info/" + name,
+		timesKey:    "api/v1/versions/" + name + ".json",
+		timesURL:    fmt.Sprintf("%s/api/v1/versions/%s.json", h.upstreamURL, name),
+		timesAccept: contentTypeJSON,
+		parseTimes:  parseGemVersions,
+	}
+}
+
+// indexVersions lists the versions in a compact index, as the versions API
+// names them.
+func (h *GemHandler) indexVersions(doc metadataResult) ([]string, error) {
+	body, err := h.proxy.decodedMetadataBody(doc)
+	if err != nil {
+		return nil, err
+	}
+	var versions []string
+	for rest := body; len(rest) > 0; {
+		line, tail, _ := bytes.Cut(rest, []byte("\n"))
+		rest = tail
+		if version := gemIndexLineVersion(line); gemIndexListsVersion(version) {
+			versions = append(versions, string(version))
+		}
+	}
+	return versions, nil
+}
+
+// gemIndexLineVersion returns the version a compact index line starts with.
+func gemIndexLineVersion(line []byte) []byte {
+	if spaceIdx := bytes.IndexByte(line, ' '); spaceIdx > 0 {
+		return line[:spaceIdx]
+	}
+	return line
+}
+
+// gemIndexListsVersion reports whether a compact index line's first field
+// is a version, rather than the "---" that starts the file or an empty line.
+func gemIndexListsVersion(field []byte) bool {
+	return len(field) > 0 && string(field) != "---"
+}
+
+// filterIndex returns the compact index without the lines of versions
+// withheld reports, and the versions it kept.
+func (h *GemHandler) filterIndex(body []byte, name string, withheld func(string) bool) ([]byte, []string) {
+	var kept []string
 	var out bytes.Buffer
 	out.Grow(len(body))
 	for rest := body; len(rest) > 0; {
 		line, tail, _ := bytes.Cut(rest, []byte("\n"))
 		rest = tail
 
-		version := line
-		if spaceIdx := bytes.IndexByte(line, ' '); spaceIdx > 0 {
-			version = line[:spaceIdx]
+		version := gemIndexLineVersion(line)
+		if gemIndexListsVersion(version) {
+			if withheld(string(version)) {
+				h.proxy.Logger.Info("cooldown: filtering gem version",
+					"gem", name, "version", string(version))
+				continue
+			}
+			kept = append(kept, string(version))
 		}
-		if filtered[string(version)] {
-			h.proxy.Logger.Info("cooldown: filtering gem version",
-				"gem", name, "version", string(version))
-			continue
-		}
-
 		out.Write(line)
 		out.WriteByte('\n')
 	}
-
-	for k, vv := range resp.Header {
-		if slices.ContainsFunc(gemFilteredIndexDroppedHeaders, func(d string) bool { return strings.EqualFold(k, d) }) {
-			continue
-		}
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.Header().Set(headerContentLength, strconv.Itoa(out.Len()))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(out.Bytes())
+	return out.Bytes(), kept
 }
 
 // gemVersion represents a version entry from the RubyGems versions API.
@@ -282,54 +282,26 @@ type gemVersion struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// fetchFilteredVersions fetches the versions API and returns a set of version
-// strings that should be filtered out by cooldown.
-func (h *GemHandler) fetchFilteredVersions(r *http.Request, name string) (map[string]bool, error) {
-	versionsURL := fmt.Sprintf("%s/api/v1/versions/%s.json", h.upstreamURL, name)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, versionsURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := h.proxy.HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("versions API returned %d", resp.StatusCode)
-	}
-
-	body, err := h.proxy.ReadMetadata(resp.Body)
-	if err != nil {
-		return nil, err
-	}
+// parseGemVersions reads the publish times from a versions API response,
+// keyed by version as the compact index writes it.
+func parseGemVersions(body []byte) (publishTimes, error) {
 	var versions []gemVersion
 	if err := json.Unmarshal(body, &versions); err != nil {
 		return nil, err
 	}
-
-	packagePURL := canonicalPackagePURL("gem", name)
-	filtered := make(map[string]bool)
-
+	times := make(publishTimes, len(versions))
 	for _, v := range versions {
+		versionStr := v.Number
+		if v.Platform != "" && v.Platform != "ruby" {
+			versionStr = v.Number + "-" + v.Platform
+		}
 		createdAt, err := time.Parse(time.RFC3339, v.CreatedAt)
 		if err != nil {
-			continue
+			createdAt = time.Time{}
 		}
-
-		if !h.proxy.Cooldown.IsAllowed("gem", packagePURL, createdAt) {
-			// Build version string matching compact index format
-			versionStr := v.Number
-			if v.Platform != "" && v.Platform != "ruby" {
-				versionStr = v.Number + "-" + v.Platform
-			}
-			filtered[versionStr] = true
-		}
+		times[versionStr] = createdAt
 	}
-
-	return filtered, nil
+	return times, nil
 }
 
 // proxyCached forwards a metadata request with caching.

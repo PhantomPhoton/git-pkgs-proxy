@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/git-pkgs/artifacts"
@@ -737,12 +738,78 @@ func (p *Proxy) storeArtifact(ctx context.Context, ecosystem, name, version, fil
 		}
 		// Continue anyway - we have the file. Queue it for deletion in case
 		// no record points at it; the queue skips it while one does.
-		if qErr := p.DB.QueuePendingDelete(storagePath); qErr != nil {
-			p.Logger.Warn("failed to queue unrecorded artifact for deletion", "path", storagePath, "error", qErr)
+		if qErr := p.DB.QueuePendingDelete(storagePath); qErr != nil && !p.recordedAt(versionPURL, filename, storagePath) {
+			p.Logger.Warn("failed to queue unrecorded artifact for deletion, deleting it once served",
+				"path", storagePath, "error", qErr)
+			return sharedArtifact, storagePath, errUnrecorded
 		}
 	}
 
 	return sharedArtifact, storagePath, nil
+}
+
+// recordedAt reports whether the artifact's record points at storagePath. A
+// commit can apply and still report an error, so storeArtifact checks before
+// treating an object as unrecorded. A failed lookup counts as not recorded.
+func (p *Proxy) recordedAt(versionPURL, filename, storagePath string) bool {
+	a, err := p.DB.GetArtifact(versionPURL, filename)
+	return err == nil && a != nil && a.StoragePath.Valid && a.StoragePath.String == storagePath
+}
+
+// errUnrecorded comes back from storeArtifact together with a usable artifact
+// and path when neither a record nor a queue entry could be written for it.
+// Nothing else would ever delete the object, so the fetch serves it to
+// everyone sharing it and deletes it when the last of them is done.
+var errUnrecorded = errors.New("stored artifact has no record")
+
+// unrecordedObject deletes an unrecorded object once every caller sharing
+// its fetch has released it.
+type unrecordedObject struct {
+	refs   atomic.Int32
+	delete func()
+}
+
+func (u *unrecordedObject) release() {
+	if u.refs.Add(-1) == 0 {
+		u.delete()
+	}
+}
+
+// releaseOnClose releases an unrecorded object once its reader is closed.
+type releaseOnClose struct {
+	io.ReadCloser
+	release func()
+}
+
+func (r *releaseOnClose) Close() error {
+	err := r.ReadCloser.Close()
+	r.release()
+	return err
+}
+
+// seekableReleaseOnClose keeps range requests working on a seekable reader.
+type seekableReleaseOnClose struct {
+	releaseOnClose
+	io.Seeker
+}
+
+// serveUnrecorded gives one caller its own reader over an unrecorded object
+// and releases the caller's hold on it when that reader closes, or right away
+// if it can't be opened.
+func (p *Proxy) serveUnrecorded(ctx context.Context, u *unrecordedObject, artifact artifacts.Artifact, path string) (*CacheResult, error) {
+	res, err := p.openStoredArtifact(ctx, artifact, path)
+	if err != nil {
+		u.release()
+		return nil, err
+	}
+	// Once, so a second Close can't drop another caller's hold.
+	r := releaseOnClose{ReadCloser: res.Reader, release: sync.OnceFunc(u.release)}
+	if s, ok := res.Reader.(io.Seeker); ok {
+		res.Reader = &seekableReleaseOnClose{releaseOnClose: r, Seeker: s}
+	} else {
+		res.Reader = &r
+	}
+	return res, nil
 }
 
 // openStoredArtifact gives one caller its own reader over just-committed
@@ -796,15 +863,17 @@ func (p *Proxy) cachedArtifactRecord(pkgPURL, versionPURL, filename, upstreamHas
 // fetch panicked out of it.
 var errSharedFetchAbandoned = errors.New("shared upstream fetch did not complete")
 
-// inflightFetch is one upstream fetch that concurrent callers share. val and
-// err are written before done closes and read only after, so the close is the
-// handoff.
+// inflightFetch is one upstream fetch that concurrent callers share. val, err
+// and unrecorded are written before done closes and read only after, so the
+// close is the handoff. done closes under fetchMu, so a waiter leaving early
+// knows whether it was counted in waiters.
 type inflightFetch struct {
-	done chan struct{}
-	val  fetchedArtifact
-	err  error
+	done       chan struct{}
+	val        fetchedArtifact
+	err        error
+	unrecorded *unrecordedObject
 
-	// waiters counts callers that joined the fetch, guarded by fetchMu.
+	// waiters counts callers waiting on the fetch, guarded by fetchMu.
 	// Tests read it to know a caller has joined.
 	waiters int
 }
@@ -857,13 +926,33 @@ func (p *Proxy) coalesceFetch(ctx context.Context, key string, recheck func() (a
 	select {
 	case <-ctx.Done():
 		// This caller gave up; the fetch continues for everyone else.
+		p.leaveFetch(f)
 		return nil, ctx.Err()
 	case <-f.done:
 	}
 	if f.err != nil {
 		return nil, f.err
 	}
+	if f.unrecorded != nil {
+		return p.serveUnrecorded(ctx, f.unrecorded, f.val.artifact, f.val.storagePath)
+	}
 	return p.openStoredArtifact(ctx, f.val.artifact, f.val.storagePath)
+}
+
+// leaveFetch withdraws a waiter that gave up. Once the fetch has finished the
+// waiter was counted as holding any unrecorded object, so it releases it.
+func (p *Proxy) leaveFetch(f *inflightFetch) {
+	p.fetchMu.Lock()
+	select {
+	case <-f.done:
+		p.fetchMu.Unlock()
+		if f.unrecorded != nil {
+			f.unrecorded.release()
+		}
+	default:
+		f.waiters--
+		p.fetchMu.Unlock()
+	}
 }
 
 // runSharedFetch performs the fetch that joined callers are waiting on. It is
@@ -875,8 +964,14 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 	defer func() {
 		p.fetchMu.Lock()
 		delete(p.inFlight, key)
-		p.fetchMu.Unlock()
+		if f.unrecorded != nil {
+			// Hand each waiter a hold, then drop the one kept while the
+			// waiters were still unknown.
+			f.unrecorded.refs.Add(int32(f.waiters))
+			defer f.unrecorded.release()
+		}
 		close(f.done)
+		p.fetchMu.Unlock()
 	}()
 
 	// A caller checks the cache before reaching here, so a fetch that finished
@@ -938,17 +1033,40 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		commitCtx = context.WithoutCancel(ctx)
 	}
 	stored, path, err := commit(commitCtx)
-	failed = err != nil
+	unrecorded := errors.Is(err, errUnrecorded)
+	if unrecorded {
+		err = nil
+	}
+	// Nothing an instance waiting on the lease could find was recorded, so
+	// an unrecorded object counts as failed for it.
+	failed = err != nil || unrecorded
 	f.val, f.err = fetchedArtifact{artifact: stored, storagePath: path}, err
 	if err != nil {
 		return nil, err
 	}
-	if h := handoffFrom(ctx); h != nil && h.handedOver() {
-		// The caller already has the bytes; opening the stored copy would
-		// cost a read it never uses, a GET on S3 or GCS.
+	// A caller handed the stream already has the bytes; opening the stored
+	// copy would cost a read it never uses, a GET on S3 or GCS.
+	h := handoffFrom(ctx)
+	handedOver := h != nil && h.handedOver()
+	if unrecorded {
+		f.unrecorded = &unrecordedObject{delete: func() { p.deleteUnrecorded(path) }}
+		f.unrecorded.refs.Add(1) // until the waiters are counted
+		if handedOver {
+			return nil, nil
+		}
+		f.unrecorded.refs.Add(1) // this caller
+		return p.serveUnrecorded(ctx, f.unrecorded, stored, path)
+	}
+	if handedOver {
 		return nil, nil
 	}
 	return p.openStoredArtifact(ctx, stored, path)
+}
+
+func (p *Proxy) deleteUnrecorded(path string) {
+	if err := p.Storage.Delete(context.Background(), path); err != nil {
+		p.Logger.Warn("failed to delete unrecorded artifact", "path", path, "error", err)
+	}
 }
 
 type servingHeadKey struct{}
@@ -1563,7 +1681,7 @@ func (p *Proxy) cachedMetadataState(ctx context.Context, ecosystem, cacheKey str
 	if entry != nil && p.MetadataTTL > 0 && entry.FetchedAt.Valid && time.Since(entry.FetchedAt.Time) < p.MetadataTTL {
 		data, ct, err := p.readCachedMetadata(ctx, entry, validate)
 		if err == nil {
-			hit := metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String}.describedBy(entry)
+			hit := metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String, fromCache: true}.describedBy(entry)
 			return entry, &hit
 		}
 		if validate != nil {
@@ -1572,6 +1690,31 @@ func (p *Proxy) cachedMetadataState(ctx context.Context, ecosystem, cacheKey str
 		// Cache file missing/unreadable, fall through to upstream
 	}
 	return entry, nil
+}
+
+// refreshMetadata is lookupMetadata for a document whose cached copy is known
+// to be out of date although it is within its TTL. It skips the TTL and asks
+// upstream, revalidating the cached copy with its validators, and falls back
+// to that copy if upstream fails, which the result reports as stale.
+// Concurrent refreshes of one document share a fetch.
+func (p *Proxy) refreshMetadata(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding string, validate func([]byte) error) metadataResult {
+	if containsPathTraversal(cacheKey) {
+		return metadataResult{err: fmt.Errorf("invalid cache key: %q", cacheKey)}
+	}
+	key := metadataCoalesceKey(ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate != nil) + "\x00refresh"
+	res, shared := p.coalesceMetadata(ctx, key, func(fetchCtx context.Context) metadataResult {
+		var entry *database.MetadataCacheEntry
+		if p.CacheMetadata && p.DB != nil {
+			entry, _ = p.DB.GetMetadataCache(ecosystem, cacheKey)
+		}
+		return p.fetchMetadataFromUpstream(fetchCtx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate, entry)
+	})
+	if shared && res.err == nil && validate != nil {
+		if err := validate(res.body); err != nil {
+			return metadataResult{err: err}
+		}
+	}
+	return res
 }
 
 // fetchMetadataFromUpstream fetches metadata after a cache miss, caches it,
@@ -1642,6 +1785,9 @@ type metadataResult struct {
 	// stale is set when the body is the cached copy served because upstream
 	// failed.
 	stale bool
+	// fromCache is set when the body is a stored copy within its TTL, read
+	// without asking upstream.
+	fromCache bool
 }
 
 // describedBy returns res with the digest that entry, the cache row its body

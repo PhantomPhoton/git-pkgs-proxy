@@ -155,7 +155,7 @@ func TestNPMRewriteMetadata(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata("lodash", []byte(input))
+	output, _, err := h.rewriteMetadataKeeping("lodash", []byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestNPMRewriteMetadataLogsOncePerDocument(t *testing.T) {
 		"4.17.19":{"dist":{"tarball":"https://registry.npmjs.org/lodash/-/lodash-4.17.19.tgz"}},
 		"4.17.20":{"dist":{"tarball":"https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"}},
 		"4.17.21":{"dist":{"tarball":"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"}}}}`
-	if _, err := h.rewriteMetadata("lodash", []byte(input)); err != nil {
+	if _, _, err := h.rewriteMetadataKeeping("lodash", []byte(input)); err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
 
@@ -215,7 +215,7 @@ func TestNPMRewriteMetadataScopedPackage(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata("@babel/core", []byte(input))
+	output, _, err := h.rewriteMetadataKeeping("@babel/core", []byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestNPMRewriteMetadataCooldown(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata("testpkg", []byte(input))
+	output, _, err := h.rewriteMetadataKeeping("testpkg", []byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
@@ -386,7 +386,7 @@ func TestNPMRewriteMetadataCooldownExemptPackage(t *testing.T) {
 		}
 	}`
 
-	output, err := h.rewriteMetadata("testpkg", []byte(input))
+	output, _, err := h.rewriteMetadataKeeping("testpkg", []byte(input))
 	if err != nil {
 		t.Fatalf("rewriteMetadata failed: %v", err)
 	}
