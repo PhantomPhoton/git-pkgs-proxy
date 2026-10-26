@@ -12,12 +12,6 @@ import (
 	"github.com/git-pkgs/proxy/internal/database"
 )
 
-// With cache_metadata, release lists and manifests are kept in the metadata
-// cache along with the upstream Link header, which carries the pagination of
-// release lists and the version-specific manifests a client picks from. They
-// are served from the cache within metadata_ttl, and after it when the
-// upstream fails, as release metadata is.
-
 // swiftDocument is a release list or manifest as the upstream sent it.
 type swiftDocument struct {
 	body        []byte
@@ -30,7 +24,9 @@ type swiftDocument struct {
 
 // fetchDocument returns the document at upstreamURL, from the metadata cache
 // under cacheKey while it is fresh or when the upstream fails, and otherwise
-// from upstream, storing it.
+// from upstream, storing it. The upstream Link header is cached with it,
+// since it carries the pagination of release lists and the version-specific
+// manifests a client picks from.
 func (h *SwiftHandler) fetchDocument(ctx context.Context, cacheKey, upstreamURL, accept string) (*swiftDocument, error) {
 	cached := h.loadDocument(ctx, cacheKey)
 	if cached != nil && h.proxy.MetadataTTL > 0 && time.Since(cached.fetchedAt) < h.proxy.MetadataTTL {
@@ -64,11 +60,11 @@ func (h *SwiftHandler) loadDocument(ctx context.Context, cacheKey string) *swift
 	if !h.documentsCached() {
 		return nil
 	}
-	entry, err := h.proxy.DB.GetMetadataCache("swift", cacheKey)
-	if err != nil || entry == nil || !entry.FetchedAt.Valid {
+	entry := h.proxy.storedMetadataEntry("swift", cacheKey, true)
+	if entry == nil {
 		return nil
 	}
-	reader, err := h.proxy.Storage.Open(ctx, entry.StoragePath)
+	reader, err := h.proxy.openMetadataEntry(ctx, "swift", cacheKey, entry)
 	if err != nil {
 		return nil
 	}
@@ -93,16 +89,17 @@ func (h *SwiftHandler) storeDocument(ctx context.Context, cacheKey string, doc *
 		return
 	}
 	storagePath := metadataStoragePath("swift", cacheKey)
-	size, _, err := h.proxy.Storage.Store(ctx, storagePath, bytes.NewReader(doc.body))
+	size, hash, err := h.proxy.Storage.Store(ctx, storagePath, bytes.NewReader(doc.body))
 	if err == nil {
 		err = h.proxy.DB.UpsertMetadataCache(&database.MetadataCacheEntry{
-			Ecosystem:   "swift",
-			Name:        cacheKey,
-			StoragePath: storagePath,
-			Link:        sql.NullString{String: doc.link, Valid: doc.link != ""},
-			ContentType: sql.NullString{String: doc.contentType, Valid: doc.contentType != ""},
-			Size:        sql.NullInt64{Int64: size, Valid: true},
-			FetchedAt:   sql.NullTime{Time: doc.fetchedAt, Valid: true},
+			Ecosystem:     "swift",
+			Name:          cacheKey,
+			StoragePath:   storagePath,
+			Link:          sql.NullString{String: doc.link, Valid: doc.link != ""},
+			ContentType:   sql.NullString{String: doc.contentType, Valid: doc.contentType != ""},
+			ContentDigest: sql.NullString{String: "sha256:" + hash, Valid: hash != ""},
+			Size:          sql.NullInt64{Int64: size, Valid: true},
+			FetchedAt:     sql.NullTime{Time: doc.fetchedAt, Valid: true},
 		})
 	}
 	if err != nil {

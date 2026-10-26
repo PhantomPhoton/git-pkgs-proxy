@@ -12,17 +12,23 @@ import (
 // its release metadata, from the registry the proxy serves Swift packages
 // from.
 func (m *Mirror) mirrorSwift(ctx context.Context, pv PackageVersion, tracker *progressTracker) {
-	scope, name, err := swiftScopeAndName(pv.Name)
-	if err != nil {
-		m.recordFailure(tracker, pv, err)
-		return
-	}
 	upstream, err := m.registryURL("swift", pv.Name)
 	if err != nil {
 		m.recordFailure(tracker, pv, err)
 		return
 	}
-	result, err := handler.NewSwiftHandler(m.proxy, "", upstream).MirrorRelease(ctx, scope, name, pv.Version)
+	h := handler.NewSwiftHandler(m.proxy, "", upstream)
+	var scope, name string
+	if source := swiftSourceURL(pv.Name); source != "" {
+		scope, name, err = h.ResolveIdentity(ctx, source)
+	} else {
+		scope, name, err = swiftScopeAndName(pv.Name)
+	}
+	if err != nil {
+		m.recordFailure(tracker, pv, err)
+		return
+	}
+	result, err := h.MirrorRelease(ctx, scope, name, pv.Version)
 	if err != nil {
 		m.recordFailure(tracker, pv, err)
 		return
@@ -39,26 +45,23 @@ func (m *Mirror) registryURL(purlType, name string) (string, error) {
 	return "", nil
 }
 
-// swiftScopeAndName splits the name of a pkg:swift PURL, its namespace and
-// name, into a registry scope and package name. The namespace of a registry
-// package is its scope, as in pkg:swift/apple/swift-nio for the identity
-// apple.swift-nio. A namespace naming a source repository, such as
-// pkg:swift/github.com/apple/swift-nio, isn't a registry identity and is
-// refused.
-func swiftScopeAndName(name string) (scope, pkg string, _ error) {
-	scope, pkg, ok := strings.Cut(name, "/")
-	if !ok || strings.ContainsAny(scope, ".:") || strings.Contains(pkg, "/") {
-		return "", "", fmt.Errorf("pkg:swift/%s names a source repository; mirroring needs a registry scope as the namespace, such as pkg:swift/apple/swift-nio for apple.swift-nio", name)
+// swiftSourceURL returns the repository URL of a pkg:swift name whose
+// namespace starts with a host, as in pkg:swift/github.com/apple/swift-nio,
+// or "" for a name whose namespace is a registry scope.
+func swiftSourceURL(name string) string {
+	if host, _, ok := strings.Cut(name, "/"); ok && strings.Contains(host, ".") {
+		return "https://" + name
 	}
-	return scope, pkg, nil
+	return ""
 }
 
-// swiftIdentity returns the registry identity, scope.name, of the name of a
-// pkg:swift PURL.
-func swiftIdentity(name string) (string, error) {
-	scope, pkg, err := swiftScopeAndName(name)
-	if err != nil {
-		return "", err
+// swiftScopeAndName splits the name of a pkg:swift PURL whose namespace is
+// a registry scope, as in pkg:swift/apple/swift-nio for the identity
+// apple.swift-nio.
+func swiftScopeAndName(name string) (scope, pkg string, _ error) {
+	scope, pkg, ok := strings.Cut(name, "/")
+	if !ok || scope == "" || pkg == "" || strings.ContainsAny(scope, ".:") || strings.Contains(pkg, "/") {
+		return "", "", fmt.Errorf("pkg:swift/%s needs a registry scope or a source repository as the namespace, such as pkg:swift/apple/swift-nio or pkg:swift/github.com/apple/swift-nio", name)
 	}
-	return scope + "." + pkg, nil
+	return scope, pkg, nil
 }

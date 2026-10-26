@@ -2,19 +2,16 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 )
 
-// MirrorRelease caches the source archive of release version of the registry
-// package scope.name, under the key the source archive route serves it from,
-// verified against the SHA-256 checksum its release metadata lists. The
-// release metadata is cached as that route reads it, and with cache_metadata
-// so are the package's release list and the release's manifests, which a
-// client reads before it downloads the archive. A client can then resolve and
-// fetch the release without the upstream.
+// MirrorRelease caches release version of scope.name so that a client can
+// resolve and fetch the release without the upstream.
 func (h *SwiftHandler) MirrorRelease(ctx context.Context, scope, name, version string) (*CacheResult, error) {
 	if !validSwiftPackageReference(scope, name, version) {
 		return nil, fmt.Errorf("invalid Swift registry release %s.%s@%s", scope, name, version)
@@ -122,4 +119,39 @@ func swiftLinkHasRel(params, rel string) bool {
 		}
 	}
 	return false
+}
+
+// ResolveIdentity returns the registry scope and name the upstream lists for
+// the source repository at sourceURL. The answer is cached as the identifiers
+// route caches it.
+func (h *SwiftHandler) ResolveIdentity(ctx context.Context, sourceURL string) (scope, name string, _ error) {
+	query := url.Values{"url": {sourceURL}}.Encode()
+	body, _, err := h.proxy.FetchOrCacheMetadata(ctx, "swift", swiftMetadataCacheKey("identifiers", query),
+		h.upstreamURL+"/identifiers?"+query, swiftAcceptJSON)
+	if errors.Is(err, ErrUpstreamNotFound) {
+		return "", "", fmt.Errorf("the Swift registry has no package for %s", sourceURL)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return SwiftIdentityOf(body, sourceURL)
+}
+
+// SwiftIdentityOf returns the scope and name of the first identity in body,
+// a registry's answer to an identifiers lookup for sourceURL.
+func SwiftIdentityOf(body []byte, sourceURL string) (scope, name string, _ error) {
+	var answer struct {
+		Identifiers []string `json:"identifiers"`
+	}
+	if err := json.Unmarshal(body, &answer); err != nil {
+		return "", "", fmt.Errorf("parsing the Swift registry's identifiers for %s: %w", sourceURL, err)
+	}
+	if len(answer.Identifiers) == 0 {
+		return "", "", fmt.Errorf("the Swift registry has no package for %s", sourceURL)
+	}
+	scope, name, ok := strings.Cut(answer.Identifiers[0], ".")
+	if !ok || scope == "" || name == "" {
+		return "", "", fmt.Errorf("the Swift registry answered %s with the invalid identity %q", sourceURL, answer.Identifiers[0])
+	}
+	return scope, name, nil
 }

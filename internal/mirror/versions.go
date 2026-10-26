@@ -2,9 +2,15 @@ package mirror
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 
+	"github.com/git-pkgs/proxy/internal/config"
+	"github.com/git-pkgs/proxy/internal/handler"
 	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries"
 	_ "github.com/git-pkgs/registries/all"
@@ -58,12 +64,6 @@ func (r RegistryVersions) FindVersion(ctx context.Context, ecosystem, name, vers
 }
 
 func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name string) ([]registries.Version, error) {
-	if ecosystem == "swift" {
-		var err error
-		if name, err = swiftIdentity(name); err != nil {
-			return nil, err
-		}
-	}
 	purlType := purl.EcosystemToPURLType(ecosystem)
 	var baseURL string
 	if r.URL != nil {
@@ -76,6 +76,12 @@ func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name str
 	if client == nil {
 		client = registries.DefaultClient()
 	}
+	if ecosystem == "swift" {
+		var err error
+		if name, err = swiftIdentity(ctx, client, baseURL, name); err != nil {
+			return nil, err
+		}
+	}
 	reg, err := registries.New(purlType, baseURL, client)
 	if err != nil {
 		return nil, err
@@ -86,4 +92,35 @@ func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name str
 		_, name, _ = strings.Cut(name, "/")
 	}
 	return reg.FetchVersions(ctx, name)
+}
+
+// swiftIdentity returns the registry identity, scope.name, of the name of a
+// pkg:swift PURL, looking a source repository up on the registry at baseURL.
+func swiftIdentity(ctx context.Context, client *registries.Client, baseURL, name string) (string, error) {
+	source := swiftSourceURL(name)
+	if source == "" {
+		scope, pkg, err := swiftScopeAndName(name)
+		if err != nil {
+			return "", err
+		}
+		return scope + "." + pkg, nil
+	}
+	if baseURL == "" {
+		baseURL = config.DefaultSwiftUpstream
+	}
+	var body json.RawMessage
+	_, err := client.GetJSONWithHeaders(ctx,
+		strings.TrimSuffix(baseURL, "/")+"/identifiers?"+url.Values{"url": {source}}.Encode(),
+		http.Header{"Accept": {"application/vnd.swift.registry.v1+json"}}, &body)
+	if httpErr := (*registries.HTTPError)(nil); errors.As(err, &httpErr) && httpErr.IsNotFound() {
+		return "", fmt.Errorf("the Swift registry has no package for %s", source)
+	}
+	if err != nil {
+		return "", err
+	}
+	scope, pkg, err := handler.SwiftIdentityOf(body, source)
+	if err != nil {
+		return "", err
+	}
+	return scope + "." + pkg, nil
 }

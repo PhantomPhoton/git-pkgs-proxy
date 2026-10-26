@@ -42,6 +42,13 @@ func newSwiftUpstream(t *testing.T) *swiftUpstream {
 		w.Header().Set("Content-Version", "1")
 		rest, ok := strings.CutPrefix(r.URL.Path, "/acme/widget")
 		switch {
+		case r.URL.Path == "/identifiers":
+			if r.URL.Query().Get("url") != "https://github.com/acme/widget" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"identifiers":["acme.widget"]}`)
 		case !ok:
 			http.NotFound(w, r)
 		case rest == "":
@@ -191,15 +198,26 @@ func TestMirrorSwiftListsReleases(t *testing.T) {
 	}
 }
 
-func TestMirrorSwiftRefusesRepositoryNamespaces(t *testing.T) {
+func TestMirrorSwiftResolvesRepositoryPURLs(t *testing.T) {
 	upstream := newSwiftUpstream(t)
 
-	progress, _ := mirrorSwift(t, upstream, "pkg:swift/github.com/acme/widget@1.0.0")
+	progress, proxy := mirrorSwift(t, upstream, "pkg:swift/github.com/acme/widget@1.0.0", "pkg:swift/github.com/acme/widget", "pkg:swift/github.com/acme/other@1.0.0")
 
-	if progress.Failed != 1 || len(progress.Errors) != 1 || !strings.Contains(progress.Errors[0].Error, "registry scope") {
-		t.Errorf("failed = %d, errors = %v; want the repository PURL refused", progress.Failed, progress.Errors)
+	// The listed PURL's 1.0.0 is the versioned one, so it's mirrored once.
+	if progress.Completed != 2 || progress.Failed != 1 || upstream.archiveHits.Load() != 2 {
+		t.Fatalf("completed = %d, failed = %d, archive hits = %d, errors = %v; want both acme.widget releases mirrored and the unknown repository refused",
+			progress.Completed, progress.Failed, upstream.archiveHits.Load(), progress.Errors)
 	}
-	if upstream.hits.Load() != 0 {
-		t.Error("the upstream was asked for a repository PURL")
+	if len(progress.Errors) != 1 || !strings.Contains(progress.Errors[0].Error, "no package for https://github.com/acme/other") {
+		t.Errorf("errors = %v; want the unknown repository named", progress.Errors)
+	}
+
+	// The lookup is cached too, for clients that resolve a repository URL
+	// through the registry.
+	upstream.Close()
+	routes := handler.NewSwiftHandler(proxy, "http://proxy.test", upstream.URL).Routes()
+	rec := swiftRegistryGet(t, routes, "/identifiers?url=https%3A%2F%2Fgithub.com%2Facme%2Fwidget", "application/vnd.swift.registry.v1+json")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "acme.widget") {
+		t.Errorf("identifiers: status = %d, body %q; want the cached lookup", rec.Code, rec.Body.String())
 	}
 }

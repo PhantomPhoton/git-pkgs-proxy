@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSwiftReleaseListAndManifestServedFromCacheWhenUpstreamFails(t *testing.T) {
@@ -59,6 +61,52 @@ func TestSwiftReleaseListAndManifestServedFromCacheWhenUpstreamFails(t *testing.
 				t.Errorf("%s: Link = %q, want the cached Link rewritten", path, link)
 			}
 		}
+	}
+}
+
+// TestSwiftCorruptManifestRefetched checks that a cached manifest whose
+// stored bytes no longer match the recorded digest is fetched again, even
+// within metadata_ttl.
+func TestSwiftCorruptManifestRefetched(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/x-swift")
+		_, _ = io.WriteString(w, "// swift-tools-version:5.9")
+	}))
+	defer upstream.Close()
+
+	proxy, db, store, _ := setupTestProxy(t)
+	proxy.CacheMetadata = true
+	proxy.MetadataTTL = time.Hour
+	routes := NewSwiftHandler(proxy, "https://proxy.example", upstream.URL+"/registry").Routes()
+	get := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apple/example/1.0.0/Package.swift", nil))
+		return w
+	}
+
+	get()
+	entry, err := db.GetMetadataCache("swift", swiftManifestCacheKey("apple", "example", "1.0.0", ""))
+	if err != nil || entry == nil {
+		t.Fatalf("manifest not cached: %v", err)
+	}
+	if !strings.HasPrefix(entry.ContentDigest.String, "sha256:") {
+		t.Fatalf("ContentDigest = %q, want a sha256 digest", entry.ContentDigest.String)
+	}
+	if w := get(); hits.Load() != 1 || w.Code != http.StatusOK {
+		t.Fatalf("fresh cached manifest: status %d, %d upstream fetches; want it served from the cache", w.Code, hits.Load())
+	}
+
+	if _, _, err := store.Store(context.Background(), entry.StoragePath, strings.NewReader("// tampered")); err != nil {
+		t.Fatal(err)
+	}
+	w := get()
+	if hits.Load() != 2 {
+		t.Errorf("upstream fetches = %d, want the corrupt manifest fetched again", hits.Load())
+	}
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "swift-tools-version:5.9") {
+		t.Errorf("status = %d, body %q; want the upstream manifest", w.Code, w.Body.String())
 	}
 }
 
