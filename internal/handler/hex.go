@@ -101,6 +101,11 @@ const hexAPIURL = "https://hex.pm"
 // handlePackages proxies the /packages/{name} endpoint, applying cooldown filtering
 // when enabled. Since the protobuf format has no timestamps, we fetch them from the
 // Hex HTTP API concurrently.
+//
+// Both are read through the metadata cache, so within metadata_ttl a package
+// costs no request to repo.hex.pm or to the rate limited Hex API, and after
+// it both are revalidated with their ETags. The filtered package is kept in
+// the rewrite cache and served with an ETag of its own.
 func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" || !h.proxy.cooldownApplies("hex", name) {
@@ -110,87 +115,102 @@ func (h *HexHandler) handlePackages(w http.ResponseWriter, r *http.Request) {
 
 	h.proxy.Logger.Info("hex package request with cooldown", "name", name)
 
-	protoResp, filteredVersions, versionsErr, err := h.fetchPackageAndVersions(r, name)
-	if err != nil {
-		if writeUpstreamHeld(w, err) {
-			return
-		}
-		h.proxy.Logger.Error("upstream request failed", "error", err)
-		http.Error(w, "upstream request failed", http.StatusBadGateway)
+	docs, err := h.proxy.fetchTimedMetadata(r.Context(), h.timedPackage(name), h.packageVersions)
+	switch {
+	case docs.doc.err != nil:
+		h.proxy.writeMetadataFetchError(w, docs.doc.err)
 		return
-	}
-	defer func() { _ = protoResp.Body.Close() }()
-
-	if protoResp.StatusCode != http.StatusOK {
-		h.proxy.relayResponse(w, r, protoResp, nil)
+	case docs.times.err != nil:
+		h.proxy.writeCooldownLookupError(w, "hex", name, docs.times.err)
 		return
-	}
-
-	if versionsErr != nil {
-		h.proxy.writeCooldownLookupError(w, "hex", name, versionsErr)
-		return
-	}
-
-	body, err := h.proxy.ReadMetadata(protoResp.Body)
-	if err != nil {
+	case err != nil:
 		h.proxy.Logger.Error("failed to read hex package", "name", name, "error", err)
-		http.Error(w, "failed to read response", http.StatusBadGateway)
+		http.Error(w, "failed to filter package metadata", http.StatusBadGateway)
 		return
 	}
 
-	if len(filteredVersions) == 0 {
-		// No versions in cooldown, pass through
-		w.Header().Set(headerContentType, protoResp.Header.Get(headerContentType))
-		w.Header().Set("Content-Encoding", "gzip")
-		_, _ = w.Write(body)
-		return
-	}
-
-	filtered, err := h.filterSignedPackage(body, filteredVersions)
+	packagePURL := canonicalPackagePURL("hex", name)
+	m, err := h.proxy.cachedRewrite(r.Context(), "hex", h.proxyURL, "packages/"+name, docs.doc.body, docs.rewriteDigest(),
+		func([]byte) ([]byte, []string, error) {
+			body, err := h.proxy.decodedMetadataBody(docs.doc)
+			if err != nil {
+				return nil, nil, err
+			}
+			versions, err := h.packageVersions(docs.doc)
+			if err != nil {
+				return nil, nil, err
+			}
+			filtered := make(map[string]bool)
+			var kept []string
+			for _, version := range versions {
+				if docs.withheld(h.proxy, "hex", packagePURL, version) {
+					filtered[version] = true
+					h.proxy.Logger.Info("cooldown: filtering hex version", "package", name, "version", version)
+					continue
+				}
+				kept = append(kept, version)
+			}
+			if len(filtered) == 0 {
+				// Nothing in cooldown: upstream's bytes, signature included.
+				return body, kept, nil
+			}
+			out, err := h.filterSignedPackage(body, filtered)
+			return out, kept, err
+		})
 	if err != nil {
 		h.proxy.Logger.Error("failed to filter hex package", "name", name, "error", err)
 		http.Error(w, "failed to filter package metadata", http.StatusBadGateway)
 		return
 	}
 
+	markStale(w, docs.doc.stale || docs.times.stale)
+	serveHexPackage(w, r, m)
+}
+
+// serveHexPackage writes a package with its validators, or 304 when they
+// show the client's copy is current. The registry file is gzip itself, and
+// Hex clients gunzip it however it is labelled, so it is never compressed
+// again.
+func serveHexPackage(w http.ResponseWriter, r *http.Request, m rewrittenMetadata) {
+	w.Header().Set(headerETag, m.etag)
+	if !m.lastModified.IsZero() {
+		w.Header().Set(headerLastModified, m.lastModified.UTC().Format(http.TimeFormat))
+	}
+	if notModified(r, m.etag, m.lastModified) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.Header().Set(headerContentType, "application/octet-stream")
-	w.Header().Set("Content-Encoding", "gzip")
-	_, _ = w.Write(filtered)
+	w.Header().Set(headerContentEncoding, "gzip")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(m.body)
 }
 
-// fetchPackageAndVersions fetches the protobuf package and version timestamps
-// concurrently. It returns the package response and the set of versions to
-// filter, the Hex API's error, and the package fetch's error.
-func (h *HexHandler) fetchPackageAndVersions(r *http.Request, name string) (*http.Response, map[string]bool, error, error) {
-	type versionsResult struct {
-		filtered map[string]bool
-		err      error
+// timedPackage describes a package's registry file and the Hex API entry
+// it takes publish times from.
+func (h *HexHandler) timedPackage(name string) timedMetadata {
+	return timedMetadata{
+		ecosystem:   "hex",
+		docKey:      "packages/" + name,
+		docURL:      h.upstreamURL + "/packages/" + name,
+		timesKey:    hashedCacheKey(h.apiURL, "api/packages/"+name),
+		timesURL:    fmt.Sprintf("%s/api/packages/%s", h.apiURL, name),
+		timesAccept: contentTypeJSON,
+		parseTimes:  parseHexReleases,
 	}
-
-	versionsCh := make(chan versionsResult, 1)
-	go func() {
-		filtered, err := h.fetchFilteredVersions(r, name)
-		versionsCh <- versionsResult{filtered: filtered, err: err}
-	}()
-
-	protoResp, err := h.fetchUpstreamPackage(r, name)
-
-	versionsRes := <-versionsCh
-
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return protoResp, versionsRes.filtered, versionsRes.err, nil
 }
 
-// fetchUpstreamPackage fetches the protobuf package from upstream.
-func (h *HexHandler) fetchUpstreamPackage(r *http.Request, name string) (*http.Response, error) {
-	upstreamURL := h.upstreamURL + "/packages/" + name
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
+// packageVersions lists the releases in a gzipped Signed package.
+func (h *HexHandler) packageVersions(doc metadataResult) ([]string, error) {
+	body, err := h.proxy.decodedMetadataBody(doc)
 	if err != nil {
 		return nil, err
 	}
-	return h.proxy.HTTPClient.Do(req)
+	payload, err := h.signedPayload(body)
+	if err != nil {
+		return nil, err
+	}
+	return packageReleaseVersions(payload)
 }
 
 // hexRelease represents a version entry from the Hex API.
@@ -204,60 +224,26 @@ type hexPackageAPI struct {
 	Releases []hexRelease `json:"releases"`
 }
 
-// fetchFilteredVersions fetches the Hex API and returns a set of version
-// strings that should be filtered out by cooldown.
-func (h *HexHandler) fetchFilteredVersions(r *http.Request, name string) (map[string]bool, error) {
-	apiURL := fmt.Sprintf("%s/api/packages/%s", h.apiURL, name)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.proxy.HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hex API returned %d", resp.StatusCode)
-	}
-
-	body, err := h.proxy.ReadMetadata(resp.Body)
-	if err != nil {
-		return nil, err
-	}
+// parseHexReleases reads the publish times from a Hex API package response.
+func parseHexReleases(body []byte) (publishTimes, error) {
 	var pkg hexPackageAPI
 	if err := json.Unmarshal(body, &pkg); err != nil {
 		return nil, err
 	}
-
-	packagePURL := canonicalPackagePURL("hex", name)
-	filtered := make(map[string]bool)
-
+	times := make(publishTimes, len(pkg.Releases))
 	for _, release := range pkg.Releases {
 		insertedAt, err := time.Parse(time.RFC3339Nano, release.InsertedAt)
 		if err != nil {
-			continue
+			insertedAt = time.Time{}
 		}
-
-		if !h.proxy.Cooldown.IsAllowed("hex", packagePURL, insertedAt) {
-			filtered[release.Version] = true
-			h.proxy.Logger.Info("cooldown: filtering hex version",
-				"package", name, "version", release.Version,
-				"published", release.InsertedAt)
-		}
+		times[release.Version] = insertedAt
 	}
-
-	return filtered, nil
+	return times, nil
 }
 
-// filterSignedPackage decompresses gzipped data, decodes the Signed protobuf wrapper,
-// filters releases from the Package payload, and re-encodes as gzipped protobuf
-// (without the original signature since the payload has changed).
-func (h *HexHandler) filterSignedPackage(gzippedData []byte, filteredVersions map[string]bool) ([]byte, error) {
-	// Decompress gzip, with the metadata limit applied to the decompressed size
+// signedPayload decompresses a gzipped Signed message, with the metadata
+// limit applied to the decompressed size, and returns its payload.
+func (h *HexHandler) signedPayload(gzippedData []byte) ([]byte, error) {
 	gr, err := gzip.NewReader(bytes.NewReader(gzippedData))
 	if err != nil {
 		return nil, err
@@ -273,9 +259,30 @@ func (h *HexHandler) filterSignedPackage(gzippedData []byte, filteredVersions ma
 	if err != nil {
 		return nil, fmt.Errorf("extracting payload: %w", err)
 	}
+	return payload, nil
+}
+
+// packageReleaseVersions lists the versions of the releases in a Package
+// message.
+func packageReleaseVersions(payload []byte) ([]string, error) {
+	var versions []string
+	_, err := filterPackageReleases(payload, nil, func(version string) {
+		versions = append(versions, version)
+	})
+	return versions, err
+}
+
+// filterSignedPackage decompresses gzipped data, decodes the Signed protobuf wrapper,
+// filters releases from the Package payload, and re-encodes as gzipped protobuf
+// (without the original signature since the payload has changed).
+func (h *HexHandler) filterSignedPackage(gzippedData []byte, filteredVersions map[string]bool) ([]byte, error) {
+	payload, err := h.signedPayload(gzippedData)
+	if err != nil {
+		return nil, err
+	}
 
 	// Filter releases from the Package message
-	filteredPayload, err := filterPackageReleases(payload, filteredVersions)
+	filteredPayload, err := filterPackageReleases(payload, filteredVersions, nil)
 	if err != nil {
 		return nil, fmt.Errorf("filtering releases: %w", err)
 	}
@@ -298,9 +305,10 @@ func (h *HexHandler) filterSignedPackage(gzippedData []byte, filteredVersions ma
 	return buf.Bytes(), nil
 }
 
-// filterPackageReleases filters releases from a Package protobuf message.
+// filterPackageReleases filters releases from a Package protobuf message,
+// calling seen, when not nil, with the version of each release.
 // Package: field 1 = releases (repeated), field 2 = name, field 3 = repository
-func filterPackageReleases(payload []byte, filteredVersions map[string]bool) ([]byte, error) {
+func filterPackageReleases(payload []byte, filteredVersions map[string]bool, seen func(string)) ([]byte, error) {
 	var result []byte
 	data := payload
 
@@ -325,6 +333,9 @@ func filterPackageReleases(payload []byte, filteredVersions map[string]bool) ([]
 
 			if num == 1 { // releases field
 				version := extractReleaseVersion(v)
+				if seen != nil {
+					seen(version)
+				}
 				if filteredVersions[version] {
 					continue // skip this release
 				}

@@ -3,6 +3,7 @@ package mirror
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/git-pkgs/purl"
 	"github.com/git-pkgs/registries"
@@ -78,6 +79,11 @@ func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name str
 	reg, err := registries.New(purlType, baseURL, client)
 	if err != nil {
 		return nil, err
+	}
+	if purlType == "helm" {
+		// The namespace names the repository, which URL resolves to the
+		// index the chart is listed in.
+		_, name, _ = strings.Cut(name, "/")
 	}
 	return reg.FetchVersions(ctx, name)
 }

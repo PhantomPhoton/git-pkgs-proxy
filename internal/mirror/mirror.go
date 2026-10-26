@@ -29,6 +29,9 @@ type Mirror struct {
 	// other unsupported ecosystem.
 	Images ImageMirrorer
 
+	// Charts mirrors helm charts. Without it they fail.
+	Charts ChartMirrorer
+
 	// Versions lists the versions of unversioned PURLs in mirror jobs and
 	// schedules. Nil lists them from the public registries.
 	Versions VersionLister
@@ -234,6 +237,10 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 	}
 	if pv.Ecosystem == "composer" {
 		m.mirrorComposer(ctx, pv, tracker)
+		return
+	}
+	if pv.Ecosystem == "helm" {
+		m.mirrorHelm(ctx, pv, tracker)
 		return
 	}
 	if pv.Ecosystem == "swift" {

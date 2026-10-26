@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -92,9 +93,10 @@ func TestHexHandlerUsesConfiguredAPIUpstream(t *testing.T) {
 		upstream.URL+"/hex",
 		upstream.URL+"/hex-api",
 	)
-	_, err := h.fetchFilteredVersions(httptest.NewRequest(http.MethodGet, "/", nil), "demo")
-	if err != nil {
-		t.Fatalf("fetchFilteredVersions failed: %v", err)
+	timed := h.timedPackage("demo")
+	res := h.proxy.lookupMetadata(context.Background(), "hex", timed.timesKey, timed.timesURL, timed.timesAccept, "", nil)
+	if res.err != nil {
+		t.Fatalf("fetching publish times failed: %v", res.err)
 	}
 	if requestedPath != "/hex-api/api/packages/demo" {
 		t.Errorf("API path = %q, want %q", requestedPath, "/hex-api/api/packages/demo")

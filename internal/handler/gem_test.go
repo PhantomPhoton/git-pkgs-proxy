@@ -196,10 +196,11 @@ func TestGemCompactIndexCooldownClientAcceptsGzip(t *testing.T) {
 	if got := w.Body.String(); got != want {
 		t.Errorf("body = %q, want %q", got, want)
 	}
-	for _, hdr := range []string{"ETag", "Repr-Digest"} {
-		if v := w.Header().Get(hdr); v != "" {
-			t.Errorf("%s = %q, upstream's value must not describe the filtered index", hdr, v)
-		}
+	if v := w.Header().Get("Repr-Digest"); v != "" {
+		t.Errorf("Repr-Digest = %q, upstream's value must not describe the filtered index", v)
+	}
+	if v := w.Header().Get("ETag"); v == "" || v == `"upstream"` {
+		t.Errorf("ETag = %q, want one of the filtered index", v)
 	}
 }
 
@@ -351,7 +352,7 @@ func TestGemCompactIndexVersionsAPIFails(t *testing.T) {
 	}
 }
 
-func TestGemFetchFilteredVersions(t *testing.T) {
+func TestGemParseVersions(t *testing.T) {
 	now := time.Now()
 	oldTime := now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)
 	recentTime := now.Add(-1 * time.Hour).Format(time.RFC3339)
@@ -360,39 +361,22 @@ func TestGemFetchFilteredVersions(t *testing.T) {
 		{Number: "1.0.0", Platform: "ruby", CreatedAt: oldTime},
 		{Number: "2.0.0", Platform: "ruby", CreatedAt: recentTime},
 		{Number: "2.0.0", Platform: "java", CreatedAt: recentTime},
+		{Number: "3.0.0", Platform: "ruby", CreatedAt: "not a time"},
 	})
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(versionsJSON)
-	}))
-	defer upstream.Close()
-
 	proxy := testProxy()
-	proxy.Cooldown = &cooldown.Config{
-		Default: "3d",
-	}
+	proxy.Cooldown = &cooldown.Config{Default: "3d"}
 
-	h := &GemHandler{
-		proxy:       proxy,
-		upstreamURL: upstream.URL,
-		proxyURL:    "http://proxy.local",
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/info/testgem", nil)
-	filtered, err := h.fetchFilteredVersions(req, "testgem")
+	times, err := parseGemVersions(versionsJSON)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if filtered["1.0.0"] {
-		t.Error("version 1.0.0 should not be filtered (old enough)")
-	}
-	if !filtered["2.0.0"] {
-		t.Error("version 2.0.0 (ruby) should be filtered")
-	}
-	if !filtered["2.0.0-java"] {
-		t.Error("version 2.0.0-java should be filtered")
+	docs := timedDocuments{published: times}
+	purl := canonicalPackagePURL("gem", "testgem")
+	for version, want := range map[string]bool{"1.0.0": false, "2.0.0": true, "2.0.0-java": true, "3.0.0": false, "4.0.0": false} {
+		if got := docs.withheld(proxy, "gem", purl, version); got != want {
+			t.Errorf("withheld(%s) = %v, want %v", version, got, want)
+		}
 	}
 
 	_ = fmt.Sprintf // silence unused import
