@@ -802,7 +802,8 @@ func (p *Proxy) serveUnrecorded(ctx context.Context, u *unrecordedObject, artifa
 		u.release()
 		return nil, err
 	}
-	r := releaseOnClose{ReadCloser: res.Reader, release: u.release}
+	// Once, so a second Close can't drop another caller's hold.
+	r := releaseOnClose{ReadCloser: res.Reader, release: sync.OnceFunc(u.release)}
 	if s, ok := res.Reader.(io.Seeker); ok {
 		res.Reader = &seekableReleaseOnClose{releaseOnClose: r, Seeker: s}
 	} else {

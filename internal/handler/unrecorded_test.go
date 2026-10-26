@@ -170,6 +170,44 @@ func TestUnrecordedRefetchWaitsForEveryCaller(t *testing.T) {
 	}
 }
 
+func TestUnrecordedRefetchSurvivesDoubleClose(t *testing.T) {
+	proxy, store := setupUnrecorded(t)
+	fetcher := newGatedFetcher(unrecordedContent)
+	proxy.Fetcher = fetcher
+
+	leader := make(chan *CacheResult, 1)
+	go func() {
+		res, err := fetchGone(context.Background(), proxy)
+		if err != nil {
+			t.Errorf("leader: %v", err)
+		}
+		leader <- res
+	}()
+	<-fetcher.entered
+
+	waiter := make(chan *CacheResult, 1)
+	go func() {
+		res, err := fetchGone(context.Background(), proxy)
+		if err != nil {
+			t.Errorf("waiter: %v", err)
+		}
+		waiter <- res
+	}()
+	waitForWaiters(t, proxy, 1)
+	close(fetcher.release)
+
+	lead, wait := <-leader, <-waiter
+	readAndClose(t, lead)
+	_ = lead.Reader.Close()
+	if got := storedFiles(store); len(got) != 1 {
+		t.Fatalf("stored files with the waiter still reading = %v, want the refetched one", got)
+	}
+	readAndClose(t, wait)
+	if got := storedFiles(store); len(got) != 0 {
+		t.Errorf("stored files after every caller closed = %v, want none", got)
+	}
+}
+
 // ctxStorage fails to open under a cancelled context, as cloud backends do.
 type ctxStorage struct{ *mockStorage }
 
