@@ -51,7 +51,9 @@ Metadata is not cached - always fetched fresh. This ensures clients see new vers
    - Open file from storage
    - Record hit (increment counter, update last_accessed_at)
    - Return reader to handler
-   - Handler streams file to client
+   - Handler streams file to client, checking it against the recorded
+     SHA-256 `content_hash` (the registry's own integrity was checked when the
+     file was stored); a mismatch aborts the response and clears the record
 
    **Cache Miss:**
    - Resolve download URL using Resolver
@@ -95,6 +97,8 @@ the full artifact digest because they read only part of the artifact.
 ### `internal/database`
 
 SQLite or PostgreSQL database for cache metadata. SQLite uses `modernc.org/sqlite` (pure Go, no CGO). PostgreSQL uses `lib/pq`.
+
+For SQLite, `DB` holds two pools: one connection for writes and a pool of read-only (`query_only`) connections for reads. `Get`, `Select`, `Query` and `QueryRow` go to the reader; `Exec`, transactions and everything else go to the writer, so a read inside a transaction sees the transaction's writes. A write sent to the reader fails instead of running. WAL mode lets the readers run while the writer commits. PostgreSQL and in-memory SQLite use one pool for both.
 
 The schema is compatible with [git-pkgs](https://github.com/git-pkgs) databases. The proxy adds the `artifacts` and `vulnerabilities` tables on top of the shared `packages` and `versions` tables, so both tools can point at the same database.
 
@@ -200,7 +204,7 @@ metadata_dates (
 )
 ```
 
-`metadata_dates` holds the `Last-Modified` served with rewritten npm and Composer metadata. A package's date is the second it started serving its current representation, and a new representation is only dated in a later second. Keeping it in the database means replicas sharing one serve the same date, and never give one representation's date to another, so `If-Modified-Since` cannot return 304 for a body the client does not have.
+`metadata_dates` holds the `Last-Modified` served with rewritten metadata, such as npm packuments, Composer documents, PyPI simple pages and Helm indexes. A package's date is the second it started serving its current representation, and a new representation is only dated in a later second. Keeping it in the database means replicas sharing one serve the same date, and never give one representation's date to another, so `If-Modified-Since` cannot return 304 for a body the client does not have.
 
 On PostgreSQL, `INTEGER PRIMARY KEY` becomes `SERIAL`, `DATETIME` becomes `TIMESTAMP`, `INTEGER DEFAULT 0` booleans become `BOOLEAN DEFAULT FALSE`, and size/count columns use `BIGINT`.
 
@@ -301,6 +305,22 @@ HTTP protocol handlers for each registry type.
 - Proxies the Swift Package Registry v1 read endpoints
 - Rewrites release URLs and caches source archives
 
+**GitHandler:**
+- Serves `/git/{name}/{repo}` from `internal/gitcache`, read-only over smart HTTP
+- Validates repository paths and the `repos` allowlist, and maps cache errors to statuses
+- Serves the Git LFS API under `{repo}.git/info/lfs/`: forwards download batches upstream and points each object at `objects/{oid}/{size}`, which is served from the artifact cache (ecosystem `git`, name `{name}/{repo}`, version the object ID); a miss uses the download URL kept from the batch or asks the upstream batch API for a fresh one, recorded without its signed query, copies the object from another repository when its content is already stored, and checks the object against its sha256 ID; a batch the upstream can't answer is answered from the cache
+
+### `internal/gitcache`
+
+Local bare clones of upstream Git repositories, outside the artifact cache and the database, at `{git.cache_dir}/{name}-{URL hash}/{repo}.git`. The hash of the upstream's URL means repointing an upstream starts a fresh cache; at startup only the configured upstreams' directories are loaded, and those of their old URLs removed.
+
+- Each request for refs checks the upstream's branches and tags with protocol v2 `ls-refs` and fetches only when they changed; concurrent requests share one refresh
+- Clients are served by `git upload-pack --stateless-rpc`
+- Spawned `git` reaches the upstream only through a loopback relay that forwards with the proxy's upstream client, so address checks, `upstream.auth` and the access log apply
+- Commits a client asks for by ID that are on no cached branch or tag are fetched and kept under hidden `refs/proxy/wanted/{time}/{id}` refs until a branch or tag includes them or for 7 days; off for upstreams with credentials
+- Evicts least recently used repositories after each fetch once `git.max_size` is passed, and drops a repository that can no longer be refreshed within `git.max_repo_size` so it is cloned again; never one in use. A commit fetched by ID that does not fit is refused instead
+- Every fetched pack is kept as a pack (`transfer.unpackLimit=1`), so a transfer cut off at the size limit leaves nothing behind
+
 ### `internal/server`
 
 HTTP server setup, web UI, and API handlers.
@@ -313,6 +333,10 @@ HTTP server setup, web UI, and API handlers.
 - Enrichment API for package metadata, vulnerability scanning, and outdated detection
 - Health, stats, and Prometheus metrics endpoints. `/health` runs an active write → size-check → read → verify → delete probe against the storage backend and returns a structured JSON response (`HealthResponse`) with `"ok"` / `"error"` status per subsystem. Probe results are cached (default 30 s, configurable via `health.storage_probe_interval`) to avoid overwhelming remote backends. The response also carries a `circuit_breakers` map reporting each upstream's artifact-fetch breaker as `"open"` or `"closed"`, keyed by the host fetched from (or an opaque placeholder where the fetch URL has no host to read); the same state is published as the `proxy_circuit_breaker_state` gauge on each `/metrics` scrape. An open breaker leaves the overall status `"ok"` — it describes an upstream, not this proxy.
 
+### `internal/memlimit`
+
+Sets Go's soft memory limit to 80% of the cgroup memory limit at startup on Linux, unless `GOMEMLIMIT` is set. See "Memory limit" in the configuration docs.
+
 ### `internal/metrics`
 
 Prometheus metrics for cache performance, upstream latency, storage operations, and active requests. See the Monitoring section of the README for the full metric list.
@@ -323,7 +347,7 @@ Version age filtering for supply chain attack mitigation, provided by [github.co
 
 ### `internal/enrichment`
 
-Package metadata enrichment. Fetches license, description, homepage, repository URL, and vulnerability data from upstream registries. Powers the `/api/` endpoints and the web UI's package detail pages.
+Package metadata enrichment, built on [github.com/git-pkgs/enrichment](https://github.com/git-pkgs/enrichment). Fetches license, description, homepage, repository URL, and vulnerability data from upstream registries. Powers the `/api/` endpoints and the web UI's package detail pages.
 
 ### `internal/mirror`
 

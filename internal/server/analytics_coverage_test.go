@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/git-pkgs/proxy/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // metricSurface records where each registered metric is shown on /ui/analytics.
@@ -24,6 +25,8 @@ var metricSurface = map[string]string{
 	"proxy_ecosystem_versions":           "breakdown table",
 	"proxy_cache_size_bytes":             "Cache size tile",
 	"proxy_cached_artifacts_total":       "Cached artifacts tile",
+	"proxy_metadata_cache_size_bytes":    "Metadata cache card",
+	"proxy_metadata_cache_entries":       "Metadata cache card",
 
 	// Request-path counters.
 	"proxy_response_bytes_total":        "Runtime: Served",
@@ -34,8 +37,9 @@ var metricSurface = map[string]string{
 	"proxy_requests_total":                     "Runtime: Requests + Responses by status",
 	"proxy_request_duration_seconds":           "Runtime: Mean latency",
 	"proxy_active_requests":                    "Runtime: In flight",
-	"proxy_cache_hits_total":                   "Runtime: Cache lookups + hit rate",
-	"proxy_cache_misses_total":                 "Runtime: Cache lookups + hit rate",
+	"proxy_cache_hits_total":                   "Runtime: Artifact and metadata cache lookups + artifact hit rate",
+	"proxy_cache_misses_total":                 "Runtime: Artifact and metadata cache lookups + artifact hit rate",
+	"proxy_metadata_cache_served_bytes_total":  "Runtime: Metadata cache lookups -- served from cache",
 	"proxy_upstream_fetch_duration_seconds":    "Runtime: Upstream fetches + mean fetch",
 	"proxy_upstream_errors_total":              "Runtime: Upstream errors",
 	"proxy_storage_operation_duration_seconds": "Runtime: Storage operations",
@@ -45,6 +49,7 @@ var metricSurface = map[string]string{
 	"proxy_circuit_breaker_state":              "Runtime: Circuit breakers",
 	"proxy_circuit_breaker_trips_total":        "Runtime: Circuit breaker trips",
 	"proxy_artifacts_evicted_total":            "Runtime: Evicted artifacts",
+	"proxy_metadata_evicted_total":             "Runtime: Evicted metadata",
 	"proxy_scan_duration_seconds":              "Runtime: Pre-cache scanning -- Scans",
 	"proxy_scan_blocked_total":                 "Runtime: Pre-cache scanning -- Artifacts blocked",
 	"proxy_scan_errors_total":                  "Runtime: Pre-cache scanning -- Scan errors",
@@ -54,13 +59,14 @@ var metricSurface = map[string]string{
 // on the analytics page. The page is meant to be a complete view of what
 // /metrics exposes, so a silently unsurfaced metric is a gap, not a detail.
 func TestEveryMetricIsSurfaced(t *testing.T) {
-	isolateRecentFailures(t)
 	// Touch every metric family so it is present in the registry output, since
 	// a vector with no observed label values gathers as nothing at all.
 	metrics.RecordRequest("npm", 200, 0)
 	metrics.RecordResponse("npm", "npm", 1)
-	metrics.RecordCacheHit("npm")
-	metrics.RecordCacheMiss("npm")
+	metrics.RecordArtifactCacheHit("npm")
+	metrics.RecordArtifactCacheMiss("npm")
+	metrics.RecordMetadataCacheHit("npm", 1)
+	metrics.RecordMetadataCacheMiss("npm")
 	metrics.RecordUpstreamFetch("npm", 0)
 	metrics.RecordUpstreamError("npm", "fetch_failed", metrics.FailureDetail{})
 	metrics.RecordStorageOperation("get", 0)
@@ -73,15 +79,18 @@ func TestEveryMetricIsSurfaced(t *testing.T) {
 	metrics.RecordScanError("npm", "clamav", "timeout", metrics.FailureDetail{})
 	metrics.UpdateCacheStats(1, 1)
 	metrics.RecordArtifactEvicted("retention", "npm")
+	metrics.RecordMetadataEvicted("npm")
 	metrics.UpdateEcosystemStats([]metrics.EcosystemStats{{Ecosystem: "npm", DownloadedBytes: 1}})
+	metrics.UpdateMetadataCacheStats([]metrics.MetadataCacheStats{{Ecosystem: "npm", Entries: 1, Size: 1}})
 
-	snap, err := metrics.Gather()
+	families, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
 		t.Fatalf("Gather: %v", err)
 	}
 
 	var registered []string
-	for _, name := range snap.Names() {
+	for _, family := range families {
+		name := family.GetName()
 		if strings.HasPrefix(name, "proxy_") {
 			registered = append(registered, name)
 		}

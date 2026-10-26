@@ -9,7 +9,6 @@ import (
 
 	"github.com/git-pkgs/artifacts"
 	"github.com/git-pkgs/purl"
-	"github.com/jmoiron/sqlx"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -53,7 +52,17 @@ func (db *DB) GetPackageByEcosystemName(ecosystem, name string) (*Package, error
 	return &pkg, nil
 }
 
+// execer runs statements on the database or inside a transaction.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Get(dest any, query string, args ...any) error
+}
+
 func (db *DB) UpsertPackage(pkg *Package) error {
+	return db.upsertPackage(db, pkg)
+}
+
+func (db *DB) upsertPackage(exec execer, pkg *Package) error {
 	now := time.Now()
 	var query string
 
@@ -91,7 +100,7 @@ func (db *DB) UpsertPackage(pkg *Package) error {
 		`
 	}
 
-	_, err := db.Exec(query,
+	_, err := exec.Exec(query,
 		pkg.PURL, pkg.Ecosystem, pkg.Name, pkg.LatestVersion,
 		pkg.License, pkg.Description, pkg.Homepage, pkg.RepositoryURL,
 		pkg.RegistryURL, pkg.EnrichedAt, now, now,
@@ -137,6 +146,10 @@ func (db *DB) GetVersionsByPackagePURL(packagePURL string) ([]Version, error) {
 }
 
 func (db *DB) UpsertVersion(v *Version) error {
+	return db.upsertVersion(db, v)
+}
+
+func (db *DB) upsertVersion(exec execer, v *Version) error {
 	now := time.Now()
 	var query string
 
@@ -168,7 +181,7 @@ func (db *DB) UpsertVersion(v *Version) error {
 		`
 	}
 
-	_, err := db.Exec(query,
+	_, err := exec.Exec(query,
 		v.PURL, v.PackagePURL, v.License, v.Integrity,
 		v.PublishedAt, v.Yanked, v.EnrichedAt, now, now,
 	)
@@ -250,6 +263,34 @@ func (db *DB) GetCachedArtifact(packagePURL, versionPURL, filename string) (*Cac
 		return nil, err
 	}
 	return row.artifact(versionPURL, filename), nil
+}
+
+// StoredContent is a stored object with a given content hash.
+type StoredContent struct {
+	StoragePath string         `db:"storage_path"`
+	Size        int64          `db:"size"`
+	ContentType sql.NullString `db:"content_type"`
+}
+
+// FindStoredContent returns a cached artifact whose content has the sha256
+// hash, under any name, or nil if none is stored. Pushed artifacts are left
+// out.
+func (db *DB) FindStoredContent(hash string) (*StoredContent, error) {
+	var found StoredContent
+	query := db.Rebind(`
+		SELECT storage_path, size, content_type FROM artifacts
+		WHERE content_hash = ? AND storage_path IS NOT NULL AND fetched_at IS NOT NULL
+		  AND size IS NOT NULL AND source <> 'local'
+		LIMIT 1
+	`)
+	err := db.Get(&found, query, hash)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &found, nil
 }
 
 type cachedArtifactRow struct {
@@ -335,37 +376,76 @@ func inUTC(t sql.NullTime) sql.NullTime {
 }
 
 func (db *DB) UpsertArtifact(a *Artifact) error {
-	for range upsertArtifactAttempts {
-		var previous sql.NullString
-		query := db.Rebind(`SELECT storage_path FROM artifacts WHERE version_purl = ? AND filename = ?`)
-		if err := db.Get(&previous, query, a.VersionPURL, a.Filename); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("reading artifact: %w", err)
-		}
-		applied, err := db.upsertArtifactQueuing(a, previous)
-		if err != nil {
-			return err
-		}
-		if applied {
-			return nil
-		}
-	}
-	return errors.New("upserting artifact: record kept changing")
+	return db.recordArtifact(a, nil, ErrLocalArtifactExists)
 }
 
-// upsertArtifactQueuing writes a as upsertArtifactFrom does and queues the
-// path it replaced in the same transaction, so a failed queue leaves the
-// record on the old path instead of orphaning it.
-func (db *DB) upsertArtifactQueuing(a *Artifact, previous sql.NullString) (bool, error) {
+// ErrLocalArtifactExists is returned when an artifact would replace one that
+// was pushed to the proxy. Pushed artifacts are only removed by deleting them.
+var ErrLocalArtifactExists = errors.New("a pushed artifact already exists")
+
+// RecordCachedArtifact records an artifact fetched from an upstream together
+// with its package and version, in one transaction. If the artifact was
+// pushed in the meantime, nothing is written and ErrLocalArtifactExists is
+// returned, so the push's version integrity is kept as well.
+func (db *DB) RecordCachedArtifact(pkg *Package, v *Version, a *Artifact) error {
+	return db.recordArtifact(a, func(tx execer) error {
+		if err := db.upsertPackage(tx, pkg); err != nil {
+			return err
+		}
+		return db.upsertVersion(tx, v)
+	}, ErrLocalArtifactExists)
+}
+
+// artifactSlot is what an artifact record holds before it is replaced.
+type artifactSlot struct {
+	StoragePath sql.NullString `db:"storage_path"`
+	Source      sql.NullString `db:"source"`
+}
+
+// recordArtifact writes before's records and a in one transaction. A pushed
+// artifact is never replaced: the transaction is rolled back and localErr
+// returned. A storage path the record stops pointing at is queued for
+// deletion in the same transaction, since each fetch or push stores its own
+// object and nothing else would remove it. The write applies only if the
+// record still holds the path read before it, so commits racing on one
+// artifact each queue the path they replaced.
+func (db *DB) recordArtifact(a *Artifact, before func(tx execer) error, localErr error) error {
+	for range upsertArtifactAttempts {
+		done, err := db.tryRecordArtifact(a, before, localErr)
+		if err != nil || done {
+			return err
+		}
+	}
+	return errors.New("recording artifact: record kept changing")
+}
+
+func (db *DB) tryRecordArtifact(a *Artifact, before func(tx execer) error, localErr error) (bool, error) {
 	tx, err := db.Beginx()
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	applied, err := db.upsertArtifactFrom(tx, a, previous)
+	if before != nil {
+		if err := before(tx); err != nil {
+			return false, err
+		}
+	}
+
+	var current artifactSlot
+	query := db.Rebind(`SELECT storage_path, source FROM artifacts WHERE version_purl = ? AND filename = ?`)
+	if err := tx.Get(&current, query, a.VersionPURL, a.Filename); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("reading artifact: %w", err)
+	}
+	if current.Source.String == SourceLocal {
+		return false, localErr
+	}
+
+	applied, err := db.upsertArtifactFrom(tx, a, current.StoragePath)
 	if err != nil || !applied {
 		return false, err
 	}
+	previous := current.StoragePath
 	if previous.Valid && previous.String != a.StoragePath.String {
 		if _, err := tx.Exec(db.Rebind(queuePendingDeleteQuery), previous.String, time.Now().UTC()); err != nil {
 			return false, fmt.Errorf("queueing replaced artifact: %w", err)
@@ -374,9 +454,9 @@ func (db *DB) upsertArtifactQueuing(a *Artifact, previous sql.NullString) (bool,
 	return true, tx.Commit()
 }
 
-// upsertArtifactFrom writes a if the record is absent or still holds
-// previous, and reports whether it did.
-func (db *DB) upsertArtifactFrom(ex sqlx.Execer, a *Artifact, previous sql.NullString) (bool, error) {
+// upsertArtifactFrom writes a if the record is absent, or still holds
+// previous and wasn't pushed, and reports whether it did.
+func (db *DB) upsertArtifactFrom(exec execer, a *Artifact, previous sql.NullString) (bool, error) {
 	now := time.Now()
 	var query string
 
@@ -397,6 +477,7 @@ func (db *DB) upsertArtifactFrom(ex sqlx.Execer, a *Artifact, previous sql.NullS
 				source = EXCLUDED.source,
 				manifest = EXCLUDED.manifest
 			WHERE artifacts.storage_path IS NOT DISTINCT FROM $15
+				AND (artifacts.source IS NULL OR artifacts.source <> 'local')
 		`
 	} else {
 		query = `
@@ -415,10 +496,11 @@ func (db *DB) upsertArtifactFrom(ex sqlx.Execer, a *Artifact, previous sql.NullS
 				source = excluded.source,
 				manifest = excluded.manifest
 			WHERE artifacts.storage_path IS ?
+				AND (artifacts.source IS NULL OR artifacts.source <> 'local')
 		`
 	}
 
-	res, err := ex.Exec(query,
+	res, err := exec.Exec(query,
 		a.VersionPURL, a.Filename, a.UpstreamURL, a.StoragePath, a.ContentHash,
 		a.Size, a.ContentType, inUTC(a.FetchedAt), a.HitCount, inUTC(a.LastAccessedAt), now, now,
 		a.sourceOrUpstream(), a.Manifest, previous,
@@ -553,13 +635,16 @@ const queuePendingDeleteQuery = `
 	ON CONFLICT(path) DO UPDATE SET queued_at = excluded.queued_at`
 
 // GetDuePendingDeletes returns up to limit paths queued before cutoff, oldest
-// first. A path a record points at again is skipped.
+// first. A path a record points at again is skipped: a metadata document is
+// stored at a path fixed by its key, so one fetched again after eviction
+// reuses the path queued for it.
 func (db *DB) GetDuePendingDeletes(cutoff time.Time, limit int) ([]string, error) {
 	var paths []string
 	query := db.Rebind(`
 		SELECT path FROM pending_deletes
 		WHERE queued_at < ?
 		  AND NOT EXISTS (SELECT 1 FROM artifacts WHERE artifacts.storage_path = pending_deletes.path)
+		  AND NOT EXISTS (SELECT 1 FROM metadata_cache WHERE metadata_cache.storage_path = pending_deletes.path)
 		ORDER BY queued_at
 		LIMIT ?
 	`)
@@ -748,6 +833,7 @@ func (db *DB) SearchPackages(query string, ecosystem string, limit int, offset i
 	var args []any
 
 	if ecosystem != "" {
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
 		sqlQuery = db.Rebind(`
 			SELECT p.ecosystem, p.name, p.latest_version, p.license,
 			       COALESCE(SUM(a.hit_count), 0) as hits,
@@ -756,12 +842,12 @@ func (db *DB) SearchPackages(query string, ecosystem string, limit int, offset i
 			FROM packages p
 			LEFT JOIN versions v ON v.package_purl = p.purl
 			LEFT JOIN artifacts a ON a.version_purl = v.purl
-			WHERE p.name LIKE ? AND p.ecosystem = ? AND a.storage_path IS NOT NULL
+			WHERE p.name LIKE ? AND ` + condition + ` AND a.storage_path IS NOT NULL
 			GROUP BY p.purl, p.ecosystem, p.name, p.latest_version, p.license
 			ORDER BY hits DESC
 			LIMIT ? OFFSET ?
 		`)
-		args = []any{searchPattern, ecosystem, limit, offset}
+		args = append(append([]any{searchPattern}, ecosystemArgs...), limit, offset)
 	} else {
 		sqlQuery = db.Rebind(`
 			SELECT p.ecosystem, p.name, p.latest_version, p.license,
@@ -800,14 +886,15 @@ func (db *DB) CountSearchResults(query string, ecosystem string) (int64, error) 
 	var args []any
 
 	if ecosystem != "" {
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
 		sqlQuery = db.Rebind(`
 			SELECT COUNT(DISTINCT p.purl)
 			FROM packages p
 			LEFT JOIN versions v ON v.package_purl = p.purl
 			LEFT JOIN artifacts a ON a.version_purl = v.purl
-			WHERE p.name LIKE ? AND p.ecosystem = ? AND a.storage_path IS NOT NULL
+			WHERE p.name LIKE ? AND ` + condition + ` AND a.storage_path IS NOT NULL
 		`)
-		args = []any{searchPattern, ecosystem}
+		args = append([]any{searchPattern}, ecosystemArgs...)
 	} else {
 		sqlQuery = db.Rebind(`
 			SELECT COUNT(DISTINCT p.purl)
@@ -1046,8 +1133,9 @@ func (db *DB) ListCachedPackages(ecosystem string, sortBy string, limit int, off
 	whereClause := "WHERE a.storage_path IS NOT NULL"
 	args := []any{}
 	if ecosystem != "" {
-		whereClause += " AND p.ecosystem = ?"
-		args = append(args, ecosystem)
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
+		whereClause += " AND " + condition
+		args = append(args, ecosystemArgs...)
 	}
 
 	groupByClause := "GROUP BY p.purl, p.ecosystem, p.name, p.latest_version, p.license"
@@ -1129,8 +1217,9 @@ func (db *DB) CountCachedPackages(ecosystem string) (int64, error) {
 	whereClause := "WHERE a.storage_path IS NOT NULL"
 	args := []any{}
 	if ecosystem != "" {
-		whereClause += " AND p.ecosystem = ?"
-		args = append(args, ecosystem)
+		condition, ecosystemArgs := ecosystemFilter(ecosystem)
+		whereClause += " AND " + condition
+		args = append(args, ecosystemArgs...)
 	}
 
 	query := fmt.Sprintf(`
@@ -1150,11 +1239,67 @@ func (db *DB) CountCachedPackages(ecosystem string) (int64, error) {
 
 // Metadata cache queries
 
+// MetadataCacheStats is one ecosystem's share of the metadata cache.
+type MetadataCacheStats struct {
+	Ecosystem string
+	Entries   int64
+	Size      int64
+}
+
+// GetMetadataCacheStats returns the number and total size of cached metadata
+// documents per ecosystem, largest first. Ecosystem names are normalized so
+// aliases such as "gem" and "rubygems" share one row. Rows written before
+// sizes were recorded count as entries with no size.
+func (db *DB) GetMetadataCacheStats() ([]MetadataCacheStats, error) {
+	hasTable, err := db.HasTable("metadata_cache")
+	if err != nil || !hasTable {
+		return nil, err
+	}
+
+	rows, err := db.Query(`SELECT ecosystem, COUNT(*), COALESCE(SUM(size), 0) FROM metadata_cache GROUP BY ecosystem`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	byEcosystem := make(map[string]*MetadataCacheStats)
+	for rows.Next() {
+		var ecosystem string
+		var entries, size int64
+		if err := rows.Scan(&ecosystem, &entries, &size); err != nil {
+			return nil, err
+		}
+		key := purl.NormalizeEcosystem(ecosystem)
+		row, ok := byEcosystem[key]
+		if !ok {
+			row = &MetadataCacheStats{Ecosystem: key}
+			byEcosystem[key] = row
+		}
+		row.Entries += entries
+		row.Size += size
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	stats := make([]MetadataCacheStats, 0, len(byEcosystem))
+	for _, row := range byEcosystem {
+		stats = append(stats, *row)
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].Size != stats[j].Size {
+			return stats[i].Size > stats[j].Size
+		}
+		return stats[i].Ecosystem < stats[j].Ecosystem
+	})
+	return stats, nil
+}
+
 func (db *DB) GetMetadataCache(ecosystem, name string) (*MetadataCacheEntry, error) {
 	var entry MetadataCacheEntry
 	query := db.Rebind(`
 		SELECT id, ecosystem, name, storage_path, etag, link, content_type, content_encoding,
-		       content_digest, size, last_modified, fetched_at, created_at, updated_at
+		       content_digest, size, last_modified, fetched_at, last_accessed_at, created_at, updated_at
 		FROM metadata_cache WHERE ecosystem = ? AND name = ?
 	`)
 	err := db.Get(&entry, query, ecosystem, name)
@@ -1167,6 +1312,53 @@ func (db *DB) GetMetadataCache(ecosystem, name string) (*MetadataCacheEntry, err
 	return &entry, nil
 }
 
+// RefreshMetadataCache sets fetched_at on the metadata cache row for ecosystem
+// and name, provided the row still records digest, and reports whether it did.
+// It is for an upstream 304, which leaves the stored document as it is.
+func (db *DB) RefreshMetadataCache(ecosystem, name, digest string, fetchedAt time.Time) (bool, error) {
+	// fetched_at is stored in UTC, as in UpsertMetadataCache.
+	res, err := db.Exec(db.Rebind(`
+		UPDATE metadata_cache SET fetched_at = ?, updated_at = ?
+		WHERE ecosystem = ? AND name = ? AND content_digest = ?
+	`), fetchedAt.UTC(), time.Now(), ecosystem, name, digest)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// MoveMetadataCache points the metadata cache row for ecosystem and name at
+// to, provided it is still at from and records digest, and reports whether
+// it did. The caller has copied the document from from to to.
+func (db *DB) MoveMetadataCache(ecosystem, name, from, to, digest string) (bool, error) {
+	res, err := db.Exec(db.Rebind(`
+		UPDATE metadata_cache SET storage_path = ?, updated_at = ?
+		WHERE ecosystem = ? AND name = ? AND storage_path = ? AND content_digest = ?
+	`), to, time.Now(), ecosystem, name, from, digest)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// ForgetMetadataDocument points the metadata cache row for ecosystem and name
+// at to, provided it is still at from, and clears what described the document
+// at from: its digest, validators and fetch time. The row stays, so the next
+// lookup fetches the document again rather than serving or revalidating it.
+func (db *DB) ForgetMetadataDocument(ecosystem, name, from, to string) error {
+	_, err := db.Exec(db.Rebind(`
+		UPDATE metadata_cache
+		SET storage_path = ?, content_digest = NULL, etag = NULL, last_modified = NULL,
+		    fetched_at = NULL, updated_at = ?
+		WHERE ecosystem = ? AND name = ? AND storage_path = ?
+	`), to, time.Now(), ecosystem, name, from)
+	return err
+}
+
+// UpsertMetadataCache writes entry and marks it accessed now, since a
+// document is stored because a request asked for it.
 func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 	now := time.Now()
 	// fetched_at is a TIMESTAMP without zone on Postgres, and lib/pq reads it
@@ -1181,8 +1373,8 @@ func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 	if db.dialect == DialectPostgres {
 		query = `
 			INSERT INTO metadata_cache (ecosystem, name, storage_path, etag, link, content_type, content_encoding,
-			                            content_digest, size, last_modified, fetched_at, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			                            content_digest, size, last_modified, fetched_at, last_accessed_at, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT(ecosystem, name) DO UPDATE SET
 				storage_path = EXCLUDED.storage_path,
 				etag = EXCLUDED.etag,
@@ -1193,13 +1385,14 @@ func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 				size = EXCLUDED.size,
 				last_modified = EXCLUDED.last_modified,
 				fetched_at = EXCLUDED.fetched_at,
+				last_accessed_at = EXCLUDED.last_accessed_at,
 				updated_at = EXCLUDED.updated_at
 		`
 	} else {
 		query = `
 			INSERT INTO metadata_cache (ecosystem, name, storage_path, etag, link, content_type, content_encoding,
-			                            content_digest, size, last_modified, fetched_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			                            content_digest, size, last_modified, fetched_at, last_accessed_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ecosystem, name) DO UPDATE SET
 				storage_path = excluded.storage_path,
 				etag = excluded.etag,
@@ -1210,13 +1403,14 @@ func (db *DB) UpsertMetadataCache(entry *MetadataCacheEntry) error {
 				size = excluded.size,
 				last_modified = excluded.last_modified,
 				fetched_at = excluded.fetched_at,
+				last_accessed_at = excluded.last_accessed_at,
 				updated_at = excluded.updated_at
 		`
 	}
 
 	_, err := db.Exec(query,
 		entry.Ecosystem, entry.Name, entry.StoragePath, entry.ETag, entry.Link,
-		entry.ContentType, entry.ContentEncoding, entry.ContentDigest, entry.Size, entry.LastModified, fetchedAt, now, now,
+		entry.ContentType, entry.ContentEncoding, entry.ContentDigest, entry.Size, entry.LastModified, fetchedAt, now.UTC(), now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("upserting metadata cache: %w", err)

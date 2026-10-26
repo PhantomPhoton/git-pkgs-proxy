@@ -13,6 +13,7 @@
 //   - /nuget/*    - NuGet V3 API protocol
 //   - /composer/* - Composer/Packagist protocol
 //   - /conan/*    - Conan C/C++ protocol
+//   - /chef/*     - Chef Supermarket protocol
 //   - /conda/*    - Conda/Anaconda protocol
 //   - /cran/*     - CRAN (R) protocol
 //   - /julia/*    - Julia Pkg server protocol
@@ -20,6 +21,7 @@
 //   - /v2/*       - OCI/Docker container registry protocol
 //   - /apk/*      - Alpine APK repository protocol
 //   - /arch/*     - Arch Linux pacman repository protocol
+//   - /freebsd/*  - FreeBSD pkg repository protocol
 //   - /debian/*   - Debian/APT repository protocol
 //   - /rpm/*      - RPM/Yum repository protocol
 //
@@ -63,17 +65,19 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/git-pkgs/archives"
 	"github.com/git-pkgs/cooldown"
+	shared "github.com/git-pkgs/enrichment"
 	swaggerdoc "github.com/git-pkgs/proxy/docs/swagger"
 	"github.com/git-pkgs/proxy/internal/accesslog"
 	"github.com/git-pkgs/proxy/internal/config"
-	"github.com/git-pkgs/proxy/internal/cooldownpolicy"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
 	"github.com/git-pkgs/proxy/internal/enrichment"
+	"github.com/git-pkgs/proxy/internal/gitcache"
 	"github.com/git-pkgs/proxy/internal/handler"
 	upstreamhttp "github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/proxy/internal/metrics"
@@ -81,19 +85,18 @@ import (
 	"github.com/git-pkgs/proxy/internal/packageurl"
 	"github.com/git-pkgs/proxy/internal/scanner"
 	"github.com/git-pkgs/proxy/internal/storage"
+	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
 	"github.com/git-pkgs/registries/safehttp"
-	"github.com/git-pkgs/spdx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
 const (
-	serverReadTimeout  = 30 * time.Second
-	serverWriteTimeout = 5 * time.Minute
-	serverIdleTimeout  = 60 * time.Second
-	dashboardTopN      = 10
-	hoursPerDay        = 24
+	serverReadTimeout = 30 * time.Second
+	serverIdleTimeout = 60 * time.Second
+	dashboardTopN     = 10
+	hoursPerDay       = 24
 
 	// Upstream transport defaults, matching what fetch.NewFetcher would use
 	// if we did not hand it our own client. Go's default transport keeps only
@@ -117,14 +120,21 @@ type Server struct {
 	accessLog   *accesslog.Logger
 	ecr         *ecrTokens
 	breakers    *breakerMonitor
-	rateLimits  *upstreamhttp.RateLimitGate
+	rateLimits  *upstreamhttp.SharedRateLimitGate
 	ecoStats    ecosystemStatsCache
+	metaStats   metadataStatsCache
 	sources     sourceTracker
+	scheduler   *mirror.Scheduler
+	git         *gitcache.Cache
 
 	// browseLimits overrides defaultBrowseLimits when set; tests use it.
 	browseLimits archives.StreamOptions
 
 	compares compareLimiter
+
+	// background counts the goroutines Start runs until cancel, which
+	// Shutdown waits for before it closes storage and the database.
+	background sync.WaitGroup
 }
 
 // New creates a new Server with the given configuration.
@@ -224,22 +234,22 @@ func (s *Server) Start(listeners ...net.Listener) error {
 }
 
 func (s *Server) serve(listener net.Listener) error {
-	metadataClient, artifactClient := s.newUpstreamClients(serverWriteTimeout)
+	metadataClient, artifactClient := s.newUpstreamClients(s.cfg.ParseArtifactTimeout())
 
 	// Create shared components with circuit breaker.
-	baseFetcher := fetch.NewFetcher(fetch.WithHTTPClient(artifactClient))
+	baseFetcher := fetch.NewFetcher(fetch.WithHTTPClient(artifactClient), fetch.WithMaxArtifactSize(s.cfg.ParseArtifactMaxSize()))
 	fetcher := fetch.NewCircuitBreakerFetcher(baseFetcher)
 	s.breakers = newBreakerMonitor(fetcher, s.logger)
-	resolver := fetch.NewResolver()
 	cd := &cooldown.Config{
 		Default:    s.cfg.Cooldown.Default,
 		Ecosystems: s.cfg.Cooldown.Ecosystems,
 		Packages:   s.cfg.Cooldown.NormalizedPackages(),
 	}
-	proxy := handler.NewProxy(s.db, s.storage, handler.LimitArtifactSize(fetcher, s.cfg.ParseArtifactMaxSize()), resolver, s.logger)
+	proxy := handler.NewProxy(s.db, s.storage, fetcher, nil, s.logger)
+	configureMirrorResolvers(proxy, s.cfg.Upstream)
 	proxy.HTTPClient = metadataClient
 	proxy.RateLimits = s.rateLimits
-	cooldownPolicy, err := cooldownpolicy.New(cd, s.cfg.Cooldown.PackagePatterns)
+	cooldownPolicy, err := cooldown.NewPolicy(cd, s.cfg.Cooldown.PackagePatterns)
 	if err != nil {
 		return fmt.Errorf("configuring cooldown policy: %w", err)
 	}
@@ -268,6 +278,27 @@ func (s *Server) serve(listener net.Listener) error {
 	proxy.DirectServeBaseURL = s.cfg.Storage.DirectServeBaseURL
 	proxy.StreamArtifacts = !s.cfg.Storage.CacheArtifacts
 
+	if len(s.cfg.Upstream.Git) > 0 {
+		upstreamDirs := make(map[string]string, len(s.cfg.Upstream.Git))
+		for name, upstream := range s.cfg.Upstream.Git {
+			upstreamDirs[name] = gitcache.UpstreamDir(name, upstream.URL)
+		}
+		gitCache, err := gitcache.New(gitcache.Options{
+			CacheDir:    s.cfg.Git.CacheDir,
+			MaxSize:     s.cfg.Git.MaxSizeBytes(),
+			MaxRepoSize: s.cfg.Git.MaxRepoSizeBytes(),
+			RefreshWait: s.cfg.Git.RefreshWaitDuration(),
+			StaleMaxAge: s.cfg.Git.StaleMaxAgeDuration(),
+			Client:      artifactClient,
+			Logger:      s.logger,
+			Upstreams:   upstreamDirs,
+		})
+		if err != nil {
+			return fmt.Errorf("configuring git cache: %w", err)
+		}
+		s.git = gitCache
+	}
+
 	// Create router with Chi
 	r := chi.NewRouter()
 
@@ -285,11 +316,7 @@ func (s *Server) serve(listener net.Listener) error {
 			next.ServeHTTP(w, r)
 		})
 	})
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r.WithContext(handler.DetachUpstreamFetch(r.Context())))
-		})
-	})
+	r.Use(markRequestContext)
 
 	// Mount protocol handlers
 	s.mountProtocolHandlers(r, proxy)
@@ -317,6 +344,7 @@ func (s *Server) serve(listener net.Listener) error {
 	// Web UI. Mounted under /ui so a reverse proxy can apply different
 	// access rules to it than to the package endpoints above (#123).
 	r.Route("/ui", func(ui chi.Router) {
+		ui.Use(denyFraming)
 		ui.Mount("/static", http.StripPrefix("/ui/static/", staticHandler()))
 		ui.Get("/", s.handleRoot)
 		ui.Get("/analytics", s.handleAnalytics)
@@ -326,10 +354,16 @@ func (s *Server) serve(listener net.Listener) error {
 		ui.Get("/package/{ecosystem}/*", s.handlePackagePath)
 		ui.Get("/api/browse/{ecosystem}/*", s.handleBrowsePath)
 		ui.Get("/api/compare/{ecosystem}/*", s.handleComparePath)
+		if s.cfg.CacheDelete {
+			ui.Delete("/api/cache/{ecosystem}/*", s.handleCacheDelete)
+		}
 	})
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/ui/", http.StatusFound)
 	})
+	if s.cfg.CacheDelete {
+		r.Delete("/api/cache/{ecosystem}/*", s.handleCacheDelete)
+	}
 
 	// API endpoints for enrichment data
 	enrichSvc := enrichment.New(s.logger)
@@ -349,15 +383,20 @@ func (s *Server) serve(listener net.Listener) error {
 
 	// Mirror API endpoints (opt-in via mirror_api config or PROXY_MIRROR_API env)
 	if s.cfg.MirrorAPI {
-		mirrorSvc := mirror.New(proxy, s.db, s.storage, s.logger, 4) //nolint:mnd // default concurrency
-		mirrorSvc.Images = s.newContainerHandler(proxy)
+		mirrorSvc := s.newMirror(proxy, 4) //nolint:mnd // default concurrency
 		jobStore := mirror.NewJobStore(bgCtx, mirrorSvc)
 		mirrorAPI := NewMirrorAPIHandler(jobStore)
 		r.Post("/api/mirror", mirrorAPI.HandleCreate)
 		r.Get("/api/mirror/{id}", mirrorAPI.HandleGet)
 		r.Delete("/api/mirror/{id}", mirrorAPI.HandleCancel)
-		go jobStore.StartCleanup(bgCtx)
+		s.background.Go(func() { jobStore.StartCleanup(bgCtx) })
+		// Mirror jobs stop with bgCtx; their fetches still use the database.
+		s.background.Go(func() {
+			<-bgCtx.Done()
+			jobStore.Wait()
+		})
 	}
+	s.startMirrorSchedules(bgCtx, proxy)
 
 	// Hosted package endpoints (opt-in via hosted.enabled or PROXY_HOSTED_ENABLED)
 	if s.cfg.Hosted.Enabled {
@@ -369,7 +408,7 @@ func (s *Server) serve(listener net.Listener) error {
 		Addr:         s.cfg.Listen,
 		Handler:      r,
 		ReadTimeout:  serverReadTimeout,
-		WriteTimeout: serverWriteTimeout, // Large artifacts need time
+		WriteTimeout: s.cfg.ParseWriteTimeout(), // Large artifacts need time
 		IdleTimeout:  serverIdleTimeout,
 	}
 
@@ -379,10 +418,14 @@ func (s *Server) serve(listener net.Listener) error {
 		"ui_url", s.cfg.UIBaseURL,
 		"storage", s.storage.URL(),
 		"database", s.cfg.Database.String())
-	go s.updateCacheStatsMetrics()
-	go s.startEvictionLoop(bgCtx)
-	go s.startRetentionLoop(bgCtx)
-	go s.startReclaimLoop(bgCtx)
+	for _, warning := range s.cfg.EnvWarnings() {
+		s.logger.Warn(warning)
+	}
+	s.background.Go(func() { s.updateCacheStatsMetrics(bgCtx) })
+	s.background.Go(func() { backfillMetadataAccess(bgCtx, s.db, s.logger, metadataBackfillBatch) })
+	s.background.Go(func() { s.startEvictionLoop(bgCtx) })
+	s.background.Go(func() { s.startRetentionLoop(bgCtx) })
+	s.background.Go(func() { s.startReclaimLoop(bgCtx) })
 
 	if listener != nil {
 		return s.http.Serve(listener)
@@ -422,7 +465,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 		s.cfg.BaseURL,
 		s.cfg.Upstream.Maven,
 		s.cfg.Upstream.GradlePluginPortal,
-	)
+	).WithRepositories(s.cfg.Upstream.MavenRepositories)
 	gradleHandler := handler.NewGradleBuildCacheHandler(proxy)
 	nugetHandler := handler.NewNuGetHandlerWithUpstreams(
 		proxy,
@@ -437,6 +480,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 		s.cfg.Upstream.ComposerRepository,
 	).WithPackageRoutes(s.cfg.Upstream.ComposerRoutes)
 	conanHandler := handler.NewConanHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Conan)
+	chefHandler := handler.NewChefHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.Chef)
 	condaHandler := handler.NewCondaHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.Conda)
 	cranHandler := handler.NewCRANHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.CRAN)
 	juliaHandler := handler.NewJuliaHandlerWithUpstream(proxy, s.cfg.Upstream.Julia)
@@ -447,6 +491,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 		proxy, s.cfg.BaseURL, s.cfg.Upstream.Helm, s.cfg.Upstream.OCIDefault, s.cfg.Upstream.OCI)
 	apkHandler := handler.NewAPKHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.APK)
 	archHandler := handler.NewArchHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.Arch)
+	freebsdHandler := handler.NewFreeBSDHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.FreeBSD)
 	debianHandler := handler.NewDebianHandler(
 		proxy,
 		s.cfg.BaseURL,
@@ -454,9 +499,10 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 		s.cfg.Upstream.DebianRepositories,
 	)
 	rpmHandler := handler.NewRPMHandlerWithUpstream(proxy, s.cfg.BaseURL, s.cfg.Upstream.RPM)
-	genericHandler := handler.NewGenericHandler(proxy, s.cfg.Upstream.Generic, s.cfg.Upstream.GenericArtifacts)
+	genericHandler := handler.NewGenericHandler(proxy, s.cfg.Upstream.Generic, s.cfg.Upstream.GenericArtifacts).
+		WithPaths(s.cfg.Upstream.GenericPaths)
 
-	r = r.With(sandboxUpstreamContent, rejectQueryInPath)
+	r = r.With(sandboxUpstreamContent, rejectQueryInPath, rejectDotSegments)
 	r.Mount("/npm", http.StripPrefix("/npm", npmHandler.Routes()))
 	r.Mount("/cargo", http.StripPrefix("/cargo", cargoHandler.Routes()))
 	r.Mount("/gem", http.StripPrefix("/gem", gemHandler.Routes()))
@@ -469,6 +515,7 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	r.Mount("/nuget", http.StripPrefix("/nuget", nugetHandler.Routes()))
 	r.Mount("/composer", http.StripPrefix("/composer", composerHandler.Routes()))
 	r.Mount("/conan", http.StripPrefix("/conan", conanHandler.Routes()))
+	r.Mount("/chef", http.StripPrefix("/chef", chefHandler.Routes()))
 	r.Mount("/conda", http.StripPrefix("/conda", condaHandler.Routes()))
 	r.Mount("/cran", http.StripPrefix("/cran", cranHandler.Routes()))
 	r.Mount("/julia", http.StripPrefix("/julia", juliaHandler.Routes()))
@@ -478,9 +525,14 @@ func (s *Server) mountProtocolHandlers(r chi.Router, proxy *handler.Proxy) {
 	r.Mount("/helm", http.StripPrefix("/helm", helmHandler.Routes()))
 	r.Mount("/apk", http.StripPrefix("/apk", apkHandler.Routes()))
 	r.Mount("/arch", http.StripPrefix("/arch", archHandler.Routes()))
+	r.Mount("/freebsd", http.StripPrefix("/freebsd", freebsdHandler.Routes()))
 	r.Mount("/debian", http.StripPrefix("/debian", debianHandler.Routes()))
 	r.Mount("/rpm", http.StripPrefix("/rpm", rpmHandler.Routes()))
 	r.Mount("/generic", http.StripPrefix("/generic", genericHandler.Routes()))
+	if s.git != nil {
+		gitHandler := handler.NewGitHandler(proxy, s.git, s.cfg.Upstream).WithBaseURL(s.cfg.BaseURL)
+		r.Mount("/git", http.StripPrefix("/git", gitHandler.Routes()))
+	}
 }
 
 // configureScanning builds the scanner group from cfg and wires it into
@@ -497,11 +549,32 @@ func (s *Server) newUpstreamClients(artifactTimeout time.Duration) (metadataClie
 	}
 	// The gate sits under the auth transport so it sees every final upstream
 	// answer, including the retry after a bearer challenge.
-	gate := upstreamhttp.NewRateLimitGate(baseTransport)
-	gate.Logger = s.logger
-	gate.OnHold = metrics.RecordUpstreamRateLimitHold
-	s.rateLimits = gate
-	authTransport := upstreamhttp.NewTransport(gate, upstreamhttp.AuthFunc(s.authForURL))
+	gate := registryclient.NewRateLimitGate(baseTransport)
+	gate.OnHold = func(event registryclient.HoldEvent) {
+		metrics.RecordUpstreamRateLimitHold(event.Host)
+		if s.logger != nil {
+			source := "default"
+			if event.FromHeader {
+				source = "retry-after"
+			}
+			s.logger.Warn("upstream rate limited this proxy, holding its requests",
+				"host", event.Host, "hold", event.RetryAfter.Round(time.Second).String(), "source", source,
+				"until", event.Until.UTC().Format(time.RFC3339))
+		}
+	}
+	gate.OnRelease = func(host string) {
+		if s.logger != nil {
+			s.logger.Info("upstream rate limit cleared", "host", host)
+		}
+	}
+	// Holds go through the database so instances sharing it stop sending to
+	// a host as soon as any one of them is rate limited.
+	var holdStore upstreamhttp.HoldStore
+	if s.db != nil {
+		holdStore = s.db
+	}
+	s.rateLimits = upstreamhttp.NewSharedRateLimitGate(gate, holdStore, s.logger)
+	authTransport := upstreamhttp.NewTransport(s.rateLimits, upstreamhttp.AuthFunc(s.authForURL))
 	metadata := *safeClient
 	metadata.Timeout = s.cfg.ParseHTTPTimeout()
 	metadata.Transport = authTransport
@@ -517,8 +590,9 @@ func (s *Server) newUpstreamClients(artifactTimeout time.Duration) (metadataClie
 func NewMirrorProxy(cfg *config.Config, db *database.DB, store storage.Storage, logger *slog.Logger) (*handler.Proxy, *handler.ContainerHandler) {
 	s := &Server{cfg: cfg, db: db, storage: store, logger: logger, ecr: newECRTokens(logger)}
 	metadataClient, artifactClient := s.newUpstreamClients(0)
-	fetcher := handler.LimitArtifactSize(fetch.NewFetcher(fetch.WithHTTPClient(artifactClient)), cfg.ParseArtifactMaxSize())
-	proxy := handler.NewProxy(db, store, fetcher, fetch.NewResolver(), logger)
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(artifactClient), fetch.WithMaxArtifactSize(cfg.ParseArtifactMaxSize()))
+	proxy := handler.NewProxy(db, store, fetcher, nil, logger)
+	configureMirrorResolvers(proxy, cfg.Upstream)
 	proxy.HTTPClient = metadataClient
 	proxy.RateLimits = s.rateLimits
 	return proxy, s.newContainerHandler(proxy)
@@ -570,16 +644,35 @@ func upstreamSafeHTTPOptions(upstream config.UpstreamConfig) safehttp.Options {
 }
 
 // updateCacheStatsMetrics periodically updates cache statistics in Prometheus metrics.
-func (s *Server) updateCacheStatsMetrics() {
+func (s *Server) updateCacheStatsMetrics(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	// Update once immediately
-	s.updateCacheStats()
-
-	for range ticker.C {
+	for {
 		s.updateCacheStats()
+		s.updateMetadataCacheStats()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
+}
+
+// updateMetadataCacheStats republishes the metadata cache gauges from a fresh
+// read of the snapshot the analytics page also serves. It runs separately
+// from updateCacheStats so a failure in one leaves the other's gauges current.
+func (s *Server) updateMetadataCacheStats() {
+	stats, err := s.metaStats.Refresh(s.db)
+	if err != nil {
+		s.logger.Warn("failed to get metadata cache stats for metrics", "error", err)
+		return
+	}
+	out := make([]metrics.MetadataCacheStats, 0, len(stats))
+	for _, e := range stats {
+		out = append(out, metrics.MetadataCacheStats{Ecosystem: e.Ecosystem, Entries: e.Entries, Size: e.Size})
+	}
+	metrics.UpdateMetadataCacheStats(out)
 }
 
 func (s *Server) updateCacheStats() {
@@ -632,6 +725,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 
+	s.waitForMirrorSchedules(ctx)
+	s.waitForBackground(ctx)
+
+	if s.git != nil {
+		if err := s.git.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("git cache close: %w", err))
+		}
+	}
+
 	if s.storage != nil {
 		if err := s.storage.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("storage close: %w", err))
@@ -654,6 +756,27 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return errs[0]
 	}
 	return nil
+}
+
+// backgroundShutdownWait bounds how long shutdown waits for background jobs
+// to notice they were cancelled.
+const backgroundShutdownWait = 30 * time.Second
+
+// waitForBackground waits for the goroutines Start ran to return, so none of
+// them still uses storage or the database when they are closed.
+func (s *Server) waitForBackground(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, backgroundShutdownWait)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		s.background.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		s.logger.Warn("background jobs still running at shutdown")
+	}
 }
 
 // authForURL returns the authentication header for a given URL based on config.
@@ -1088,19 +1211,29 @@ func (s *Server) showVersion(w http.ResponseWriter, r *http.Request, ecosystem, 
 	hasCached := firstBrowsableArtifact(artifacts) != nil
 
 	data := VersionShowData{
-		Layout:            s.layoutFor(r),
-		Package:           pkg,
-		Version:           ver,
-		Artifacts:         artifacts,
-		Vulnerabilities:   vulns,
-		IsOutdated:        isOutdated,
-		LicenseCategory:   categorizeLicense(ver.License),
-		HasCachedArtifact: hasCached,
+		Layout:               s.layoutFor(r),
+		Package:              pkg,
+		Version:              ver,
+		Artifacts:            artifacts,
+		Vulnerabilities:      vulns,
+		IsOutdated:           isOutdated,
+		LicenseCategory:      categorizeLicense(ver.License),
+		HasCachedArtifact:    hasCached,
+		HasDeletableArtifact: hasDeletableArtifact(artifacts),
 	}
 
 	if err := s.templates.Render(w, "version_show", data); err != nil {
 		s.logger.Error("failed to render version show", "error", err)
 	}
+}
+
+func hasDeletableArtifact(artifacts []database.Artifact) bool {
+	for _, art := range artifacts {
+		if art.StoragePath.Valid && art.Source != database.SourceLocal {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) cachedVersionPURL(ecosystem, name, version string) string {
@@ -1338,21 +1471,9 @@ func formatTimeAgo(t time.Time) string {
 	}
 }
 
-// categorizeLicenseCSS returns the CSS class suffix for a license category using the spdx module.
+// categorizeLicenseCSS returns the CSS class suffix for a license category.
 func categorizeLicenseCSS(license string) string {
-	if license == "" {
-		return licenseCategoryUnknown
-	}
-
-	if spdx.HasCopyleft(license) {
-		return "copyleft"
-	}
-
-	if spdx.IsFullyPermissive(license) {
-		return "permissive"
-	}
-
-	return licenseCategoryUnknown
+	return string(shared.CategorizeLicense(license))
 }
 
 // categorizeLicense is a helper that handles sql.NullString.

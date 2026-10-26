@@ -77,16 +77,11 @@ type Storage interface {
 	Close() error
 }
 
-// ArtifactPath builds the storage path artifacts were cached under before each
-// fetch got its own; records from then still point at such paths. Only tests
-// call it, to build such records.
-// Format: {ecosystem}/{namespace}/{name}/{version}/{filename}
-// For packages without namespace: {ecosystem}/{name}/{version}/{filename}
-func ArtifactPath(ecosystem, namespace, name, version, filename string) string {
-	if namespace != "" {
-		return ecosystem + "/" + namespace + "/" + name + "/" + version + "/" + filename
-	}
-	return ecosystem + "/" + name + "/" + version + "/" + filename
+// SeekableReads is implemented by backends whose Open always returns a
+// reader that implements io.Seeker. It tells a caller that byte ranges can be
+// served from an object without opening it first.
+type SeekableReads interface {
+	ReadsSeekable() bool
 }
 
 // FetchPath builds the storage path for one fetch of an artifact:

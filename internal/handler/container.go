@@ -15,6 +15,7 @@ import (
 
 	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/purl"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -114,19 +115,15 @@ type ContainerHandler struct {
 	// refusalsFull is set once the refusals set reached its limit and that
 	// was logged.
 	refusalsFull bool
+
+	// manifestFlight shares one upstream exchange among concurrent
+	// requests for the same manifest.
+	manifestFlight singleflight.Group
 }
 
 type containerRegistry struct {
 	repositoryPrefix string
 	registryURL      string
-}
-
-// NewContainerHandler creates a new container registry protocol handler.
-// Named registries are selected with the repository prefix
-// upstream/{name}/, leaving unprefixed requests compatible with the Docker Hub
-// mirror behavior.
-func NewContainerHandler(proxy *Proxy, proxyURL string, namedRegistries ...map[string]string) *ContainerHandler {
-	return newContainerHandler(proxy, proxyURL, dockerHubRegistry, namedRegistries...)
 }
 
 // NewContainerHandlerWithRegistry creates a container handler with a custom
@@ -401,10 +398,14 @@ func (h *ContainerHandler) handleBlobDownload(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	h.proxy.Logger.Info("container blob request", "name", upstreamName, "digest", digest)
+	h.proxy.Logger.Debug("container blob request", "name", upstreamName, "digest", digest)
 
 	filename := digest
 	cached, err := h.proxy.GetCachedArtifact(r.Context(), "oci", cacheName, digest, filename)
+	if errors.Is(err, ErrVersionDenied) {
+		h.containerError(w, http.StatusForbidden, "DENIED", err.Error())
+		return
+	}
 	if err != nil {
 		h.proxy.Logger.Error("failed to check blob cache", "error", err)
 		h.containerError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to check blob cache")
@@ -479,14 +480,17 @@ func (h *ContainerHandler) handleManifest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	registryURL, upstreamName, _, ok := h.registryForRequest(r, name)
+	registryURL, upstreamName, cacheName, ok := h.registryForRequest(r, name)
 	if !ok {
 		h.containerError(w, http.StatusNotFound, "NAME_UNKNOWN", "unknown upstream registry")
 		return
 	}
 
-	h.proxy.Logger.Info("container manifest request", "name", upstreamName, "reference", reference)
-	h.serveManifest(w, r, registryURL, upstreamName, reference)
+	h.proxy.Logger.Debug("container manifest request", "name", upstreamName, "reference", reference)
+	if h.manifestDenied(w, cacheName, reference) {
+		return
+	}
+	h.serveManifest(w, r, registryURL, upstreamName, cacheName, reference)
 }
 
 // handleTagsList caches tag list responses for offline OCI pulls.

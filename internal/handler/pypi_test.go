@@ -375,7 +375,7 @@ func TestPyPIRewriteJSONMetadataCooldown(t *testing.T) {
 		"urls": [{"url": "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz", "upload_time_iso_8601": "` + recent + `"}]
 	}`
 
-	output, err := h.rewriteJSONMetadata([]byte(input))
+	output, _, err := h.rewriteJSONMetadata([]byte(input))
 	if err != nil {
 		t.Fatalf("rewriteJSONMetadata failed: %v", err)
 	}

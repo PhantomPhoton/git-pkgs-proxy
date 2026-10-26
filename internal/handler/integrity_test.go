@@ -7,10 +7,16 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
+	"testing/iotest"
+
+	"github.com/git-pkgs/registries/fetch"
 )
 
 func sha256Hex(data string) string {
@@ -346,5 +352,199 @@ func TestVerifyingReaderVerifyOnce(t *testing.T) {
 	_ = reader.Close()
 	if calls != 1 {
 		t.Errorf("onMismatch called %d times, want 1", calls)
+	}
+}
+
+// TestCorruptCachedArtifactAbortsResponse serves a cached artifact whose
+// stored bytes no longer match its digest through a real server and client.
+// The client must see a failed, short body rather than a complete response.
+func TestCorruptCachedArtifactAbortsResponse(t *testing.T) {
+	proxy, db, store, _ := setupTestProxy(t)
+	content := strings.Repeat("cached content ", 10000)
+	seedPackage(t, db, store, "npm", "corrupt", "1.0.0", "corrupt-1.0.0.tgz", content)
+	seeded, err := db.GetArtifact("pkg:npm/corrupt@1.0.0", "corrupt-1.0.0.tgz")
+	if err != nil || seeded == nil || !seeded.StoragePath.Valid {
+		t.Fatalf("seeded record = %+v (err %v), want a storage path", seeded, err)
+	}
+	tampered := []byte(content)
+	tampered[len(tampered)-1] = '!'
+	store.files[seeded.StoragePath.String] = tampered
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		result, err := proxy.GetCachedArtifact(r.Context(), "npm", "corrupt", "1.0.0", "corrupt-1.0.0.tgz")
+		if err != nil || result == nil {
+			http.Error(w, "not cached", http.StatusInternalServerError)
+			return
+		}
+		ServeArtifactRequest(w, r, result)
+	}))
+	t.Cleanup(server.Close)
+
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if resp.ContentLength != int64(len(content)) {
+		t.Fatalf("Content-Length = %d, want %d", resp.ContentLength, len(content))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err == nil {
+		t.Error("reading a corrupted cached artifact succeeded, want an error")
+	}
+	if int64(len(body)) >= resp.ContentLength {
+		t.Errorf("read %d bytes, want fewer than Content-Length %d", len(body), resp.ContentLength)
+	}
+	if !bytes.HasPrefix(tampered, body) {
+		t.Error("body is not a prefix of the stored bytes")
+	}
+
+	artifact, err := db.GetArtifact("pkg:npm/corrupt@1.0.0", "corrupt-1.0.0.tgz")
+	if err != nil || artifact == nil || artifact.StoragePath.Valid {
+		t.Errorf("record = %+v (err %v), want it cleared", artifact, err)
+	}
+}
+
+func TestFailOnMismatchHoldsBackFinalChunk(t *testing.T) {
+	data := strings.Repeat("0123456789", 1000)
+	for _, tt := range []struct {
+		name   string
+		source func(string) io.Reader
+	}{
+		{"single reads", func(s string) io.Reader { return strings.NewReader(s) }},
+		{"one byte reads", func(s string) io.Reader { return iotest.OneByteReader(strings.NewReader(s)) }},
+		{"data with EOF", func(s string) io.Reader { return iotest.DataErrReader(strings.NewReader(s)) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			checks, err := newIntegrityChecks(sha256Hex(data), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			reader, err := checks.wrapFailOnMismatch(io.NopCloser(tt.source(data)), func(string) {
+				t.Error("onMismatch called for matching bytes")
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(reader)
+			if err != nil || string(got) != data {
+				t.Errorf("matching read = %d bytes, %v; want %d bytes, nil", len(got), err, len(data))
+			}
+
+			var calls int
+			tampered := data[:len(data)-1] + "!"
+			reader, err = checks.wrapFailOnMismatch(io.NopCloser(tt.source(tampered)), func(string) { calls++ })
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err = io.ReadAll(reader)
+			if !errors.Is(err, ErrArtifactDigestMismatch) {
+				t.Errorf("mismatched read error = %v, want ErrArtifactDigestMismatch", err)
+			}
+			if len(got) >= len(tampered) || !strings.HasPrefix(tampered, string(got)) {
+				t.Errorf("mismatched read returned %d of %d bytes, want a strict prefix", len(got), len(tampered))
+			}
+			if calls != 1 {
+				t.Errorf("onMismatch called %d times, want 1", calls)
+			}
+		})
+	}
+}
+
+// TestFetchWithDigestVerifiesEveryAlgorithm checks that a sha512 digest is
+// verified before the artifact is cached, like a sha256 one, and that a digest
+// whose algorithm can't be verified is refused without fetching.
+func TestFetchWithDigestVerifiesEveryAlgorithm(t *testing.T) {
+	const content = "blob content"
+	sum512 := sha512.Sum512([]byte(content))
+	tests := []struct {
+		name, digest string
+		wantErr      error
+	}{
+		{"sha256", "sha256:" + sha256Hex(content), nil},
+		{"sha512", "sha512:" + hex.EncodeToString(sum512[:]), nil},
+		{"mismatched sha256", "sha256:" + sha256Hex("other"), ErrArtifactDigestMismatch},
+		{"mismatched sha512", "sha512:" + strings.Repeat("a", 128), ErrArtifactDigestMismatch},
+		{"unsupported algorithm", "sha1:" + strings.Repeat("a", 40), ErrUnsupportedDigest},
+		{"malformed sha512", "sha512:abc", ErrUnsupportedDigest},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s/stream=%t", tt.name, stream), func(t *testing.T) {
+				checkFetchWithDigest(t, stream, content, tt.digest, tt.wantErr)
+			})
+		}
+	}
+}
+
+func checkFetchWithDigest(t *testing.T, stream bool, content, digest string, wantErr error) {
+	t.Helper()
+	proxy, _, _, fetcher := setupTestProxy(t)
+	proxy.StreamArtifacts = stream
+	fetcher.artifact = &fetch.Artifact{Body: io.NopCloser(strings.NewReader(content))}
+
+	result, err := proxy.GetOrFetchArtifactFromURLWithDigest(t.Context(), "oci", "library/demo", digest, digest,
+		"https://registry.example/v2/library/demo/blobs/"+digest, digest)
+	if err == nil {
+		var body []byte
+		body, err = io.ReadAll(result.Reader)
+		_ = result.Reader.Close()
+		if err == nil && string(body) != content {
+			t.Errorf("body = %q, want %q", body, content)
+		}
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if errors.Is(wantErr, ErrUnsupportedDigest) && fetcher.fetchCalled {
+		t.Error("fetched an artifact whose digest can't be verified")
+	}
+	cached, err := proxy.GetCachedArtifact(t.Context(), "oci", "library/demo", digest, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached != nil {
+		_ = cached.Reader.Close()
+	}
+	if wantCached := wantErr == nil && !stream; (cached != nil) != wantCached {
+		t.Errorf("cached = %v, want %v", cached != nil, wantCached)
+	}
+}
+
+// BenchmarkStoredObjectVerification compares verifying a cache hit with
+// every recorded digest (SHA-256 content hash plus npm's SHA-512) against
+// the content hash alone.
+func BenchmarkStoredObjectVerification(b *testing.B) {
+	data := strings.Repeat("x", 8<<20)
+	checks, err := newIntegrityChecks(sha256Hex(data), sha512SRI(data))
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, bench := range []struct {
+		name   string
+		checks integrityChecks
+	}{
+		{"all digests", checks},
+		{"content hash", checks.forStoredObject()},
+	} {
+		b.Run(bench.name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			buf := make([]byte, 32<<10)
+			for b.Loop() {
+				reader, err := bench.checks.wrapFailOnMismatch(io.NopCloser(strings.NewReader(data)), func(reason string) {
+					b.Fatal(reason)
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := io.CopyBuffer(io.Discard, reader, buf); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

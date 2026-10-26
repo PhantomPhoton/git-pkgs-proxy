@@ -74,7 +74,7 @@ func NewAPKHandler(proxy *Proxy, proxyURL string, repositories map[string]string
 // Routes returns the HTTP handler for APK requests.
 // Mount this at /apk on your router.
 func (h *APKHandler) Routes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return rejectQueryChars(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -107,7 +107,7 @@ func (h *APKHandler) Routes() http.Handler {
 			// Other files - proxy directly.
 			h.proxyFile(w, r, upstreamURL, rest)
 		}
-	})
+	}))
 }
 
 // isAPKIndex reports whether the path names a repository index:

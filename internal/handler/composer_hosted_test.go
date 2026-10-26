@@ -58,11 +58,11 @@ func newComposerHostedFixture(t *testing.T, upstream map[string]string) composer
 
 func (f composerHostedFixture) push(t *testing.T, name, version, manifest string) HostedArtifact {
 	t.Helper()
-	target, err := HostedTargetFor("composer", name, version)
+	target, err := HostedTargetFor("composer", name, version, "")
 	if err != nil {
 		t.Fatalf("HostedTargetFor: %v", err)
 	}
-	pushed, err := f.proxy.PushLocalArtifact(context.Background(), "composer", target, bytes.NewReader(composerZip("", manifest)), "")
+	pushed, err := f.proxy.PushLocalArtifact(context.Background(), "composer", target, bytes.NewReader(composerZip("", manifest)), "", "")
 	if err != nil {
 		t.Fatalf("PushLocalArtifact: %v", err)
 	}

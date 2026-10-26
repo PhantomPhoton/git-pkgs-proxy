@@ -3,8 +3,10 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +28,14 @@ type Mirror struct {
 	// Images mirrors docker and oci items. Without it they fail like any
 	// other unsupported ecosystem.
 	Images ImageMirrorer
+
+	// Versions lists the versions of unversioned PURLs in mirror jobs and
+	// schedules. Nil lists them from the public registries.
+	Versions VersionLister
+
+	// RefusePackages, when set, fails every item Images does not take with
+	// this reason instead of fetching it, so nothing is cached.
+	RefusePackages string
 }
 
 // New creates a new Mirror with the given dependencies.
@@ -211,15 +221,40 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 		m.mirrorImage(ctx, pv, tracker)
 		return
 	}
-	result, err := m.proxy.GetOrFetchArtifact(ctx, pv.Ecosystem, pv.Name, pv.Version, "")
-	if err != nil {
+	if m.RefusePackages != "" {
 		tracker.failed.Add(1)
-		tracker.addError(pv.Ecosystem, pv.Name, pv.Version, err.Error())
-		m.logger.Warn("mirror failed",
-			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "error", err)
+		tracker.addError(pv.Ecosystem, pv.Name, pv.Version, m.RefusePackages)
+		m.logger.Warn("mirror refused",
+			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "reason", m.RefusePackages)
 		return
 	}
+	if eco, ok := fileEcosystems[pv.Ecosystem]; ok {
+		m.mirrorFiles(ctx, pv, eco, tracker)
+		return
+	}
+	if pv.Ecosystem == "composer" {
+		m.mirrorComposer(ctx, pv, tracker)
+		return
+	}
+	result, err := m.proxy.GetOrFetchArtifact(ctx, pv.Ecosystem, pv.Name, pv.Version, "")
+	if err != nil {
+		m.recordFailure(tracker, pv, err)
+		return
+	}
+	m.recordResult(tracker, pv, result)
+}
 
+// recordFailure counts and logs a package that could not be mirrored.
+func (m *Mirror) recordFailure(tracker *progressTracker, pv PackageVersion, err error) {
+	tracker.failed.Add(1)
+	tracker.addError(pv.Ecosystem, pv.Name, pv.Version, err.Error())
+	m.logger.Warn("mirror failed",
+		"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version, "error", err)
+}
+
+// recordResult closes the fetched artifact and counts it as mirrored, or as
+// skipped when it was already cached.
+func (m *Mirror) recordResult(tracker *progressTracker, pv PackageVersion, result *handler.CacheResult) {
 	if result.Reader != nil {
 		_ = result.Reader.Close()
 	}
@@ -235,4 +270,114 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version,
 			"size", result.Artifact.Size)
 	}
+}
+
+// mirrorComposer mirrors the archive of a tagged Composer release under the
+// file name the Composer handler serves it as, checked against the listed
+// shasum, and records the release's publish time, which the handler needs to
+// serve the archive from the cache without the metadata.
+func (m *Mirror) mirrorComposer(ctx context.Context, pv PackageVersion, tracker *progressTracker) {
+	// Packagist names are lowercase, and so are the paths Composer requests.
+	name := strings.ToLower(pv.Name)
+	v, err := m.versionFinder().FindVersion(ctx, pv.Ecosystem, name, pv.Version)
+	if err != nil {
+		m.recordFailure(tracker, pv, err)
+		return
+	}
+	distURL, _ := v.Metadata["dist_url"].(string)
+	distType, _ := v.Metadata["dist_type"].(string)
+	filename, declared, err := handler.ComposerReleaseArchive(v.Number, distURL, distType, strings.TrimPrefix(v.Integrity, "sha1-"))
+	if err != nil {
+		m.recordFailure(tracker, pv, err)
+		return
+	}
+	result, err := m.proxy.GetOrFetchArtifactFromURLWithIntegrity(ctx, pv.Ecosystem, name, v.Number, filename, distURL, declared)
+	if err != nil {
+		m.recordFailure(tracker, pv, err)
+		return
+	}
+	if err := m.proxy.RecordComposerPublishTime(name, v.Number, v.PublishedAt); err != nil {
+		m.logger.Warn("failed to store composer publish time",
+			"name", name, "version", v.Number, "error", err)
+	}
+	m.recordResult(tracker, pv, result)
+}
+
+// mirrorFiles mirrors every file of a version, or those its qualifiers
+// select. Each file is cached under the name and version the download
+// handler reads from its filename, so clients are served it.
+func (m *Mirror) mirrorFiles(ctx context.Context, pv PackageVersion, eco fileEcosystem, tracker *progressTracker) {
+	fail := func(err error) { m.recordFailure(tracker, pv, err) }
+	if eco.check != nil {
+		if err := eco.check(pv); err != nil {
+			fail(err)
+			return
+		}
+	}
+	v, err := m.versionFinder().FindVersion(ctx, pv.Ecosystem, pv.Name, pv.Version)
+	if err != nil {
+		fail(fmt.Errorf("listing files: %w", err))
+		return
+	}
+	var matched, fetched int
+	var size int64
+	for _, file := range v.Artifacts {
+		if !eco.selects(pv, file) {
+			continue
+		}
+		name, version, filename, ok := eco.cacheKey(pv, file)
+		if !ok {
+			continue
+		}
+		matched++
+		result, err := m.proxy.GetOrFetchArtifactFromURLWithDigest(ctx, pv.Ecosystem, name, version, filename, file.URL, fileDigest(file.Integrity))
+		if err != nil {
+			fail(fmt.Errorf("%s: %w", file.Filename, err))
+			return
+		}
+		if result.Reader != nil {
+			_ = result.Reader.Close()
+		}
+		if !result.Cached {
+			fetched++
+			size += result.Artifact.Size
+		}
+	}
+	switch selection := eco.selection(pv); {
+	case matched == 0 && selection != "":
+		fail(fmt.Errorf("no file matches %s", selection))
+	case matched == 0:
+		fail(errors.New("version has no files"))
+	case fetched == 0:
+		tracker.skipped.Add(1)
+		m.logger.Debug("already cached",
+			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version)
+	default:
+		tracker.completed.Add(1)
+		tracker.bytes.Add(size)
+		m.logger.Info("mirrored",
+			"ecosystem", pv.Ecosystem, "name", pv.Name, "version", pv.Version,
+			"files", fetched, "size", size)
+	}
+}
+
+// fileDigest returns the SHA-256 of one file as a digest, which is checked
+// against that file alone. The integrity GetOrFetchArtifactFromURLWithIntegrity
+// takes is kept with the version instead, and the files of a version that
+// share a name and version would overwrite each other's. Other checksums are
+// not checked, as the download handlers don't check them either.
+func fileDigest(integrity string) string {
+	if sum, ok := strings.CutPrefix(integrity, "sha256-"); ok {
+		return "sha256:" + sum
+	}
+	return ""
+}
+
+// versionFinder finds versions where Versions lists them, so both come from
+// the configured upstream.
+func (m *Mirror) versionFinder() VersionFinder { //nolint:ireturn // any finder will do
+	if finder, ok := m.Versions.(VersionFinder); ok {
+		return finder
+	}
+	return RegistryVersions{}
 }

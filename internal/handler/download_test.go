@@ -12,10 +12,9 @@ import (
 	"time"
 
 	"github.com/git-pkgs/proxy/internal/database"
-	"github.com/git-pkgs/proxy/internal/httpclient"
 	"github.com/git-pkgs/proxy/internal/metrics"
-	"github.com/git-pkgs/proxy/internal/storage"
 	"github.com/git-pkgs/purl"
+	registryclient "github.com/git-pkgs/registries/client"
 	"github.com/git-pkgs/registries/fetch"
 )
 
@@ -44,7 +43,7 @@ func seedPackageWithPURL(t *testing.T, db *database.DB, store *mockStorage, ecos
 		t.Fatalf("failed to upsert version: %v", err)
 	}
 
-	storagePath := storage.ArtifactPath(ecosystem, "", name, version, filename)
+	storagePath := ecosystem + "/" + name + "/" + version + "/" + filename
 	store.files[storagePath] = []byte(content)
 	sharedArtifact := testArtifact(content, versionPURL, filename, "application/octet-stream")
 
@@ -489,7 +488,7 @@ func TestPubHandler_CacheMiss(t *testing.T) {
 
 func TestCondaHandler_DownloadCacheHit(t *testing.T) {
 	proxy, db, store, _ := setupTestProxy(t)
-	seedPackageWithPURL(t, db, store, "conda", "main/numpy", "1.24.0", "numpy-1.24.0-py311h64a7726_0.conda", "conda pkg")
+	seedPackageWithPURL(t, db, store, "conda", "main/numpy", "1.24.0", "linux-64/numpy-1.24.0-py311h64a7726_0.conda", "conda pkg")
 
 	h := NewCondaHandler(proxy, "http://localhost")
 	srv := httptest.NewServer(h.Routes())
@@ -512,7 +511,7 @@ func TestCondaHandler_DownloadCacheHit(t *testing.T) {
 
 func TestCondaHandler_DownloadTarBz2CacheHit(t *testing.T) {
 	proxy, db, store, _ := setupTestProxy(t)
-	seedPackageWithPURL(t, db, store, "conda", "main/scipy", "1.11.0", "scipy-1.11.0-py311hb2e3ea1_0.tar.bz2", "tar bz2 data")
+	seedPackageWithPURL(t, db, store, "conda", "main/scipy", "1.11.0", "linux-64/scipy-1.11.0-py311hb2e3ea1_0.tar.bz2", "tar bz2 data")
 
 	h := NewCondaHandler(proxy, "http://localhost")
 	srv := httptest.NewServer(h.Routes())
@@ -869,6 +868,109 @@ func TestMavenHandler_ChecksumsCachedAsArtifacts(t *testing.T) {
 				t.Errorf("GET %s request %d: fetched = %v, want %v", path, i+1, fetcher.fetchCalled, i == 0)
 			}
 		}
+	}
+}
+
+// Any file named after its coordinates goes through the download path, so
+// policy applies to it whatever its extension.
+func TestMavenHandler_DeniedVersionBlocksEveryArtifactFile(t *testing.T) {
+	proxy, _, _, fetcher := setupTestProxy(t)
+	setTestDenylist(t, proxy, "pkg:maven/com.google.protobuf/protoc@3.21.0")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("denied file %s proxied to upstream", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	h := NewMavenHandler(proxy, "http://localhost", upstream.URL, upstream.URL)
+	proxy.HTTPClient = upstream.Client()
+
+	for _, name := range []string{
+		"protoc-3.21.0-linux-x86_64.exe",
+		"protoc-3.21.0-linux-x86_64.exe.sha1",
+		"protoc-3.21.0.hpi",
+		"protoc-3.21.0.pom",
+	} {
+		fetcher.fetchCalled = false
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/com/google/protobuf/protoc/3.21.0/"+name, nil))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("GET %s: status = %d, want %d", name, w.Code, http.StatusForbidden)
+		}
+		if fetcher.fetchCalled {
+			t.Errorf("GET %s: fetched a denied file", name)
+		}
+	}
+}
+
+func TestMavenHandler_UncommonArtifactFilesCached(t *testing.T) {
+	proxy, _, _, fetcher := setupTestProxy(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("artifact file %s proxied without caching", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	h := NewMavenHandler(proxy, "http://localhost", upstream.URL, upstream.URL)
+	proxy.HTTPClient = upstream.Client()
+
+	for _, path := range []string{
+		"/com/google/protobuf/protoc/3.21.0/protoc-3.21.0-linux-x86_64.exe",
+		"/com/google/protobuf/protoc/3.21.0/protoc-3.21.0-linux-x86_64.exe.sha1",
+		"/org/example/plugin/1.0/plugin-1.0.hpi",
+		"/org/example/native/1.0/native-1.0-linux.so",
+		"/org/example/lib/1.0-SNAPSHOT/lib-1.0-20240101.120000-1.exe",
+	} {
+		for i := range 2 {
+			fetcher.artifact = &fetch.Artifact{
+				Body:        io.NopCloser(strings.NewReader("binary")),
+				ContentType: "application/octet-stream",
+			}
+			fetcher.fetchCalled = false
+
+			w := httptest.NewRecorder()
+			h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+
+			if w.Code != http.StatusOK || w.Body.String() != "binary" {
+				t.Errorf("GET %s: status %d body %q", path, w.Code, w.Body.String())
+			}
+			if fetcher.fetchCalled != (i == 0) {
+				t.Errorf("GET %s request %d: fetched = %v, want %v", path, i+1, fetcher.fetchCalled, i == 0)
+			}
+		}
+	}
+}
+
+func TestMavenHandler_NonArtifactPathsProxied(t *testing.T) {
+	proxy, _, _, fetcher := setupTestProxy(t)
+
+	var proxied []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied = append(proxied, r.URL.Path)
+		_, _ = fmt.Fprint(w, "listing")
+	}))
+	defer upstream.Close()
+
+	h := NewMavenHandler(proxy, "http://localhost", upstream.URL, upstream.URL)
+	proxy.HTTPClient = upstream.Client()
+
+	paths := []string{
+		"/com/google/protobuf/protoc/3.21.0/",
+		"/com/google/protobuf/protoc/",
+		"/archetype-catalog.xml",
+	}
+	for _, path := range paths {
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK || w.Body.String() != "listing" {
+			t.Errorf("GET %s: status %d body %q", path, w.Code, w.Body.String())
+		}
+	}
+	if len(proxied) != len(paths) {
+		t.Errorf("proxied %v, want %v", proxied, paths)
+	}
+	if fetcher.fetchCalled {
+		t.Error("non-artifact path went through the download path")
 	}
 }
 
@@ -1278,7 +1380,7 @@ func TestRPMHandler_DownloadCacheMiss(t *testing.T) {
 }
 
 func TestMavenHandler_UpstreamHeldReturns503(t *testing.T) {
-	held := &httpclient.HeldError{Host: "repo1.maven.org", Until: time.Now().Add(90 * time.Second), RetryAfter: 90 * time.Second}
+	held := &registryclient.HeldError{Host: "repo1.maven.org", Until: time.Now().Add(90 * time.Second), RetryAfter: 90 * time.Second}
 
 	t.Run("artifact", func(t *testing.T) {
 		proxy, _, _, fetcher := setupTestProxy(t)
@@ -1326,7 +1428,7 @@ func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) 
 func TestMavenHandler_HeldArtifactMissesSkipCircuitBreaker(t *testing.T) {
 	proxy, _, _, _ := setupTestProxy(t)
 	upstreamCalls := 0
-	gate := httpclient.NewRateLimitGate(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+	gate := registryclient.NewRateLimitGate(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		upstreamCalls++
 		return &http.Response{
 			StatusCode: http.StatusTooManyRequests,
@@ -1366,15 +1468,19 @@ func TestMavenHandler_HeldArtifactMissesSkipCircuitBreaker(t *testing.T) {
 }
 
 func TestHandlers_UpstreamHeldMetadataReturns503(t *testing.T) {
-	held := &httpclient.HeldError{Host: "upstream.example", Until: time.Now().Add(42 * time.Second), RetryAfter: 42 * time.Second}
+	held := &registryclient.HeldError{Host: "upstream.example", Until: time.Now().Add(42 * time.Second), RetryAfter: 42 * time.Second}
 	tests := []struct {
 		name    string
 		handler func(*Proxy) http.Handler
 		path    string
 	}{
 		{"npm metadata", func(p *Proxy) http.Handler { return NewNPMHandler(p, "http://localhost", "").Routes() }, "/lodash"},
-		{"pypi simple", func(p *Proxy) http.Handler { return NewPyPIHandler(p, "http://localhost").Routes() }, "/simple/requests/"},
-		{"pypi json", func(p *Proxy) http.Handler { return NewPyPIHandler(p, "http://localhost").Routes() }, "/pypi/requests/json"},
+		{"pypi simple", func(p *Proxy) http.Handler {
+			return NewPyPIHandlerWithUpstreams(p, "http://localhost", "", "").Routes()
+		}, "/simple/requests/"},
+		{"pypi json", func(p *Proxy) http.Handler {
+			return NewPyPIHandlerWithUpstreams(p, "http://localhost", "", "").Routes()
+		}, "/pypi/requests/json"},
 		{"cargo index", func(p *Proxy) http.Handler {
 			return NewCargoHandler(p, "http://localhost", "", "").Routes()
 		}, "/se/rd/serde"},

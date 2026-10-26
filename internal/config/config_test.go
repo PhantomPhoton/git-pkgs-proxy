@@ -33,6 +33,7 @@ func upstreamConfigValues(upstream UpstreamConfig) map[string]string {
 		"composer":             upstream.Composer,
 		"composer_repository":  upstream.ComposerRepository,
 		"conan":                upstream.Conan,
+		"chef":                 upstream.Chef,
 		"conda":                upstream.Conda,
 		"cran":                 upstream.CRAN,
 		"julia":                upstream.Julia,
@@ -64,6 +65,7 @@ func defaultUpstreamValues() map[string]string {
 		"composer":             "https://packagist.org",
 		"composer_repository":  "https://repo.packagist.org",
 		"conan":                "https://center.conan.io",
+		"chef":                 "https://supermarket.chef.io",
 		"conda":                "https://conda.anaconda.org",
 		"cran":                 "https://cloud.r-project.org",
 		"julia":                "https://pkg.julialang.org",
@@ -95,6 +97,7 @@ func upstreamEnvironmentVariables() map[string]string {
 		"composer":             "PROXY_UPSTREAM_COMPOSER",
 		"composer_repository":  "PROXY_UPSTREAM_COMPOSER_REPOSITORY",
 		"conan":                "PROXY_UPSTREAM_CONAN",
+		"chef":                 "PROXY_UPSTREAM_CHEF",
 		"conda":                "PROXY_UPSTREAM_CONDA",
 		"cran":                 "PROXY_UPSTREAM_CRAN",
 		"julia":                "PROXY_UPSTREAM_JULIA",
@@ -137,6 +140,9 @@ func TestDefault(t *testing.T) {
 	}
 	if cfg.Gradle.BuildCache.MaxAge != "168h" {
 		t.Errorf("Gradle.BuildCache.MaxAge = %q, want %q", cfg.Gradle.BuildCache.MaxAge, "168h")
+	}
+	if !cfg.Gradle.BuildCache.ReadOnly {
+		t.Error("Gradle.BuildCache.ReadOnly = false, want true by default")
 	}
 	if len(cfg.Upstream.AllowPrivateHosts) != 0 {
 		t.Errorf("Upstream.AllowPrivateHosts = %v, want empty", cfg.Upstream.AllowPrivateHosts)
@@ -385,6 +391,7 @@ upstream:
   composer: "https://upstream.example.com/composer"
   composer_repository: "https://upstream.example.com/composer_repository"
   conan: "https://upstream.example.com/conan"
+  chef: "https://upstream.example.com/chef"
   conda: "https://upstream.example.com/conda"
   cran: "https://upstream.example.com/cran"
   julia: "https://upstream.example.com/julia"
@@ -414,6 +421,64 @@ upstream:
 	}
 	if !cfg.Upstream.AllowLoopback {
 		t.Error("Upstream.AllowLoopback = false, want true")
+	}
+}
+
+func TestLoadGradleBuildCacheReadOnly(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"block without read_only keeps default", "gradle:\n  build_cache:\n    max_age: \"12h\"\n", true},
+		{"explicit false allows uploads", "gradle:\n  build_cache:\n    read_only: false\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tt.content), 0644); err != nil {
+				t.Fatalf("writing config file: %v", err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Gradle.BuildCache.ReadOnly != tt.want {
+				t.Errorf("Gradle.BuildCache.ReadOnly = %v, want %v", cfg.Gradle.BuildCache.ReadOnly, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadGradleBuildCacheReadOnlyFromEnv(t *testing.T) {
+	tests := []struct {
+		value    string
+		fileRO   bool
+		want     bool
+		warnings int
+	}{
+		{"false", true, false, 0},
+		{"0", true, false, 0},
+		{" FALSE ", true, false, 0},
+		{"True", false, true, 0},
+		{"1", false, true, 0},
+		{"yes", false, true, 1},
+		{"off", false, true, 1},
+		{"", false, false, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			t.Setenv("PROXY_GRADLE_BUILD_CACHE_READ_ONLY", tt.value)
+			cfg := Default()
+			cfg.Gradle.BuildCache.ReadOnly = tt.fileRO
+			cfg.LoadFromEnv()
+			if cfg.Gradle.BuildCache.ReadOnly != tt.want {
+				t.Errorf("Gradle.BuildCache.ReadOnly = %v, want %v", cfg.Gradle.BuildCache.ReadOnly, tt.want)
+			}
+			if got := len(cfg.EnvWarnings()); got != tt.warnings {
+				t.Errorf("len(EnvWarnings()) = %d, want %d: %v", got, tt.warnings, cfg.EnvWarnings())
+			}
+		})
 	}
 }
 
@@ -466,7 +531,7 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("PROXY_UI_FAILURE_DETAILS", "true")
 	t.Setenv("PROXY_UPSTREAM_ALLOW_PRIVATE_HOSTS", "registry.internal, 10.0.0.12")
 	t.Setenv("PROXY_UPSTREAM_ALLOW_LOOPBACK", "true")
-	t.Setenv("PROXY_GRADLE_BUILD_CACHE_READ_ONLY", "true")
+	t.Setenv("PROXY_GRADLE_BUILD_CACHE_READ_ONLY", "false")
 	t.Setenv("PROXY_GRADLE_BUILD_CACHE_MAX_UPLOAD_SIZE", "32MB")
 	t.Setenv("PROXY_GRADLE_BUILD_CACHE_MAX_AGE", "12h")
 	t.Setenv("PROXY_GRADLE_BUILD_CACHE_MAX_SIZE", "10GB")
@@ -517,8 +582,8 @@ func TestLoadFromEnv(t *testing.T) {
 		t.Errorf("Upstream.AllowPrivateHosts after empty env = %q, want unchanged", got)
 	}
 
-	if !cfg.Gradle.BuildCache.ReadOnly {
-		t.Error("Gradle.BuildCache.ReadOnly = false, want true")
+	if cfg.Gradle.BuildCache.ReadOnly {
+		t.Error("Gradle.BuildCache.ReadOnly = true, want false from the environment")
 	}
 	if cfg.Gradle.BuildCache.MaxUploadSize != "32MB" {
 		t.Errorf("Gradle.BuildCache.MaxUploadSize = %q, want %q", cfg.Gradle.BuildCache.MaxUploadSize, "32MB")
@@ -1257,6 +1322,13 @@ func TestUpstreamAuthForURLMatchesURLComponents(t *testing.T) {
 		{name: "lookalike host rejected", url: "https://registry.example.com.evil.test/package"},
 		{name: "different scheme rejected", url: "http://registry.example.com/package"},
 		{name: "different port rejected", url: "https://registry.example.com:8443/package"},
+		{name: "dot dot segment rejected", url: "https://registry.example.com/private/../package"},
+		{name: "encoded dot dot segment rejected", url: "https://registry.example.com/private/%2e%2e/package"},
+		{name: "double encoded dot dot segment rejected", url: "https://registry.example.com/private/%252e%252e/package"},
+		{name: "dot segment rejected", url: "https://registry.example.com/private/./package"},
+		{name: "dot dot segment with parameter rejected", url: "https://registry.example.com/private/..;/package"},
+		{name: "encoded dot dot segment with parameter rejected", url: "https://registry.example.com/private/%2e%2e;x/package"},
+		{name: "dot dot segment with encoded parameter rejected", url: "https://registry.example.com/private/..%3b/package"},
 	}
 
 	for _, tt := range tests {
@@ -1771,5 +1843,212 @@ func TestLoadArtifactMaxSizeFromEnv(t *testing.T) {
 
 	if cfg.ArtifactMaxSize != "2GB" {
 		t.Errorf("ArtifactMaxSize = %q, want %q", cfg.ArtifactMaxSize, "2GB")
+	}
+}
+
+func TestMavenRepositoryNames(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		wantErr bool
+	}{
+		{"grails", false},
+		{"grails-restricted", false},
+		{"company-releases", false},
+		{"org", true},
+		{"com", true},
+		{"tools", true},
+		{"software", true},
+		{"jakarta", true},
+		{"javax", true},
+		{"junit", true},
+		{"androidx", true},
+		{"gradle", true},
+		{"nebula", true},
+		{"my repo", true},
+		{"rel#1", true},
+		{"rel?x", true},
+		{"-releases", true},
+		{"repo_2.x", false},
+		{"ORG", false},
+		{"Tools", false},
+		{"io", true},
+		{"IO", true},
+		{"de", true},
+		{"x", true},
+		{"net", true},
+		{"a/b", true},
+	} {
+		cfg := Default()
+		cfg.Upstream.MavenRepositories = map[string]string{tt.name: "https://repo.example/maven"}
+		err := cfg.Validate()
+		if (err != nil) != tt.wantErr {
+			t.Errorf("maven_repositories name %q: error = %v, want error %v", tt.name, err, tt.wantErr)
+		}
+	}
+
+	cfg := Default()
+	cfg.Upstream.MavenRepositories = map[string]string{"grails": "not a url"}
+	if err := cfg.Validate(); err == nil {
+		t.Error("maven_repositories with an invalid URL: want an error")
+	}
+}
+
+func TestGenericUpstreamNamedHosted(t *testing.T) {
+	cfg := Default()
+	cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("upstream.generic named hosted with hosting off: %v, want it accepted", err)
+	}
+
+	cfg = Default()
+	cfg.Upstream.Generic = map[string]string{"hosted": "https://example.com"}
+	cfg.Hosted.Enabled = true
+	cfg.Hosted.Token = "secret"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("upstream.generic named hosted with hosting on: %v, want it refused", err)
+	}
+}
+
+func TestValidateFreeBSDUpstreams(t *testing.T) {
+	tests := []struct {
+		name    string
+		freebsd map[string]string
+		wantErr bool
+	}{
+		{"valid", map[string]string{"freebsd": "https://pkg.freebsd.org", "poudriere": "https://packages.example.com"}, false},
+		{"name contains path separator", map[string]string{"freebsd/ports": "https://pkg.freebsd.org"}, true},
+		{"URL is not absolute", map[string]string{"freebsd": "pkg.freebsd.org"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Upstream.FreeBSD = tt.freebsd
+			if err := cfg.Validate(); (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateGenericPaths(t *testing.T) {
+	githubAPI := map[string]string{"github-api": "https://api.github.com"}
+	token := map[string]AuthConfig{"https://api.github.com": {Type: "bearer", Token: "t"}}
+	tests := []struct {
+		name     string
+		upstream UpstreamConfig
+		wantErr  bool
+	}{
+		{name: "public", upstream: UpstreamConfig{Generic: githubAPI}},
+		{name: "credentials without paths", upstream: UpstreamConfig{Generic: githubAPI, Auth: token}, wantErr: true},
+		{
+			name: "credentials for a path under the upstream",
+			upstream: UpstreamConfig{
+				Generic: githubAPI,
+				Auth:    map[string]AuthConfig{"https://api.github.com/repos/acme": {Type: "bearer", Token: "t"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "credentials with paths",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github-api": {"repos/*/*/releases/**"}},
+				Auth:         token,
+			},
+		},
+		{
+			name: "credentials for another host",
+			upstream: UpstreamConfig{
+				Generic: githubAPI,
+				Auth:    map[string]AuthConfig{"https://npm.example": {Type: "bearer", Token: "t"}},
+			},
+		},
+		{
+			name: "paths for an unknown upstream",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github": {"*/*/releases/**"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "bad pattern",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github-api": {"["}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty pattern",
+			upstream: UpstreamConfig{
+				Generic:      githubAPI,
+				GenericPaths: map[string][]string{"github-api": {""}},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.upstream.Validate(); (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestGenericPathAllowed(t *testing.T) {
+	patterns := []string{"repos/*/*/releases/**", "rate_limit"}
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"repos/jqlang/jq/releases/tags/jq-1.7.1", true},
+		{"repos/jqlang/jq/releases/latest", true},
+		{"rate_limit", true},
+		{"repos/jqlang/jq/releases", false},
+		{"repos/acme/private/contents/secret.txt", false},
+		{"user/repos", false},
+		{"repos/jqlang/jq/releases/%2e%2e", false},
+		{"repos/jqlang/jq?/releases/x", false},
+		{"repos/jqlang/jq/releases/x#y", false},
+		{`repos/jqlang/jq/releases/x\y`, false},
+	}
+	for _, tt := range tests {
+		if got := GenericPathAllowed(patterns, tt.path); got != tt.want {
+			t.Errorf("GenericPathAllowed(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+	if !GenericPathAllowed(nil, "user/repos") {
+		t.Error("GenericPathAllowed without patterns refused a path")
+	}
+}
+
+func TestLoadGenericPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`
+upstream:
+  generic:
+    github-api: https://api.github.com
+  generic_paths:
+    github-api:
+      - "repos/*/*/releases/**"
+  auth:
+    "https://api.github.com":
+      type: bearer
+      token: t
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := cfg.Upstream.GenericPaths["github-api"]; len(got) != 1 || got[0] != "repos/*/*/releases/**" {
+		t.Errorf("generic_paths = %v", cfg.Upstream.GenericPaths)
 	}
 }

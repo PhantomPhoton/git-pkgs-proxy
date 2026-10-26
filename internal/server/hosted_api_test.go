@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -80,6 +83,7 @@ func newHostedTestServer(t *testing.T) hostedTestServer {
 	r.Mount("/npm", http.StripPrefix("/npm", handler.NewNPMHandler(proxy, "http://proxy.test", upstream.URL).Routes()))
 	composer := handler.NewComposerHandlerWithUpstreams(proxy, "http://proxy.test", upstream.URL, upstream.URL)
 	r.Mount("/composer", http.StripPrefix("/composer", composer.Routes()))
+	r.Mount("/generic", http.StripPrefix("/generic", handler.NewGenericHandler(proxy, nil).Routes()))
 	return hostedTestServer{router: r, fetches: &calls, upstreamRequests: &upstreamRequests}
 }
 
@@ -214,6 +218,10 @@ func TestHostedPushRejections(t *testing.T) {
 		{name: "manifest of another version", target: "/api/hosted/npm/request/2.88.4", token: testHostedToken, body: requestTarball, wantStatus: http.StatusBadRequest},
 		{name: "empty body", target: "/api/hosted/npm/request/2.88.3", token: testHostedToken, wantStatus: http.StatusBadRequest},
 		{name: "too large", target: "/api/hosted/npm/request/2.88.3", token: testHostedToken, body: strings.Repeat("x", testHostedMaxUpload+1), wantStatus: http.StatusRequestEntityTooLarge},
+		{name: "sha256 mismatch", target: "/api/hosted/npm/request/2.88.3?sha256=" + strings.Repeat("0", 64), token: testHostedToken, body: requestTarball, wantStatus: http.StatusBadRequest},
+		{name: "malformed sha256", target: "/api/hosted/npm/request/2.88.3?sha256=abc", token: testHostedToken, body: requestTarball, wantStatus: http.StatusBadRequest},
+		{name: "generic without file", target: "/api/hosted/generic/request/2.88.3", token: testHostedToken, body: "binary", wantStatus: http.StatusBadRequest},
+		{name: "generic name with two segments", target: "/api/hosted/generic/acme/tools/1.0.0/tool.bin", token: testHostedToken, body: "binary", wantStatus: http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -270,7 +278,9 @@ func startHostedServer(t *testing.T, hosted config.HostedConfig) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = proxyServer.Shutdown(ctx)
-		<-startErr
+		if err := <-startErr; !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("server stopped with %v", err)
+		}
 	})
 	return cfg.BaseURL
 }
@@ -358,5 +368,175 @@ func TestHostedComposerVersionIsInstallableFromMetadata(t *testing.T) {
 	distPath := strings.TrimPrefix(versions[0].Dist.URL, "http://proxy.test")
 	if rec := s.do(t, http.MethodGet, distPath, "", ""); rec.Code != http.StatusOK {
 		t.Errorf("download of %s status = %d", distPath, rec.Code)
+	}
+}
+
+func TestHostedRepushIsRefused(t *testing.T) {
+	s := newHostedTestServer(t)
+	const target = "/api/hosted/npm/request/2.88.3"
+
+	if rec := s.do(t, http.MethodPut, target, testHostedToken, requestTarball); rec.Code != http.StatusCreated {
+		t.Fatalf("first PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := s.do(t, http.MethodPut, target, testHostedToken, requestTarball); rec.Code != http.StatusConflict {
+		t.Fatalf("second PUT status = %d, want 409, body %s", rec.Code, rec.Body)
+	}
+	if rec := s.do(t, http.MethodDelete, target, testHostedToken, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d", rec.Code)
+	}
+	if rec := s.do(t, http.MethodPut, target, testHostedToken, requestTarball); rec.Code != http.StatusCreated {
+		t.Fatalf("PUT after DELETE status = %d, want 201, body %s", rec.Code, rec.Body)
+	}
+}
+
+func TestHostedComposerRepushUnderAnotherCaseIsRefused(t *testing.T) {
+	s := newHostedTestServer(t)
+	original := composerZip(`{"name":"acme/private","description":"first"}`)
+	if rec := s.do(t, http.MethodPut, "/api/hosted/composer/acme/private/1.0.0", testHostedToken, original); rec.Code != http.StatusCreated {
+		t.Fatalf("first PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := s.do(t, http.MethodPut, "/api/hosted/composer/acme/Private/1.0.0", testHostedToken,
+		composerZip(`{"name":"acme/private","description":"second"}`)); rec.Code != http.StatusConflict {
+		t.Fatalf("PUT of acme/Private status = %d, want 409, body %s", rec.Code, rec.Body)
+	}
+	rec := s.do(t, http.MethodGet, "/composer/files/acme/private/1.0.0/private-1.0.0.zip", "", "")
+	if rec.Code != http.StatusOK || rec.Body.String() != original {
+		t.Fatalf("download status = %d, want 200 and the first archive", rec.Code)
+	}
+}
+
+func TestHostedPushWithMatchingSHA256(t *testing.T) {
+	s := newHostedTestServer(t)
+	digest := sha256.Sum256([]byte(requestTarball))
+	target := "/api/hosted/npm/request/2.88.3?sha256=" + strings.ToUpper(hex.EncodeToString(digest[:]))
+
+	if rec := s.do(t, http.MethodPut, target, testHostedToken, requestTarball); rec.Code != http.StatusCreated {
+		t.Fatalf("PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+}
+
+func TestHostedGenericFiles(t *testing.T) {
+	s := newHostedTestServer(t)
+	const (
+		arm64 = "tool-linux-arm64.tar.gz"
+		amd64 = "tool-linux-amd64.tar.gz"
+	)
+
+	for _, file := range []string{arm64, amd64} {
+		rec := s.do(t, http.MethodPut, "/api/hosted/generic/tools/1.2.0/"+file, testHostedToken, "bytes of "+file)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("PUT %s status = %d, body %s", file, rec.Code, rec.Body)
+		}
+		var pushed HostedPushResponse
+		if err := json.NewDecoder(rec.Body).Decode(&pushed); err != nil {
+			t.Fatalf("decoding PUT response: %v", err)
+		}
+		digest := sha256.Sum256([]byte("bytes of " + file))
+		if pushed.Filename != file || pushed.Version != "1.2.0" || pushed.SHA256 != hex.EncodeToString(digest[:]) {
+			t.Errorf("PUT response = %+v", pushed)
+		}
+	}
+
+	rec := s.do(t, http.MethodGet, "/generic/hosted/tools/1.2.0/"+arm64, "", "")
+	if rec.Code != http.StatusOK || rec.Body.String() != "bytes of "+arm64 {
+		t.Fatalf("download status = %d, body %q", rec.Code, rec.Body)
+	}
+	digest := sha256.Sum256([]byte("bytes of " + arm64))
+	if etag := rec.Header().Get("ETag"); etag != `"`+hex.EncodeToString(digest[:])+`"` {
+		t.Errorf("ETag = %q, want the sha256", etag)
+	}
+	if rec := s.do(t, http.MethodHead, "/generic/hosted/tools/1.2.0/"+arm64, "", ""); rec.Code != http.StatusOK {
+		t.Errorf("HEAD status = %d", rec.Code)
+	}
+
+	listed := s.do(t, http.MethodGet, "/api/hosted/generic/tools", "", "")
+	var list HostedListResponse
+	if err := json.NewDecoder(listed.Body).Decode(&list); err != nil {
+		t.Fatalf("decoding list: %v", err)
+	}
+	if len(list.Artifacts) != 2 {
+		t.Fatalf("listed %d files, want 2: %+v", len(list.Artifacts), list.Artifacts)
+	}
+
+	if rec := s.do(t, http.MethodDelete, "/api/hosted/generic/tools/1.2.0/"+arm64, testHostedToken, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE file status = %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := s.do(t, http.MethodGet, "/generic/hosted/tools/1.2.0/"+arm64, "", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("download of deleted file status = %d, want 404", rec.Code)
+	}
+	if rec := s.do(t, http.MethodGet, "/generic/hosted/tools/1.2.0/"+amd64, "", ""); rec.Code != http.StatusOK {
+		t.Errorf("download of the other file status = %d, want 200", rec.Code)
+	}
+	if rec := s.do(t, http.MethodDelete, "/api/hosted/generic/tools/1.2.0/"+arm64, testHostedToken, ""); rec.Code != http.StatusNotFound {
+		t.Errorf("second DELETE status = %d, want 404", rec.Code)
+	}
+
+	for _, path := range []string{
+		"/generic/hosted/tools/1.2.0/missing.bin",
+		"/generic/hosted/tools/1.2.0",
+		"/generic/hosted/tools/1.2.0/a/b",
+	} {
+		if rec := s.do(t, http.MethodGet, path, "", ""); rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404", path, rec.Code)
+		}
+	}
+	if *s.fetches != 0 || *s.upstreamRequests != 0 {
+		t.Errorf("hosted generic files went upstream: %d fetches, %d requests", *s.fetches, *s.upstreamRequests)
+	}
+}
+
+func TestHostedGenericFileIsServedByTheRunningServer(t *testing.T) {
+	base := startHostedServer(t, config.HostedConfig{Enabled: true, Token: testHostedToken})
+	if status := putBody(t, base+"/api/hosted/generic/tools/1.2.0/tool.tar.gz", testHostedToken, "tool bytes"); status != http.StatusCreated {
+		t.Fatalf("push status = %d, want 201", status)
+	}
+
+	resp, err := http.Get(base + "/generic/hosted/tools/1.2.0/tool.tar.gz")
+	if err != nil {
+		t.Fatalf("GET file: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "tool bytes" {
+		t.Errorf("download status = %d, body %q", resp.StatusCode, body)
+	}
+}
+
+// unreadBody fails the test if the handler reads it.
+type unreadBody struct{ t *testing.T }
+
+func (b unreadBody) Read([]byte) (int, error) {
+	b.t.Error("body of a refused push was read")
+	return 0, io.EOF
+}
+
+func TestHostedRepushIsRefusedBeforeTheBodyIsRead(t *testing.T) {
+	s := newHostedTestServer(t)
+	const target = "/api/hosted/generic/tools/1.2.0/tool.tar.gz"
+	if rec := s.do(t, http.MethodPut, target, testHostedToken, "first"); rec.Code != http.StatusCreated {
+		t.Fatalf("first PUT status = %d, body %s", rec.Code, rec.Body)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, target, unreadBody{t})
+	req.Header.Set("Authorization", "Bearer "+testHostedToken)
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second PUT status = %d, want 409, body %s", rec.Code, rec.Body)
+	}
+}
+
+func TestHostedDeleteRejectsMalformedPaths(t *testing.T) {
+	s := newHostedTestServer(t)
+	for _, target := range []string{
+		"/api/hosted/generic/tools/1.2.0/%2e%2e",
+		"/api/hosted/generic/tools/1.2.0/tool%0a",
+		"/api/hosted/npm/request/2.88.3/request-2.88.3.tgz/extra",
+		"/api/hosted/composer/monolog/3.5.0",
+		"/api/hosted/cargo/serde/1.0.200",
+	} {
+		if rec := s.do(t, http.MethodDelete, target, testHostedToken, ""); rec.Code != http.StatusBadRequest {
+			t.Errorf("DELETE %s status = %d, want 400, body %s", target, rec.Code, rec.Body)
+		}
 	}
 }

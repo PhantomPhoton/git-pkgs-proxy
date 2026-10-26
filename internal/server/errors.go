@@ -11,9 +11,12 @@ const (
 	ErrCodeBadRequest   = "BAD_REQUEST"
 	ErrCodeNotFound     = "NOT_FOUND"
 	ErrCodeUnauthorized = "UNAUTHORIZED"
+	ErrCodeConflict     = "CONFLICT"
 	ErrCodeUpstream     = "UPSTREAM_ERROR"
 	ErrCodeInternal     = "INTERNAL_ERROR"
 	ErrCodeBusy         = "BUSY"
+
+	ErrCodeUnsupportedMediaType = "UNSUPPORTED_MEDIA_TYPE"
 )
 
 // ErrorResponse is the JSON body returned for API errors.

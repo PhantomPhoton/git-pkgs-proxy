@@ -77,6 +77,33 @@ func TestGroup_Enabled(t *testing.T) {
 	}
 }
 
+func TestGroup_Covers(t *testing.T) {
+	var nilGroup *Group
+	if nilGroup.Covers("npm") {
+		t.Error("nil group Covers(npm) = true, want false")
+	}
+	g, err := NewGroup(config.ScanningConfig{
+		Enabled:    true,
+		SigningKey: "test-signing-key",
+		Scanners: []config.ScannerConfig{
+			{Name: "trivy", URL: "http://trivy.invalid", Mode: "monitor", Ecosystems: []string{"npm"}},
+			{Name: "clamav", URL: "http://clamav.invalid", Ecosystems: []string{"pypi"}},
+		},
+	}, discardLogger())
+	if err != nil {
+		t.Fatalf("NewGroup() error: %v", err)
+	}
+	for ecosystem, want := range map[string]bool{"npm": true, "pypi": true, "freebsd": false} {
+		if got := g.Covers(ecosystem); got != want {
+			t.Errorf("Covers(%s) = %v, want %v", ecosystem, got, want)
+		}
+	}
+	all := newTestGroup([]entry{{mode: modeBlock}}, false)
+	if !all.Covers("freebsd") {
+		t.Error("unrestricted scanner: Covers(freebsd) = false, want true")
+	}
+}
+
 func TestGroup_NewGroup_InvalidMode(t *testing.T) {
 	_, err := NewGroup(config.ScanningConfig{
 		Enabled:    true,

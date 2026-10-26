@@ -143,7 +143,7 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 	pkg := parts[1]
 	packageName := vendor + "/" + pkg
 
-	h.proxy.Logger.Info("composer metadata request", "package", packageName)
+	h.proxy.Logger.Debug("composer metadata request", "package", packageName)
 
 	repoURL, cacheKey := h.sourceFor(packageName)
 	upstreamURL := fmt.Sprintf("%s/p2/%s/%s.json", repoURL, vendor, pkg)
@@ -169,7 +169,7 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), "composer", cacheKey, upstreamURL, contentTypeJSON)
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "composer", cacheKey, upstreamURL, contentTypeJSON, nil)
 	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -188,31 +188,24 @@ func (h *ComposerHandler) handlePackageMetadata(w http.ResponseWriter, r *http.R
 		if r.Context().Err() != nil {
 			return // the client left while waiting on a shared rewrite
 		}
+		if h.proxy.mustFilterMetadata("composer", basePackage) {
+			h.proxy.Logger.Error("failed to filter composer metadata", "package", basePackage, "error", err)
+			http.Error(w, "failed to filter package metadata", http.StatusBadGateway)
+			return
+		}
 		h.proxy.Logger.Warn("failed to rewrite metadata, proxying original", "error", err)
+		markStale(w, upstream.stale)
 		w.Header().Set(headerContentType, "application/json")
 		_, _ = w.Write(upstream.body)
 		return
 	}
 
+	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, rewritten)
 }
 
-// rewriteMetadata rewrites dist URLs in Composer metadata to point at this proxy.
-// If cooldown is enabled, versions published too recently are filtered out.
-//
-// The document is never decoded as a whole. Packagist serves large packages
-// as minified lists of thousands of versions, and expanding them into generic
-// maps took many times the document's size for every rewrite. Instead each
-// version list is walked in place and the response is assembled from slices
-// of the original bytes: only dist values are written fresh, and minified
-// metadata stays minified.
-func (h *ComposerHandler) rewriteMetadata(body []byte) ([]byte, error) {
-	out, _, err := h.rewriteMetadataKeeping(body)
-	return out, err
-}
-
-// rewriteMetadataKeeping is rewriteMetadata that also reports the versions
-// it kept, each as its package name and version.
+// rewriteMetadataKeeping rewrites dist URLs and filters versions in cooldown.
+// It returns the kept package names and versions without expanding minified lists.
 func (h *ComposerHandler) rewriteMetadataKeeping(body []byte) ([]byte, []string, error) {
 	return h.rewriteMetadataWithLocal(body, "", nil)
 }
@@ -395,13 +388,8 @@ func (h *ComposerHandler) shouldFilterVersion(packagePURL, packageName, version 
 		return false
 	}
 
-	var timeStr string
-	if err := json.Unmarshal(published, &timeStr); err != nil {
-		return false
-	}
-
-	publishedAt, err := time.Parse(time.RFC3339, timeStr)
-	if err != nil {
+	publishedAt, ok := composerPublishTime(published)
+	if !ok {
 		return false
 	}
 
@@ -412,6 +400,17 @@ func (h *ComposerHandler) shouldFilterVersion(packagePURL, packageName, version 
 	}
 
 	return false
+}
+
+// composerPublishTime parses the raw "time" field of a version, reporting
+// false when it is missing or not an RFC 3339 string.
+func composerPublishTime(published []byte) (time.Time, bool) {
+	var timeStr string
+	if err := json.Unmarshal(published, &timeStr); err != nil {
+		return time.Time{}, false
+	}
+	publishedAt, err := time.Parse(time.RFC3339, timeStr)
+	return publishedAt, err == nil
 }
 
 // disableDefaultNotification stops Composer from reporting installs of a routed
@@ -622,7 +621,7 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 
 	packageName := vendor + "/" + pkg
 
-	h.proxy.Logger.Info("composer download request",
+	h.proxy.Logger.Debug("composer download request",
 		"package", packageName, "version", version, "filename", filename)
 
 	local, err := h.proxy.GetLocalArtifact(r.Context(), "composer", packageName, version, filename)
@@ -639,64 +638,28 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// We need to fetch the metadata to get the actual download URL since
-	// Packagist URLs include a hash. Packagist serves dev versions (e.g.
-	// "3.x-dev", "dev-master") from a separate "~dev" metadata file, while
-	// tagged releases live in the regular file. Try the file most likely to
-	// contain this version first, then fall back to the other so that both
-	// stable and dev versions resolve correctly.
-	metaURLs := h.metadataURLsForVersion(vendor, pkg, version)
-
-	h.proxy.Logger.Debug("resolving download URL",
-		"package", packageName, "version", version,
-		"metadata_urls", metaURLs)
-
-	var dist composerDist
-	for _, metaURL := range metaURLs {
-		found, err := h.findDownloadURLFromMetadata(r.Context(), metaURL, packageName, version)
-		if err != nil {
-			if writeUpstreamHeld(w, err) {
-				return
-			}
-			h.proxy.Logger.Error("failed to fetch metadata", "error", err, "url", metaURL)
-			http.Error(w, "failed to fetch metadata", http.StatusBadGateway)
-			return
-		}
-		if found.url != "" {
-			dist = found
-			break
-		}
-	}
-
-	if dist.url == "" {
-		h.proxy.Logger.Debug("version not found in any metadata source",
-			"package", packageName, "version", version,
-			"tried_urls", metaURLs)
-		http.Error(w, "version not found", http.StatusNotFound)
-		return
-	}
-
-	// Lock files name archive URLs directly, so a version filtered out of the
-	// metadata still has to be withheld here.
-	if h.shouldFilterVersion(canonicalPackagePURL("composer", packageName), packageName, version, dist.published) {
-		http.Error(w, "version not found", http.StatusNotFound)
-		return
-	}
-
 	// The archive is cached under the file name from the path, so fetch the
 	// one that name stands for. Compare it as sent, the way rewriteDist handed
 	// it out, query included.
 	requested := path.Base(r.URL.EscapedPath())
 	if r.URL.RawQuery != "" {
 		requested += "?" + r.URL.RawQuery
+	} else if h.serveCachedRelease(w, r, packageName, version, filename) {
+		return
 	}
-	listedURL := dist.url
-	downloadURL, ok := upstreamDistURL(listedURL, dist.distType, requested, isDevVersion(version))
+	files := h.metadataFilesForVersion(vendor, pkg, version)
+	dist, downloadURL, ok := h.cachedDist(r.Context(), files, packageName, version, requested)
 	if !ok {
-		h.proxy.Logger.Info("composer file not in upstream metadata",
-			"package", packageName, "version", version,
-			"filename", requested, "listed_url", listedURL)
-		http.Error(w, "file not found", http.StatusNotFound)
+		if dist, downloadURL, ok = h.upstreamDist(w, r, files, packageName, version, requested); !ok {
+			return
+		}
+	}
+	h.recordPublishTime(packageName, version, dist.published)
+
+	// Lock files name archive URLs directly, so a version filtered out of the
+	// metadata still has to be withheld here.
+	if h.shouldFilterVersion(canonicalPackagePURL("composer", packageName), packageName, version, dist.published) {
+		http.Error(w, "version not found", http.StatusNotFound)
 		return
 	}
 
@@ -718,7 +681,7 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 		h.discardOtherCommit(packageName, version, cacheFilename, commit)
 	}
 	result, err := h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "composer", packageName, version, cacheFilename, downloadURL,
-		composerIntegrity(dist.shasum, version, downloadURL == listedURL))
+		composerIntegrity(dist.shasum, version, downloadURL == dist.url))
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return
@@ -731,6 +694,77 @@ func (h *ComposerHandler) handleDownload(w http.ResponseWriter, r *http.Request)
 	}
 
 	ServeArtifactRequest(w, r, result)
+}
+
+// releaseTimeStored reports whether the publish time of version is kept in
+// the versions table, so a download can be checked against cooldown without
+// the metadata. That holds for tagged releases of packages from the default
+// repository. A branch is left out: its archive and time change with every
+// push. So are routed packages, as for npm: the versions row is keyed by the
+// plain PURL, which does not say which repository the version came from, so
+// a time read from the default repository would be trusted for a private
+// version of the same name, and the other way round.
+func (h *ComposerHandler) releaseTimeStored(packageName, version string) bool {
+	if h.proxy.DB == nil || isDevVersion(version) {
+		return false
+	}
+	_, routed := h.routes.match(packageName)
+	return !routed
+}
+
+// serveCachedRelease serves a tagged release's archive from the cache
+// without looking up its dist in the metadata, and reports whether it wrote a
+// response. The archive was only cached under its name after that name was
+// checked against the metadata, and the cache verifies it against the digest
+// recorded then. Cooldown is checked against the publish time recorded when
+// the dist was first resolved; without one, as for an archive cached by an
+// older proxy, it returns false and the caller takes the metadata path, which
+// records it. Requests with a query string, which pick a commit, always take
+// that path.
+func (h *ComposerHandler) serveCachedRelease(w http.ResponseWriter, r *http.Request, packageName, version, filename string) bool {
+	if !h.releaseTimeStored(packageName, version) {
+		return false
+	}
+	if h.proxy.Cooldown != nil && h.proxy.Cooldown.Enabled() {
+		ver, err := h.proxy.DB.GetVersionByPURL(canonicalVersionPURL("composer", packageName, version))
+		if err != nil || ver == nil || !ver.PublishedAt.Valid {
+			return false
+		}
+		if !h.proxy.Cooldown.IsAllowed("composer", canonicalPackagePURL("composer", packageName), ver.PublishedAt.Time) {
+			h.proxy.Logger.Info("cooldown: withholding composer archive",
+				"package", packageName, "version", version)
+			http.Error(w, "version not found", http.StatusNotFound)
+			return true
+		}
+	}
+	cached, err := h.proxy.GetCachedArtifact(r.Context(), "composer", packageName, version, filename)
+	if err != nil {
+		h.proxy.serveArtifactError(w, err, "failed to read cached package")
+		return true
+	}
+	if cached == nil {
+		return false
+	}
+	ServeArtifactRequest(w, r, cached)
+	return true
+}
+
+// recordPublishTime stores the publish time a release's metadata lists, for
+// serveCachedRelease. It is stored whether or not cooldown is enabled, so
+// enabling it later does not send cached archives back to the metadata.
+func (h *ComposerHandler) recordPublishTime(packageName, version string, published []byte) {
+	if !h.releaseTimeStored(packageName, version) {
+		return
+	}
+	publishedAt, ok := composerPublishTime(published)
+	if !ok {
+		return
+	}
+	if err := h.proxy.DB.SetVersionPublishedAt(canonicalVersionPURL("composer", packageName, version),
+		canonicalPackagePURL("composer", packageName), publishedAt); err != nil {
+		h.proxy.Logger.Warn("failed to store composer publish time",
+			"package", packageName, "version", version, "error", err)
+	}
 }
 
 // discardOtherCommit clears a cached branch archive named for commit that was
@@ -767,19 +801,98 @@ func isDevVersion(version string) bool {
 	return strings.HasPrefix(version, "dev-") || strings.HasSuffix(version, "-dev")
 }
 
-// metadataURLsForVersion returns the upstream metadata URLs to consult for a
+// composerMetadataFile is one of the metadata documents a version's dist can
+// be listed in: its upstream URL and the key the proxy caches it under.
+type composerMetadataFile struct {
+	url, cacheKey string
+}
+
+// metadataFilesForVersion returns the metadata documents to consult for a
 // given version, in priority order. Dev versions are served from the "~dev"
 // file, tagged releases from the regular file; the other file is included as a
-// fallback so an unexpected classification still resolves.
-func (h *ComposerHandler) metadataURLsForVersion(vendor, pkg, version string) []string {
-	repoURL, _ := h.sourceFor(vendor + "/" + pkg)
-	stable := fmt.Sprintf("%s/p2/%s/%s.json", repoURL, vendor, pkg)
-	dev := fmt.Sprintf("%s/p2/%s/%s~dev.json", repoURL, vendor, pkg)
+// fallback so an unexpected classification still resolves. The cache keys are
+// the ones handlePackageMetadata stores the documents under.
+func (h *ComposerHandler) metadataFilesForVersion(vendor, pkg, version string) []composerMetadataFile {
+	file := func(name string) composerMetadataFile {
+		repoURL, cacheKey := h.sourceFor(name)
+		return composerMetadataFile{url: fmt.Sprintf("%s/p2/%s.json", repoURL, name), cacheKey: cacheKey}
+	}
+	stable := file(vendor + "/" + pkg)
+	dev := file(vendor + "/" + pkg + composerDevFile)
 
 	if isDevVersion(version) {
-		return []string{dev, stable}
+		return []composerMetadataFile{dev, stable}
 	}
-	return []string{stable, dev}
+	return []composerMetadataFile{stable, dev}
+}
+
+// cachedDist looks up the dist of version in the metadata documents the proxy
+// caches for Composer, returning it with the URL to download the requested
+// file from. While the documents are fresh this costs no upstream request,
+// and when upstream fails their cached copies still resolve the archive. ok is
+// false when neither document lists a dist the requested file stands for, as
+// for a version published after the metadata was cached, so the caller asks
+// upstream instead. Without cache_metadata there is nothing to look in.
+func (h *ComposerHandler) cachedDist(ctx context.Context, files []composerMetadataFile, packageName, version, requested string) (composerDist, string, bool) {
+	if !h.proxy.CacheMetadata || h.proxy.DB == nil {
+		return composerDist{}, "", false
+	}
+	for _, f := range files {
+		doc := h.proxy.fetchMetadataDocument(ctx, "composer", f.cacheKey, f.url, contentTypeJSON, nil)
+		if doc.err != nil {
+			continue
+		}
+		dist, err := composerDistURL(doc.body, packageName, version)
+		if err != nil || dist.url == "" {
+			continue
+		}
+		if downloadURL, ok := upstreamDistURL(dist.url, dist.distType, requested, isDevVersion(version)); ok {
+			return dist, downloadURL, true
+		}
+	}
+	return composerDist{}, "", false
+}
+
+// upstreamDist looks up the dist of version in the metadata upstream serves
+// now, returning it with the URL to download the requested file from. When it
+// cannot, it writes the error response and returns false.
+func (h *ComposerHandler) upstreamDist(w http.ResponseWriter, r *http.Request, files []composerMetadataFile, packageName, version, requested string) (composerDist, string, bool) {
+	h.proxy.Logger.Debug("resolving download URL",
+		"package", packageName, "version", version)
+
+	var dist composerDist
+	for _, f := range files {
+		found, err := h.findDownloadURLFromMetadata(r.Context(), f.url, packageName, version)
+		if err != nil {
+			if writeUpstreamHeld(w, err) {
+				return composerDist{}, "", false
+			}
+			h.proxy.Logger.Error("failed to fetch metadata", "error", err, "url", f.url)
+			http.Error(w, "failed to fetch metadata", http.StatusBadGateway)
+			return composerDist{}, "", false
+		}
+		if found.url != "" {
+			dist = found
+			break
+		}
+	}
+
+	if dist.url == "" {
+		h.proxy.Logger.Debug("version not found in any metadata source",
+			"package", packageName, "version", version)
+		http.Error(w, "version not found", http.StatusNotFound)
+		return composerDist{}, "", false
+	}
+
+	downloadURL, ok := upstreamDistURL(dist.url, dist.distType, requested, isDevVersion(version))
+	if !ok {
+		h.proxy.Logger.Info("composer file not in upstream metadata",
+			"package", packageName, "version", version,
+			"filename", requested, "listed_url", dist.url)
+		http.Error(w, "file not found", http.StatusNotFound)
+		return composerDist{}, "", false
+	}
+	return dist, downloadURL, true
 }
 
 // composerDist is what a version's metadata says about its archive: the dist
@@ -896,6 +1009,36 @@ func composerIntegrity(shasum, version string, listed bool) string {
 		return ""
 	}
 	return sha1Checksum(shasum)
+}
+
+// ComposerReleaseArchive returns the file name the Composer handler caches a
+// tagged release's archive under, and the integrity it checks it against,
+// given the dist the release's metadata lists. It refuses versions the
+// handler only serves after reading the metadata again: branches, whose
+// archive changes with every push, and archives whose URL has a query, which
+// clients ask for with one.
+func ComposerReleaseArchive(version, distURL, distType, shasum string) (filename, declared string, err error) {
+	switch {
+	case isDevVersion(version):
+		return "", "", fmt.Errorf("%s is a branch; Composer branches are fetched when requested, not mirrored", version)
+	case distURL == "":
+		return "", "", fmt.Errorf("%s has no dist archive", version)
+	case strings.ContainsAny(distURL, "?#"):
+		return "", "", fmt.Errorf("the archive URL of %s has a query, which isn't mirrored", version)
+	}
+	return distFilename(distURL, distType), composerIntegrity(shasum, version, true), nil
+}
+
+// RecordComposerPublishTime stores the publish time of a tagged release from
+// the default repository, as the Composer handler does when it resolves the
+// release's dist, so the archive is served from the cache without the
+// metadata, with or without cooldown.
+func (p *Proxy) RecordComposerPublishTime(packageName, version string, publishedAt time.Time) error {
+	if p.DB == nil || isDevVersion(version) || publishedAt.IsZero() {
+		return nil
+	}
+	return p.DB.SetVersionPublishedAt(canonicalVersionPURL("composer", packageName, version),
+		canonicalPackagePURL("composer", packageName), publishedAt)
 }
 
 // proxyUpstream forwards a request to packagist.org without caching.

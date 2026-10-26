@@ -75,7 +75,7 @@ func NewDebianHandler(
 // Routes returns the HTTP handler for Debian requests.
 // Mount this at /debian on your router.
 func (h *DebianHandler) Routes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return rejectQueryChars(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -120,7 +120,7 @@ func (h *DebianHandler) Routes() http.Handler {
 			// Other files (like README, etc.) - proxy directly
 			h.proxyFile(w, r, upstreamURL, rest)
 		}
-	})
+	}))
 }
 
 // repositoryNotFound answers a request addressed to a repository that is not
@@ -203,11 +203,11 @@ func (h *DebianHandler) artifactCacheFilename(repository, filename string) strin
 }
 
 // metadataCacheKeyFor returns the metadata cache key for a request. The main
-// archive keeps its separator-based key so existing cache entries stay valid;
-// a named repository hashes its identity as APKHandler.metadataCacheKey does.
+// archive hashes its upstream URL and the path; a named repository hashes its
+// identity as APKHandler.metadataCacheKey does.
 func (h *DebianHandler) metadataCacheKeyFor(repository, upstreamURL, path string) string {
 	if repository == "" {
-		return strings.ReplaceAll(path, "/", "_")
+		return hashedCacheKey(upstreamURL, path)
 	}
 	identity := repository + "\x00" + upstreamURL + "\x00" + path
 	digest := sha256.Sum256([]byte(identity))

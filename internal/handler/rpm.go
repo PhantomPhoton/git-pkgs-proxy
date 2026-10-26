@@ -61,7 +61,7 @@ func NewRPMHandlerWithUpstream(proxy *Proxy, proxyURL, upstreamURL string) *RPMH
 // Routes returns the HTTP handler for RPM requests.
 // Mount this at /rpm on your router.
 func (h *RPMHandler) Routes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return rejectQueryChars(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -80,13 +80,13 @@ func (h *RPMHandler) Routes() http.Handler {
 			// Package downloads - cache these
 			h.handlePackageDownload(w, r, path)
 		case strings.Contains(path, "/repodata/"):
-			// Repository metadata - proxy without caching (changes frequently)
+			// Repository metadata
 			h.handleMetadata(w, r, path)
 		default:
 			// Other files - proxy directly
 			h.proxyFile(w, r, path)
 		}
-	})
+	}))
 }
 
 // handlePackageDownload fetches and caches .rpm packages.
@@ -119,11 +119,35 @@ func (h *RPMHandler) handlePackageDownload(w http.ResponseWriter, r *http.Reques
 	ServeArtifactRequest(w, r, result)
 }
 
-// handleMetadata proxies repository metadata files (repomd.xml, primary.xml.gz, etc.).
-// These change frequently so we don't cache them.
+// handleMetadata proxies repository metadata files (repomd.xml,
+// primary.xml.gz, etc.). repomd.xml changes with every repository update and
+// follows the metadata TTL. The files it points at are usually named after
+// their own checksum and so never change; those are kept for good.
 func (h *RPMHandler) handleMetadata(w http.ResponseWriter, r *http.Request, path string) {
-	cacheKey := strings.ReplaceAll(path, "/", "_")
-	h.proxy.ProxyCached(w, r, fmt.Sprintf("%s/%s", h.upstreamURL, path), "rpm", cacheKey, "*/*")
+	upstreamURL := fmt.Sprintf("%s/%s", h.upstreamURL, path)
+	if rpmContentAddressed(path) {
+		h.proxy.proxyImmutable(w, r, upstreamURL, "rpm", h.metadataCacheKey(path), "*/*")
+		return
+	}
+	h.proxy.ProxyCached(w, r, upstreamURL, "rpm", h.metadataCacheKey(path), "*/*")
+}
+
+// rpmChecksumPrefix matches a repodata filename that createrepo prefixed
+// with the file's checksum: <hex>-primary.xml.gz. The hex lengths are those
+// of the checksum types createrepo_c offers: SHA-1, SHA-224, SHA-256,
+// SHA-384 and SHA-512. Repositories built with --simple-md-filenames use
+// plain names, which can be replaced in place and follow the TTL.
+var rpmChecksumPrefix = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{56}|[0-9a-f]{64}|[0-9a-f]{96}|[0-9a-f]{128})-[^/]+$`)
+
+// rpmContentAddressed reports whether a repodata path names a file after
+// its checksum, so its content never changes.
+func rpmContentAddressed(path string) bool {
+	return rpmChecksumPrefix.MatchString(path[strings.LastIndex(path, "/")+1:])
+}
+
+// metadataCacheKey is the metadata cache key of a repository path.
+func (h *RPMHandler) metadataCacheKey(path string) string {
+	return hashedCacheKey(h.upstreamURL, path)
 }
 
 // proxyFile proxies any file directly without caching.

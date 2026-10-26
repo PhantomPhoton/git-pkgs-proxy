@@ -198,7 +198,7 @@ func (h *ArchHandler) handleDatabase(w http.ResponseWriter, r *http.Request, rep
 	}
 	d := h.database(repository, upstreamURL, path)
 	if _, hit := p.cachedMetadataState(r.Context(), archEcosystem, d.dbKey, nil); hit != nil {
-		metrics.RecordCacheHit(archEcosystem)
+		metrics.RecordMetadataCacheHit(archEcosystem, len(hit.body))
 		h.writeMetadata(w, r, d.dbKey, *hit)
 		return
 	}
@@ -217,7 +217,7 @@ func (h *ArchHandler) handleDatabaseSignature(w http.ResponseWriter, r *http.Req
 	}
 	d := h.database(repository, upstreamURL, strings.TrimSuffix(path, archSignatureSuffix))
 	if res, ok := h.cachedSignature(r.Context(), d); ok {
-		metrics.RecordCacheHit(archEcosystem)
+		metrics.RecordMetadataCacheHit(archEcosystem, len(res.body))
 		h.writeMetadata(w, r, d.sigKey, res)
 		return
 	}
@@ -336,7 +336,7 @@ func (h *ArchHandler) storeDatabase(ctx context.Context, d archDatabase, meta *u
 	defer h.lock(d.dbKey)()
 
 	previous, _ := p.DB.GetMetadataCache(archEcosystem, d.dbKey)
-	if previous != nil && previous.StoragePath == path {
+	if previous != nil && previous.StoragePath == path && h.blobExists(ctx, path) {
 		// Same bytes: a failed rewrite would delete the blob the row uses.
 		h.touchDatabase(previous, meta)
 	} else {
@@ -354,6 +354,13 @@ func (h *ArchHandler) storeDatabase(ctx context.Context, d archDatabase, meta *u
 		_ = p.Storage.Delete(ctx, previous.StoragePath)
 	}
 	return metadataResult{body: meta.body, contentType: meta.contentType, contentEncoding: meta.contentEncoding}, row
+}
+
+// blobExists reports whether path is stored. Size eviction can remove a blob
+// while a refresh re-creates its row, and only a rewrite brings it back.
+func (h *ArchHandler) blobExists(ctx context.Context, path string) bool {
+	ok, err := h.proxy.Storage.Exists(ctx, path)
+	return ok || err != nil
 }
 
 // touchDatabase marks an unchanged cached database as fetched now.

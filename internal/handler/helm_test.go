@@ -14,7 +14,6 @@ import (
 
 	"github.com/git-pkgs/cooldown"
 	upstreamhttp "github.com/git-pkgs/proxy/internal/httpclient"
-	"github.com/git-pkgs/proxy/internal/storage"
 	"github.com/git-pkgs/registries/fetch"
 	"gopkg.in/yaml.v3"
 )
@@ -169,7 +168,7 @@ func TestHelmHandler_RejectsChartDigestMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing queued deletes: %v", err)
 	}
-	chartDir := storage.ArtifactPath(helmMetadataEcosystem, "", "test", digest, "")
+	chartDir := helmMetadataEcosystem + "/test/" + digest + "/"
 	stored := 0
 	for path := range store.files {
 		if !strings.HasPrefix(path, chartDir) {
@@ -180,8 +179,8 @@ func TestHelmHandler_RejectsChartDigestMismatch(t *testing.T) {
 			t.Errorf("rejected chart at %q is not queued for deletion", path)
 		}
 	}
-	if stored != requests {
-		t.Errorf("found %d stored charts, want one per request (%d)", stored, requests)
+	if stored != 0 {
+		t.Errorf("found %d stored charts, want none: a mismatch is discarded before it is committed", stored)
 	}
 }
 
@@ -291,7 +290,7 @@ entries:
 `, time.Now().Add(-10*24*time.Hour).Format(time.RFC3339), oldDigest,
 		time.Now().Add(-time.Hour).Format(time.RFC3339), newDigest)
 
-	rewritten, err := h.rewriteIndex("test", "https://charts.example", []byte(body))
+	rewritten, _, err := h.rewriteIndex("test", "https://charts.example", []byte(body))
 	if err != nil {
 		t.Fatalf("rewriteIndex() error = %v", err)
 	}

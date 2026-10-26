@@ -311,10 +311,10 @@ func TestRequestEcosystemCoversEveryMountedRoute(t *testing.T) {
 		"/npm/x": "npm", "/cargo/x": "cargo", "/gem/x": "rubygems", "/go/x": "golang",
 		"/hex/x": "hex", "/pub/x": "pub", "/pypi/x": "pypi", "/maven/x": "maven",
 		"/gradle/x": "gradle", "/nuget/x": "nuget", "/composer/x": "packagist",
-		"/conan/x": "conan", "/conda/x": "conda", "/cran/x": "cran",
+		"/conan/x": "conan", "/chef/x": "chef", "/conda/x": "conda", "/cran/x": "cran",
 		"/julia/x": "julia", "/swift/x": "swift", "/v2/x": "oci",
-		"/apk/x": "alpine", "/arch/x": "arch", "/debian/x": "debian", "/rpm/x": "rpm",
-		"/helm/x": "helm", "/homebrew/x": "homebrew", "/generic/x": "generic",
+		"/apk/x": "alpine", "/arch/x": "arch", "/freebsd/x": "freebsd", "/debian/x": "debian", "/rpm/x": "rpm",
+		"/helm/x": "helm", "/homebrew/x": "homebrew", "/generic/x": "generic", "/git/x": "git",
 	}
 	for path, want := range mounts {
 		if got := requestEcosystem(path); got != want {

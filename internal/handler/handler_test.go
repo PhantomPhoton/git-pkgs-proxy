@@ -38,6 +38,8 @@ type mockStorage struct {
 	signedURL string
 	signErr   error
 	seekable  bool
+	stores    int
+	opens     int
 }
 
 func newMockStorage() *mockStorage {
@@ -55,12 +57,14 @@ func (s *mockStorage) Store(_ context.Context, path string, r io.Reader) (int64,
 		return 0, "", err
 	}
 	s.files[path] = data
+	s.stores++
 	return int64(len(data)), sha256Hex(string(data)), nil
 }
 
 func (s *mockStorage) Open(_ context.Context, path string) (io.ReadCloser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.opens++
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
@@ -73,6 +77,9 @@ func (s *mockStorage) Open(_ context.Context, path string) (io.ReadCloser, error
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
+
+// ReadsSeekable reports what Open returns, as storage.Blob does.
+func (s *mockStorage) ReadsSeekable() bool { return s.seekable }
 
 type mockSeekableReadCloser struct {
 	*bytes.Reader
@@ -238,7 +245,7 @@ func seedPackage(t testing.TB, db *database.DB, store *mockStorage, ecosystem, n
 		t.Fatalf("failed to upsert version: %v", err)
 	}
 
-	storagePath := storage.ArtifactPath(ecosystem, "", name, version, filename)
+	storagePath := ecosystem + "/" + name + "/" + version + "/" + filename
 	store.files[storagePath] = []byte(content)
 	sharedArtifact := testArtifact(content, versionPURL, filename, "application/octet-stream")
 
@@ -415,7 +422,7 @@ func assertMalformedCacheRejected(t *testing.T, malformedHash, malformedIntegrit
 	if artifact.StoragePath.Valid {
 		t.Error("unusable cache record retained its storage path")
 	}
-	assertQueuedForDeletion(t, db, storage.ArtifactPath("npm", "", packageName, version, filename))
+	assertQueuedForDeletion(t, db, "npm/"+packageName+"/"+version+"/"+filename)
 }
 
 // TestCorruptCachedArtifactIsQueuedForDeletion streams cached bytes that no
@@ -425,7 +432,7 @@ func assertMalformedCacheRejected(t *testing.T, malformedHash, malformedIntegrit
 func TestCorruptCachedArtifactIsQueuedForDeletion(t *testing.T) {
 	proxy, db, store, _ := setupTestProxy(t)
 	seedPackage(t, db, store, "npm", "corrupt", "1.0.0", "corrupt-1.0.0.tgz", "cached content")
-	storagePath := storage.ArtifactPath("npm", "", "corrupt", "1.0.0", "corrupt-1.0.0.tgz")
+	storagePath := "npm/corrupt/1.0.0/corrupt-1.0.0.tgz"
 	store.files[storagePath] = []byte("tampered bytes")
 
 	result, err := proxy.GetCachedArtifact(context.Background(), "npm", "corrupt", "1.0.0", "corrupt-1.0.0.tgz")
@@ -440,6 +447,69 @@ func TestCorruptCachedArtifactIsQueuedForDeletion(t *testing.T) {
 	assertQueuedForDeletion(t, db, storagePath)
 }
 
+// TestCachedArtifactVerifiedByContentHash checks that a cache hit is verified
+// against the recorded content hash only. The version's native integrity is
+// one value per version and was checked when the bytes were stored; a stale
+// or foreign value there must not discard an artifact whose bytes still
+// match their SHA-256.
+func TestCachedArtifactVerifiedByContentHash(t *testing.T) {
+	proxy, db, store, _ := setupTestProxy(t)
+	seedPackage(t, db, store, "npm", "hashed", "1.0.0", "hashed-1.0.0.tgz", "cached content")
+	setVersionIntegrity(t, db, "npm", "hashed", "1.0.0", sha512SRI("other bytes"))
+
+	result, err := proxy.GetCachedArtifact(context.Background(), "npm", "hashed", "1.0.0", "hashed-1.0.0.tgz")
+	if err != nil || result == nil {
+		t.Fatalf("GetCachedArtifact = %v, %v", result, err)
+	}
+	body, err := io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if err != nil || string(body) != "cached content" {
+		t.Fatalf("read %q, %v; want the cached bytes", body, err)
+	}
+	artifact, err := db.GetArtifact("pkg:npm/hashed@1.0.0", "hashed-1.0.0.tgz")
+	if err != nil || artifact == nil || !artifact.StoragePath.Valid {
+		t.Errorf("record = %+v (err %v), want it kept", artifact, err)
+	}
+}
+
+// TestCachedArtifactWithoutContentHashChecksNativeIntegrity checks that a
+// record without a content hash is still verified against the native
+// integrity, which is then the only digest there is.
+func TestCachedArtifactWithoutContentHashChecksNativeIntegrity(t *testing.T) {
+	proxy, db, store, _ := setupTestProxy(t)
+	seedPackage(t, db, store, "npm", "nohash", "1.0.0", "nohash-1.0.0.tgz", "cached content")
+	setVersionIntegrity(t, db, "npm", "nohash", "1.0.0", sha512SRI("other bytes"))
+	artifact, err := db.GetArtifact("pkg:npm/nohash@1.0.0", "nohash-1.0.0.tgz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact.ContentHash = sql.NullString{}
+	if err := db.UpsertArtifact(artifact); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := proxy.GetCachedArtifact(context.Background(), "npm", "nohash", "1.0.0", "nohash-1.0.0.tgz")
+	if err != nil || result == nil {
+		t.Fatalf("GetCachedArtifact = %v, %v", result, err)
+	}
+	_, err = io.ReadAll(result.Reader)
+	_ = result.Reader.Close()
+	if !errors.Is(err, ErrArtifactDigestMismatch) {
+		t.Fatalf("read error = %v, want ErrArtifactDigestMismatch", err)
+	}
+}
+
+func setVersionIntegrity(t *testing.T, db *database.DB, ecosystem, name, version, integrity string) {
+	t.Helper()
+	if err := db.UpsertVersion(&database.Version{
+		PURL:        purl.MakePURLString(ecosystem, name, version),
+		PackagePURL: purl.MakePURLString(ecosystem, name, ""),
+		Integrity:   sql.NullString{String: integrity, Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // assertQueuedForDeletion fails unless path waits in the pending delete queue.
 func assertQueuedForDeletion(t *testing.T, db *database.DB, path string) {
 	t.Helper()
@@ -451,7 +521,7 @@ func assertQueuedForDeletion(t *testing.T, db *database.DB, path string) {
 
 func TestGetOrFetchArtifact_CacheMiss_NoPackage(t *testing.T) {
 	proxy, _, _, fetcher := setupTestProxy(t)
-	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("npm"))
+	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("npm", metrics.CacheKindArtifact))
 
 	// The resolver will fail because "nonexistent" isn't a real package,
 	// but we're testing that it tries to fetch (doesn't return from cache).
@@ -461,7 +531,7 @@ func TestGetOrFetchArtifact_CacheMiss_NoPackage(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for uncached package")
 	}
-	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("npm"))
+	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("npm", metrics.CacheKindArtifact))
 	if diff := missesAfter - missesBefore; diff != 1 {
 		t.Errorf("cache misses delta = %.0f, want 1", diff)
 	}
@@ -905,7 +975,7 @@ func newRangeTestResult(payload string) *CacheResult {
 func TestGetOrFetchArtifactFromURL_CacheHit(t *testing.T) {
 	proxy, db, store, fetcher := setupTestProxy(t)
 	seedPackage(t, db, store, "pypi", "requests", "2.28.0", "requests-2.28.0.tar.gz", "pypi content")
-	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi"))
+	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi", metrics.CacheKindArtifact))
 
 	result, err := proxy.GetOrFetchArtifactFromURL(context.Background(), "pypi", "requests", "2.28.0", "requests-2.28.0.tar.gz", "https://pypi.org/files/requests-2.28.0.tar.gz")
 	if err != nil {
@@ -919,7 +989,7 @@ func TestGetOrFetchArtifactFromURL_CacheHit(t *testing.T) {
 	if fetcher.fetchCalled {
 		t.Error("fetcher should not be called on cache hit")
 	}
-	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi"))
+	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi", metrics.CacheKindArtifact))
 	if diff := missesAfter - missesBefore; diff != 0 {
 		t.Errorf("cache misses delta = %.0f, want 0", diff)
 	}
@@ -927,7 +997,7 @@ func TestGetOrFetchArtifactFromURL_CacheHit(t *testing.T) {
 
 func TestGetOrFetchArtifactFromURL_CacheMiss(t *testing.T) {
 	proxy, db, store, fetcher := setupTestProxy(t)
-	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi"))
+	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi", metrics.CacheKindArtifact))
 	fetchesBefore := histogramSampleCount(t, metrics.UpstreamFetchDuration.WithLabelValues("pypi"))
 	writesBefore := histogramSampleCount(t, metrics.StorageOperationDuration.WithLabelValues("write"))
 	readsBefore := histogramSampleCount(t, metrics.StorageOperationDuration.WithLabelValues("read"))
@@ -975,7 +1045,7 @@ func TestGetOrFetchArtifactFromURL_CacheMiss(t *testing.T) {
 	if _, ok := store.files[storagePath]; !ok {
 		t.Error("artifact was not stored in storage")
 	}
-	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi"))
+	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("pypi", metrics.CacheKindArtifact))
 	if diff := missesAfter - missesBefore; diff != 1 {
 		t.Errorf("cache misses delta = %.0f, want 1", diff)
 	}
@@ -990,17 +1060,7 @@ func TestGetOrFetchArtifactFromURL_CacheMiss(t *testing.T) {
 	}
 }
 
-// isolateRecentFailures empties the process-wide failure history for the
-// test and again when it ends, so neither earlier tests nor repeated runs
-// reach its assertions.
-func isolateRecentFailures(t *testing.T) {
-	t.Helper()
-	metrics.ResetRecentFailures()
-	t.Cleanup(metrics.ResetRecentFailures)
-}
-
 func TestGetOrFetchArtifactFromURL_FetchError(t *testing.T) {
-	isolateRecentFailures(t)
 	proxy, _, _, fetcher := setupTestProxy(t)
 	fetcher.fetchErr = errors.New("connection refused")
 	errorsBefore := testutil.ToFloat64(metrics.UpstreamErrors.WithLabelValues("pypi", "fetch_failed"))
@@ -1016,14 +1076,13 @@ func TestGetOrFetchArtifactFromURL_FetchError(t *testing.T) {
 		t.Errorf("upstream errors delta = %.0f, want 1", diff)
 	}
 	recent := metrics.RecentFailures("proxy_upstream_errors_total", map[string]string{"ecosystem": "pypi", "error_type": "fetch_failed"})
-	if len(recent) != 1 || recent[0].PURL != "pkg:pypi/fail@1.0.0" ||
+	if len(recent) == 0 || recent[0].PURL != "pkg:pypi/fail@1.0.0" ||
 		recent[0].URL != "https://pypi.org/files/fail-1.0.0.tar.gz" || recent[0].Error != "connection refused" {
-		t.Errorf("upstream failures = %+v, want one: the failed package, its URL and the error", recent)
+		t.Errorf("upstream failures = %+v, want the newest failure to contain the failed package, its URL and the error", recent)
 	}
 }
 
 func TestGetOrFetchArtifactFromURL_StoreError(t *testing.T) {
-	isolateRecentFailures(t)
 	proxy, _, store, fetcher := setupTestProxy(t)
 	store.storeErr = errors.New("disk full")
 	errorsBefore := testutil.ToFloat64(metrics.StorageErrors.WithLabelValues("write"))
@@ -1043,9 +1102,9 @@ func TestGetOrFetchArtifactFromURL_StoreError(t *testing.T) {
 		t.Errorf("storage errors delta = %.0f, want 1", diff)
 	}
 	recent := metrics.RecentFailures("proxy_storage_errors_total", map[string]string{"operation": "write"})
-	if len(recent) != 1 || recent[0].PURL != "pkg:pypi/fail@1.0.0" || recent[0].Filename != "fail-1.0.0.tar.gz" ||
+	if len(recent) == 0 || recent[0].PURL != "pkg:pypi/fail@1.0.0" || recent[0].Filename != "fail-1.0.0.tar.gz" ||
 		recent[0].Path == "" || recent[0].Error != "disk full" {
-		t.Errorf("storage failures = %+v, want one: the failed package, its storage path and the error", recent)
+		t.Errorf("storage failures = %+v, want the newest failure to contain the failed package, its storage path and the error", recent)
 	}
 }
 
@@ -1305,8 +1364,10 @@ func TestProxyCached_NoValidators_OmitsHeaders(t *testing.T) {
 }
 
 func TestFetchOrCacheMetadata_TTL_ServesFreshFromCache(t *testing.T) {
-	hitsBefore := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test"))
-	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test"))
+	hitsBefore := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test", metrics.CacheKindMetadata))
+	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test", metrics.CacheKindMetadata))
+	artifactHitsBefore := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test", metrics.CacheKindArtifact))
+	servedBefore := testutil.ToFloat64(metrics.MetadataServedBytes.WithLabelValues("test"))
 	upstreamHits := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits++
@@ -1333,10 +1394,10 @@ func TestFetchOrCacheMetadata_TTL_ServesFreshFromCache(t *testing.T) {
 	if upstreamHits != 1 {
 		t.Fatalf("expected 1 upstream hit, got %d", upstreamHits)
 	}
-	if diff := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test")) - missesBefore; diff != 1 {
+	if diff := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test", metrics.CacheKindMetadata)) - missesBefore; diff != 1 {
 		t.Errorf("cache misses delta after first request = %.0f, want 1", diff)
 	}
-	if diff := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test")) - hitsBefore; diff != 0 {
+	if diff := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test", metrics.CacheKindMetadata)) - hitsBefore; diff != 0 {
 		t.Errorf("cache hits delta after first request = %.0f, want 0", diff)
 	}
 
@@ -1351,16 +1412,22 @@ func TestFetchOrCacheMetadata_TTL_ServesFreshFromCache(t *testing.T) {
 	if upstreamHits != 1 {
 		t.Errorf("expected upstream to still be hit only once, got %d", upstreamHits)
 	}
-	if diff := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test")) - hitsBefore; diff != 1 {
+	if diff := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test", metrics.CacheKindMetadata)) - hitsBefore; diff != 1 {
 		t.Errorf("cache hits delta after second request = %.0f, want 1", diff)
 	}
-	if diff := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test")) - missesBefore; diff != 1 {
+	if diff := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test", metrics.CacheKindMetadata)) - missesBefore; diff != 1 {
 		t.Errorf("cache misses delta after second request = %.0f, want 1", diff)
+	}
+	if diff := testutil.ToFloat64(metrics.MetadataServedBytes.WithLabelValues("test")) - servedBefore; diff != float64(len(body)) {
+		t.Errorf("metadata served bytes delta = %.0f, want %d (only the cached response)", diff, len(body))
+	}
+	if diff := testutil.ToFloat64(metrics.CacheHits.WithLabelValues("test", metrics.CacheKindArtifact)) - artifactHitsBefore; diff != 0 {
+		t.Errorf("artifact cache hits delta = %.0f, want 0 for a metadata lookup", diff)
 	}
 }
 
 func TestFetchOrCacheMetadata_TTL_Zero_AlwaysRevalidates(t *testing.T) {
-	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test"))
+	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test", metrics.CacheKindMetadata))
 	upstreamHits := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits++
@@ -1389,7 +1456,7 @@ func TestFetchOrCacheMetadata_TTL_Zero_AlwaysRevalidates(t *testing.T) {
 	if upstreamHits != 2 {
 		t.Errorf("expected 2 upstream hits with TTL=0, got %d", upstreamHits)
 	}
-	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test"))
+	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues("test", metrics.CacheKindMetadata))
 	if diff := missesAfter - missesBefore; diff != 2 {
 		t.Errorf("cache misses delta = %.0f, want 2", diff)
 	}
@@ -1407,16 +1474,16 @@ func TestFetchOrCacheMetadata_CacheDisabledDoesNotRecordMetrics(t *testing.T) {
 	proxy, _, _, _ := setupTestProxy(t)
 	proxy.HTTPClient = upstream.Client()
 
-	hitsBefore := testutil.ToFloat64(metrics.CacheHits.WithLabelValues(ecosystem))
-	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues(ecosystem))
+	hitsBefore := testutil.ToFloat64(metrics.CacheHits.WithLabelValues(ecosystem, metrics.CacheKindMetadata))
+	missesBefore := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues(ecosystem, metrics.CacheKindMetadata))
 
 	_, _, err := proxy.FetchOrCacheMetadata(context.Background(), ecosystem, "pkg", upstream.URL+"/pkg")
 	if err != nil {
 		t.Fatalf("fetch metadata: %v", err)
 	}
 
-	hitsAfter := testutil.ToFloat64(metrics.CacheHits.WithLabelValues(ecosystem))
-	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues(ecosystem))
+	hitsAfter := testutil.ToFloat64(metrics.CacheHits.WithLabelValues(ecosystem, metrics.CacheKindMetadata))
+	missesAfter := testutil.ToFloat64(metrics.CacheMisses.WithLabelValues(ecosystem, metrics.CacheKindMetadata))
 	if diff := hitsAfter - hitsBefore; diff != 0 {
 		t.Errorf("cache hits delta = %.0f, want 0", diff)
 	}

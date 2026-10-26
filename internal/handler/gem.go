@@ -1,10 +1,13 @@
 package handler
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,38 +91,73 @@ func (h *GemHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 // e.g., "rails-7.1.0.gem" -> ("rails", "7.1.0")
 // e.g., "aws-sdk-s3-1.142.0.gem" -> ("aws-sdk-s3", "1.142.0")
 // e.g., "sorbet-static-0.5.11002-universal-darwin-22.gem" -> ("sorbet-static", "0.5.11002-universal-darwin-22")
+// e.g., "devise-2fa-1.0.0.gem" -> ("devise-2fa", "1.0.0")
 //
-// The version starts at the first hyphen followed by a digit. Platforms can
-// end in a number (universal-java-17, arm64-darwin-23), so splitting at the
-// last one would cut the platform; only gem names with a "-<digit>" segment
-// are misread this way, and those are rare.
+// A gem file is named {name}-{version}[-{platform}]. RubyGems writes a
+// version as dot-separated alphanumeric segments starting with a digit,
+// turning any "-" into ".pre.", and a platform starts with a letter (its
+// CPU, or java), though it can end in a number (universal-java-17), so
+// splitting at the last "-<digit>" would cut the platform. The version
+// starts at the first "-<digit>" that leaves such a version and platform,
+// so a name with a "-<digit>" segment of its own, such as devise-2fa, is
+// kept whole. A filename no split fits is split at the first "-<digit>".
+//
+// Trying every "-<digit>" costs time quadratic in the filename's length, so
+// a filename longer than maxGemFilenameLength is refused.
 func (h *GemHandler) parseGemFilename(filename string) (name, version string) {
+	if len(filename) > maxGemFilenameLength {
+		return "", ""
+	}
 	base := strings.TrimSuffix(filename, ".gem")
+	first := -1
 	for i := 0; i+1 < len(base); i++ {
-		if base[i] == '-' && base[i+1] >= '0' && base[i+1] <= '9' {
+		if base[i] != '-' || base[i+1] < '0' || base[i+1] > '9' {
+			continue
+		}
+		if first < 0 {
+			first = i
+		}
+		if gemVersionAndPlatform(base[i+1:]) {
 			return base[:i], base[i+1:]
 		}
 	}
-	return "", ""
+	if first < 0 {
+		return "", ""
+	}
+	return base[:first], base[first+1:]
+}
+
+// maxGemFilenameLength bounds the gem filenames parseGemFilename accepts.
+// Real gem filenames are a small fraction of this.
+const maxGemFilenameLength = 512
+
+var (
+	gemVersionPattern  = regexp.MustCompile(`^[0-9]+(\.[0-9A-Za-z]+)*$`)
+	gemPlatformPattern = regexp.MustCompile(`^[A-Za-z][0-9A-Za-z_]*(-[0-9A-Za-z_]+)*$`)
+)
+
+// gemVersionAndPlatform reports whether s reads as {version}[-{platform}].
+func gemVersionAndPlatform(s string) bool {
+	version, platform, hasPlatform := strings.Cut(s, "-")
+	return gemVersionPattern.MatchString(version) && (!hasPlatform || gemPlatformPattern.MatchString(platform))
 }
 
 // handleCompactIndex serves the compact index for a gem, filtering versions
 // based on cooldown when enabled.
 func (h *GemHandler) handleCompactIndex(w http.ResponseWriter, r *http.Request) {
-	if h.proxy.Cooldown == nil || !h.proxy.Cooldown.Enabled() {
-		h.proxyCached(w, r)
-		return
-	}
-
 	name := r.PathValue("name")
 	if name == "" {
 		http.Error(w, "invalid gem name", http.StatusBadRequest)
 		return
 	}
+	if !h.proxy.cooldownApplies("gem", name) {
+		h.proxyCached(w, r)
+		return
+	}
 
 	h.proxy.Logger.Info("gem compact index request with cooldown", "name", name)
 
-	indexResp, filteredVersions, err := h.fetchIndexAndVersions(r, name)
+	indexResp, filteredVersions, versionsErr, err := h.fetchIndexAndVersions(r, name)
 	if err != nil {
 		if writeUpstreamHeld(w, err) {
 			return
@@ -135,19 +173,18 @@ func (h *GemHandler) handleCompactIndex(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if filteredVersions == nil {
-		h.proxy.Logger.Warn("failed to fetch version timestamps, proxying unfiltered", "name", name)
-		h.proxy.relayResponse(w, r, indexResp, nil)
+	if versionsErr != nil {
+		h.proxy.writeCooldownLookupError(w, "gem", name, versionsErr)
 		return
 	}
 
 	h.writeFilteredIndex(w, indexResp, name, filteredVersions)
 }
 
-// fetchIndexAndVersions fetches the compact index and versions API concurrently.
-// Returns the index response, a set of versions to filter (nil if versions API failed),
-// and an error if the index fetch itself failed.
-func (h *GemHandler) fetchIndexAndVersions(r *http.Request, name string) (*http.Response, map[string]bool, error) {
+// fetchIndexAndVersions fetches the compact index and versions API
+// concurrently. It returns the index response and the set of versions to
+// filter, the versions API's error, and the index fetch's error.
+func (h *GemHandler) fetchIndexAndVersions(r *http.Request, name string) (*http.Response, map[string]bool, error, error) {
 	type versionsResult struct {
 		filtered map[string]bool
 		err      error
@@ -164,14 +201,9 @@ func (h *GemHandler) fetchIndexAndVersions(r *http.Request, name string) (*http.
 	versionsRes := <-versionsCh
 
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-
-	if versionsRes.err != nil {
-		return indexResp, nil, nil
-	}
-
-	return indexResp, versionsRes.filtered, nil
+	return indexResp, versionsRes.filtered, versionsRes.err, nil
 }
 
 // fetchCompactIndex fetches the compact index from upstream.
@@ -181,48 +213,66 @@ func (h *GemHandler) fetchCompactIndex(r *http.Request, name string) (*http.Resp
 	if err != nil {
 		return nil, err
 	}
-	for _, hdr := range []string{"Accept", headerAcceptEncoding, "If-None-Match", "If-Modified-Since"} {
-		if v := r.Header.Get(hdr); v != "" {
-			req.Header.Set(hdr, v)
-		}
+	// Only Accept is passed on. The client's Accept-Encoding would turn off
+	// the transport's transparent decompression and leave a gzip body to
+	// filter, and its validators belong to the filtered copy it was served,
+	// not to upstream's file.
+	if v := r.Header.Get(headerAccept); v != "" {
+		req.Header.Set(headerAccept, v)
 	}
 	return h.proxy.HTTPClient.Do(req)
 }
 
-// writeFilteredIndex writes the compact index response with cooldown-filtered versions removed.
+// gemFilteredIndexDroppedHeaders describe upstream's file as a whole, so
+// they are wrong for a copy with versions removed. Bundler checks the digest
+// headers against the body it receives.
+var gemFilteredIndexDroppedHeaders = []string{
+	headerContentLength, headerContentEncoding, headerETag, headerLastModified,
+	"Digest", "Repr-Digest", "Content-Digest", "Accept-Ranges", "Content-Range",
+}
+
+// writeFilteredIndex writes the compact index response with cooldown-filtered
+// versions removed. The body is read in full first, so a read error or an
+// oversized index answers 502 instead of a truncated 200.
 func (h *GemHandler) writeFilteredIndex(w http.ResponseWriter, resp *http.Response, name string, filtered map[string]bool) {
+	body, err := h.proxy.ReadMetadata(resp.Body)
+	if err != nil {
+		h.proxy.Logger.Error("failed to read gem compact index", "gem", name, "error", err)
+		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
+		return
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(body))
+	for rest := body; len(rest) > 0; {
+		line, tail, _ := bytes.Cut(rest, []byte("\n"))
+		rest = tail
+
+		version := line
+		if spaceIdx := bytes.IndexByte(line, ' '); spaceIdx > 0 {
+			version = line[:spaceIdx]
+		}
+		if filtered[string(version)] {
+			h.proxy.Logger.Info("cooldown: filtering gem version",
+				"gem", name, "version", string(version))
+			continue
+		}
+
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+
 	for k, vv := range resp.Header {
-		if strings.EqualFold(k, headerContentLength) {
-			continue // length will change after filtering
+		if slices.ContainsFunc(gemFilteredIndexDroppedHeaders, func(d string) bool { return strings.EqualFold(k, d) }) {
+			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
+	w.Header().Set(headerContentLength, strconv.Itoa(out.Len()))
 	w.WriteHeader(http.StatusOK)
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if line == "---" {
-			_, _ = fmt.Fprintln(w, line)
-			continue
-		}
-
-		version := line
-		if spaceIdx := strings.IndexByte(line, ' '); spaceIdx > 0 {
-			version = line[:spaceIdx]
-		}
-
-		if filtered[version] {
-			h.proxy.Logger.Info("cooldown: filtering gem version",
-				"gem", name, "version", version)
-			continue
-		}
-
-		_, _ = fmt.Fprintln(w, line)
-	}
+	_, _ = w.Write(out.Bytes())
 }
 
 // gemVersion represents a version entry from the RubyGems versions API.
@@ -251,8 +301,12 @@ func (h *GemHandler) fetchFilteredVersions(r *http.Request, name string) (map[st
 		return nil, fmt.Errorf("versions API returned %d", resp.StatusCode)
 	}
 
+	body, err := h.proxy.ReadMetadata(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	var versions []gemVersion
-	if err := json.NewDecoder(resp.Body).Decode(&versions); err != nil {
+	if err := json.Unmarshal(body, &versions); err != nil {
 		return nil, err
 	}
 

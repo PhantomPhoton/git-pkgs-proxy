@@ -50,6 +50,8 @@ type JobStore struct {
 	jobs      map[string]*Job
 	mirror    *Mirror
 	parentCtx context.Context
+	// running counts the jobs whose goroutine has not returned yet.
+	running sync.WaitGroup
 }
 
 // NewJobStore creates a new job store. The parent context is used as the base
@@ -83,7 +85,7 @@ func (js *JobStore) Create(req JobRequest) (string, error) {
 	js.jobs[id] = job
 	js.mu.Unlock()
 
-	go js.runJob(ctx, cancel, job, source)
+	js.running.Go(func() { js.runJob(ctx, cancel, job, source) })
 
 	return id, nil
 }
@@ -123,6 +125,12 @@ func (js *JobStore) Cancel(id string) bool {
 	job.cancel()
 	job.State = JobStateCanceled
 	return true
+}
+
+// Wait blocks until every job has returned. Cancel the parent context first
+// to stop running jobs.
+func (js *JobStore) Wait() {
+	js.running.Wait()
 }
 
 // Cleanup removes completed/failed/canceled jobs older than jobTTL.
@@ -201,9 +209,9 @@ func (js *JobStore) sourceFromRequest(req JobRequest) (Source, error) { //nolint
 	case len(req.PURLs) > 0 && len(req.SBOM) > 0:
 		return nil, fmt.Errorf("request must include only one of purls or sbom")
 	case len(req.PURLs) > 0:
-		return &PURLSource{PURLs: req.PURLs, Platforms: req.Platforms}, nil
+		return &PURLSource{PURLs: req.PURLs, Versions: js.mirror.Versions, Platforms: req.Platforms}, nil
 	case len(req.SBOM) > 0:
-		return &SBOMSource{Data: req.SBOM, Platforms: req.Platforms}, nil
+		return &SBOMSource{Data: req.SBOM, Versions: js.mirror.Versions, Platforms: req.Platforms}, nil
 	case req.Registry != "":
 		return nil, fmt.Errorf("registry mirroring is not yet implemented; use purls instead")
 	default:

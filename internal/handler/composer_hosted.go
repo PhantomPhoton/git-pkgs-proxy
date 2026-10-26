@@ -78,7 +78,7 @@ func pushedComposerVersion(local []composerLocalEntry, version string) bool {
 // upstream does not know the package, the document holds only the pushed
 // versions.
 func (h *ComposerHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.Request, packageName, upstreamURL, cacheKey string, local []composerLocalEntry) {
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), "composer", cacheKey, upstreamURL, contentTypeJSON)
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "composer", cacheKey, upstreamURL, contentTypeJSON, nil)
 	var out []byte
 	var err error
 	switch {
@@ -99,6 +99,7 @@ func (h *ComposerHandler) serveMetadataWithLocal(w http.ResponseWriter, r *http.
 		http.Error(w, "failed to rewrite package metadata", http.StatusBadGateway)
 		return
 	}
+	markStale(w, upstream.stale)
 	serveRewrittenMetadata(w, r, h.proxy.uncachedRewrite("composer", h.proxyURL, cacheKey, out))
 }
 

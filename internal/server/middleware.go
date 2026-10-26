@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/git-pkgs/proxy/internal/accesslog"
+	"github.com/git-pkgs/proxy/internal/config"
+	"github.com/git-pkgs/proxy/internal/handler"
 	"github.com/git-pkgs/proxy/internal/metrics"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -34,6 +36,19 @@ func RequestIDMiddleware(next http.Handler) http.Handler {
 // GetRequestID retrieves the request ID from context.
 func GetRequestID(ctx context.Context) string {
 	return accesslog.RequestID(ctx)
+}
+
+// markRequestContext marks each client request so upstream fetches it starts
+// outlive a client that hangs up, and so a HEAD answered from the cache does
+// not open the stored object.
+func markRequestContext(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := handler.DetachUpstreamFetch(r.Context())
+		if r.Method == http.MethodHead {
+			ctx = handler.ServingHead(ctx)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // LoggerMiddleware logs HTTP requests with request ID correlation.
@@ -106,8 +121,8 @@ func requestEcosystem(path string) string {
 	segment, _, _ := strings.Cut(strings.TrimPrefix(path, "/"), "/")
 	switch segment {
 	case "npm", "cargo", "hex", "pub", "pypi", "maven", "gradle", "nuget",
-		"conan", "conda", "cran", "julia", "debian", "rpm", "arch",
-		"helm", "homebrew", "generic", "swift":
+		"conan", "chef", "conda", "cran", "julia", "debian", "rpm", "arch",
+		"freebsd", "helm", "homebrew", "generic", "swift", "git":
 		return segment
 	case "apk":
 		return "alpine"
@@ -124,15 +139,33 @@ func requestEcosystem(path string) string {
 	}
 }
 
-// rejectQueryInPath refuses requests whose decoded path contains '?' or '#'.
-// Handlers build upstream URLs from the decoded path, where such a character
-// would end the path: busybox.apk%3F/foo-9.9-r0.apk fetches busybox but is
-// parsed and cached as foo, under the wrong PURL and past the denylist.
-// Composer archives are exempt: their upstream URL comes from the package
-// metadata, and git branch versions such as dev-fix/#42 may contain '#'.
+// rejectQueryInPath refuses requests whose decoded path contains '?', '#'
+// or ';'. Handlers build upstream URLs from the decoded path, where '?' or
+// '#' would end the path: busybox.apk%3F/foo-9.9-r0.apk fetches busybox but
+// is parsed and cached as foo, under the wrong PURL and past the denylist.
+// Tomcat and Jetty drop ";params" from a path segment, so 1.0;x/evil-1.0.jar
+// would be served as version 1.0 while the proxy checks 1.0;x. Composer
+// archives are exempt: their upstream URL comes from the package metadata,
+// and git branch versions such as dev-fix/#42 may contain '#' or ';'.
 func rejectQueryInPath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.ContainsAny(r.URL.Path, "?#") && !strings.HasPrefix(r.URL.Path, "/composer/files/") {
+		if strings.ContainsAny(r.URL.Path, "?#;") && !strings.HasPrefix(r.URL.Path, "/composer/files/") {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// rejectDotSegments refuses requests whose decoded path has a '.' or '..'
+// segment. Routers clean literal dot segments, but encoded ones such as
+// %2e%2e reach the handlers, and several of them append the path to the
+// upstream URL, where the upstream resolves it outside the configured base
+// path. Backslashes count as separators, and the path is decoded once more
+// so double-encoded segments are refused too.
+func rejectDotSegments(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if config.HasDotSegment(r.URL.Path) {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
@@ -152,6 +185,18 @@ func sandboxUpstreamContent(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Security-Policy", "sandbox")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// frameAncestorsNone stops other sites from framing the web UI, where a
+// framed page could trick a signed-in user into clicking Delete.
+const frameAncestorsNone = "frame-ancestors 'none'"
+
+func denyFraming(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", frameAncestorsNone)
 		next.ServeHTTP(w, r)
 	})
 }

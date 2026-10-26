@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/git-pkgs/proxy/internal/config"
+	"github.com/git-pkgs/proxy/internal/retention"
 )
 
 const (
@@ -27,6 +28,10 @@ const (
 // asset to one release, so these downloads are cached in the artifact cache
 // and served without revalidation once fetched.
 var githubReleaseAssetPattern = regexp.MustCompile(`^([^/]+)/([^/]+)/releases/download/([^/]+)/([^/]+)$`)
+
+func init() {
+	retention.Default.Register(retention.Spec{Key: genericEcosystem, CanonicalPackage: retention.DefaultCanonical(genericEcosystem)})
+}
 
 // builtinGenericArtifacts maps well-known download hosts to patterns for
 // their version-pinned paths. They apply to any generic upstream configured
@@ -66,6 +71,9 @@ type GenericHandler struct {
 	proxy            *Proxy
 	repositories     map[string]string
 	artifactPatterns map[string][]*regexp.Regexp
+	// paths holds each upstream's upstream.generic_paths patterns; an
+	// upstream without any serves every path.
+	paths map[string][]string
 }
 
 // NewGenericHandler creates a generic HTTP download proxy handler.
@@ -89,6 +97,13 @@ func NewGenericHandler(proxy *Proxy, repositories map[string]string, artifactPat
 	for name, upstreamURL := range h.repositories {
 		h.addArtifactPatterns(name, builtinGenericArtifacts[upstreamURL])
 	}
+	return h
+}
+
+// WithPaths limits upstreams to the paths their upstream.generic_paths
+// patterns match. Any other path answers 404.
+func (h *GenericHandler) WithPaths(paths map[string][]string) *GenericHandler {
+	h.paths = paths
 	return h
 }
 
@@ -121,8 +136,12 @@ func (h *GenericHandler) Routes() http.Handler {
 		}
 
 		repository, rest, ok := strings.Cut(path, "/")
+		if repository == HostedGenericRepository && h.proxy.HostedEnabled {
+			h.handleHosted(w, r, rest)
+			return
+		}
 		upstreamURL, found := h.repositories[repository]
-		if !ok || rest == "" || !found {
+		if !ok || rest == "" || !found || !config.GenericPathAllowed(h.paths[repository], rest) {
 			http.NotFound(w, r)
 			return
 		}
@@ -135,6 +154,38 @@ func (h *GenericHandler) Routes() http.Handler {
 		h.handleMetadata(w, r, repository, upstreamURL, rest)
 	})
 }
+
+// HostedGenericRepository is the /generic/{name}/ path that serves pushed
+// generic files instead of an upstream while hosted packages are enabled.
+const HostedGenericRepository = config.HostedGenericRepository
+
+// handleHosted serves a pushed file at {name}/{version}/{file}. Pushed files
+// never come from an upstream, so anything not pushed is a 404.
+func (h *GenericHandler) handleHosted(w http.ResponseWriter, r *http.Request, path string) {
+	segments := strings.Split(path, "/")
+	if len(segments) != hostedGenericPathSegments {
+		http.NotFound(w, r)
+		return
+	}
+	target, err := HostedTargetFor(genericEcosystem, segments[0], segments[1], segments[2])
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	result, err := h.proxy.GetLocalArtifact(r.Context(), genericEcosystem, target.Name, target.Version, target.Filename)
+	if err != nil {
+		h.proxy.serveArtifactError(w, err, "failed to read pushed file")
+		return
+	}
+	if result == nil {
+		http.NotFound(w, r)
+		return
+	}
+	serveGenericArtifact(w, r, result)
+}
+
+// hostedGenericPathSegments is {name}/{version}/{file}.
+const hostedGenericPathSegments = 3
 
 // genericArtifact is the identity of a version-pinned download.
 type genericArtifact struct {
@@ -229,7 +280,12 @@ func (h *GenericHandler) handleArtifact(w http.ResponseWriter, r *http.Request, 
 		h.proxy.serveArtifactError(w, err, "failed to fetch artifact")
 		return
 	}
+	serveGenericArtifact(w, r, result)
+}
 
+// serveGenericArtifact serves a cached or pushed file, as a plain download
+// when its media type is unknown.
+func serveGenericArtifact(w http.ResponseWriter, r *http.Request, result *CacheResult) {
 	if result.Artifact.MediaType == "" {
 		result.Artifact.MediaType = "application/octet-stream"
 	}

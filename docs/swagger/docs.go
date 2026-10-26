@@ -115,6 +115,73 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/cache/{ecosystem}/{name}/{version}": {
+            "delete": {
+                "description": "Removes the cached files of name@version, or only the one named by filename, so the next request fetches them from the upstream again. Pushed archives are not touched; delete those through /api/hosted.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cache"
+                ],
+                "summary": "Delete cached artifacts",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Ecosystem",
+                        "name": "ecosystem",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Package name as shown in the UI, e.g. com.google.guava:guava for Maven",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Version",
+                        "name": "version",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Delete only this file",
+                        "name": "filename",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/server.CacheDeleteResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/server.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/server.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/server.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/hosted/{ecosystem}/{name}": {
             "get": {
                 "produces": [
@@ -163,7 +230,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Stores the request body as the archive for name@version. It is served in place of the upstream archive with the same version and is never evicted.",
+                "description": "Stores the request body as the archive for name@version. It is served in place of the upstream archive with the same version and is never evicted. Generic files are pushed to /api/hosted/generic/{name}/{version}/{file} and served at /generic/hosted/{name}/{version}/{file}. A file that was already pushed is refused with 409; delete it first to push it again.",
                 "consumes": [
                     "application/octet-stream"
                 ],
@@ -177,7 +244,7 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Ecosystem (npm or composer)",
+                        "description": "Ecosystem (npm, composer or generic)",
                         "name": "ecosystem",
                         "in": "path",
                         "required": true
@@ -195,6 +262,12 @@ const docTemplate = `{
                         "name": "version",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Expected sha256 of the body, hex-encoded; a mismatch is refused",
+                        "name": "sha256",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -222,6 +295,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/server.ErrorResponse"
                         }
                     },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/server.ErrorResponse"
+                        }
+                    },
                     "413": {
                         "description": "Request Entity Too Large",
                         "schema": {
@@ -236,7 +315,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Removes the archives pushed for name@version. If the upstream has the version, clients get the upstream archive again.",
+                "description": "Removes the archives pushed for name@version. If the upstream has the version, clients get the upstream archive again. For generic files, /api/hosted/generic/{name}/{version}/{file} removes only that file.",
                 "tags": [
                     "hosted"
                 ],
@@ -750,6 +829,20 @@ const docTemplate = `{
                     "additionalProperties": {
                         "$ref": "#/definitions/server.PackageResponse"
                     }
+                }
+            }
+        },
+        "server.CacheDeleteResponse": {
+            "type": "object",
+            "properties": {
+                "deleted": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "purl": {
+                    "type": "string"
                 }
             }
         },

@@ -14,6 +14,19 @@ base_url: "http://localhost:8080"
 # Set to "0" to disable the timeout. Default: "30s".
 # http_timeout: "30s"
 
+# Response write deadline, including download and scan time before sending data.
+# Set to "0" to disable. Default: "5m".
+# write_timeout: "5m"
+
+# Timeout for each upstream artifact download while serving requests; excludes
+# scanning. Set to "0" to disable. Default: "5m". Does not limit proxy mirror.
+# artifact_timeout: "5m"
+
+# Register DELETE /api/cache and show Delete buttons on the UI's version page,
+# for removing cached artifacts so they are fetched again. Has no
+# authentication: restrict /api/cache and /ui at the ingress first.
+# cache_delete: false
+
 # Largest upstream artifact to fetch (e.g. "2GB"). Larger ones are refused
 # and not cached. Default: unlimited.
 # artifact_max_size: ""
@@ -91,19 +104,24 @@ storage:
   # The default only applies to ecosystems that support retention; naming an
   # ecosystem or package that does not is a configuration error. See
   # docs/configuration.md for the supported ecosystems.
+  # Generic downloads require an explicit ecosystem or package rule;
+  # they never inherit default, since an upstream release may disappear.
   retention:
     default: ""
     # ecosystems:
     #   npm: "30d"
+    #   generic: "30d"
     # packages:
     #   "pkg:npm/lodash": "0"
+    #   "pkg:generic/owner%2Frepo": "90d"
     # How often to look for expired artifacts; at least "1m".
     sweep_interval: "10m"
 
   # Store fetched artifacts. Set to false to stream every download from
   # upstream without storing it; metadata filtering, cooldown and the
   # denylist still apply. Useful when another cache sits in front of the
-  # proxy. false is incompatible with direct_serve, scanning and mirror_api.
+  # proxy. false is incompatible with direct_serve, scanning, mirror_api and
+  # mirror.schedules.
   cache_artifacts: true
 
   # Redirect cached artifact downloads to presigned storage URLs (HTTP 302)
@@ -201,6 +219,12 @@ upstream:
   # Maven repository URL (used by /maven endpoint)
   maven: "https://repo1.maven.org/maven2"
 
+  # Additional Maven repositories, served at /maven/{name}/. A name must not
+  # be the start of a group ID (such as "org" or "tools"), since it would hide
+  # those groups in the default repository.
+  # maven_repositories:
+  #   grails: "https://repo.grails.org/grails/restricted"
+
   # Gradle Plugin Portal Maven URL (fallback for plugin marker artifacts)
   gradle_plugin_portal: "https://plugins.gradle.org/m2"
 
@@ -223,6 +247,10 @@ upstream:
 
   # Conan registry URL
   conan: "https://center.conan.io"
+
+  # Chef Supermarket URL (used by /chef/). Point it at a private
+  # Supermarket to proxy that instead.
+  chef: "https://supermarket.chef.io"
 
   # Conda channel base URL
   conda: "https://conda.anaconda.org"
@@ -287,6 +315,14 @@ upstream:
   #   archlinux: "https://geo.mirror.pkgbuild.com"
   #   archlinuxarm: "https://<region>.mirror.archlinuxarm.org"
 
+  # Named FreeBSD pkg mirrors (used by /freebsd/{name}/), for ports and
+  # pkgbase repositories alike.
+  # Defaults to {"freebsd": "https://pkg.freebsd.org"} when empty;
+  # configuring any entry replaces that default.
+  # freebsd:
+  #   freebsd: "https://pkg.freebsd.org"
+  #   poudriere: "https://packages.example.com"
+
   # Named generic HTTP upstreams (used by /generic/{name}/). The remaining
   # request path and query are appended to the upstream URL. GitHub release
   # assets ({owner}/{repo}/releases/download/{tag}/{asset}) are cached
@@ -296,6 +332,18 @@ upstream:
   #   github-api: "https://api.github.com"
   #   apache: "https://archive.apache.org"
 
+  # Paths a generic upstream may serve, as path.Match patterns for the path
+  # after /generic/{name}/; a pattern ending in /** also matches everything
+  # nested below its prefix. Other paths answer 404. Required for an upstream
+  # that upstream.auth has credentials for, such as a GitHub token for
+  # api.github.com; use a fine-grained token with read-only access to public
+  # repositories.
+  # generic_paths:
+  #   github-api:
+  #     - "repos/*/*/releases"
+  #     - "repos/*/*/releases/**"
+  #     - "repos/*/*/tags"
+
   # Version-pinned paths of generic upstreams, cached immutably like GitHub
   # release assets. Each pattern must match the whole path after
   # /generic/{name}/ and have `version` and `file` named groups; an optional
@@ -303,6 +351,15 @@ upstream:
   # generic_artifacts:
   #   apache:
   #     - 'dist/(?P<name>maven)/maven-3/(?P<version>[^/]+)/binaries/(?P<file>[^/]+)'
+
+  # Named Git servers (used by /git/{name}/{repo}), served read-only from
+  # cached bare repositories. repos limits which repositories may be served
+  # and is required when upstream.auth has credentials for the server.
+  # git:
+  #   github: "https://github.com"
+  #   wikimedia:
+  #     url: "https://gerrit.wikimedia.org/r"
+  #     repos: ["mediawiki/**"]
 
   # Authentication for upstream registries
   # Keys are absolute URL scopes. Scheme, host, effective port, and path
@@ -344,11 +401,20 @@ upstream:
     # "https://123456789012.dkr.ecr.eu-west-1.amazonaws.com":
     #   type: ecr
 
+# Git repository cache, used when upstream.git is set
+# git:
+#   cache_dir: ./cache/git   # local disk, used by this process only
+#   max_size: ""             # evict least recently used repositories past this
+#   max_repo_size: 5GB       # refuse a repository that grows past this
+#   refresh_wait: 5s         # then serve the cached copy if the upstream check is slow
+#   stale_max_age: 24h       # never serve a copy not checked for this long
+
 # Gradle HttpBuildCache configuration
 gradle:
   build_cache:
-    # Set to true to disable PUT uploads (read-only cache mode)
-    read_only: false
+    # PUT uploads are rejected by default; set to false on the instance
+    # your CI jobs upload to
+    read_only: true
 
     # Maximum accepted Gradle cache upload body size
     # Required and must be > 0
@@ -375,6 +441,14 @@ gradle:
 #   # about them, so nobody can mix in versions by publishing the same name.
 #   npm_scopes: ["@acme"]
 #   composer_vendors: ["acme"]
+
+# Re-mirror container image tags on a schedule, so a moved tag is picked up
+# even when nobody pulls it. An unchanged tag costs one HEAD request.
+# mirror:
+#   schedules:
+#     - images: ["pkg:docker/library/alpine@3.20", "pkg:docker/library/nginx@stable"]
+#       interval: "6h"
+#       platforms: ["linux/amd64"]
 
 # Health endpoint configuration.
 health:

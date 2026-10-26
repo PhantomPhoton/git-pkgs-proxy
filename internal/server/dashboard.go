@@ -80,6 +80,9 @@ type VersionShowData struct {
 	IsOutdated        bool
 	LicenseCategory   string
 	HasCachedArtifact bool
+	// HasDeletableArtifact is true when a stored artifact was fetched from
+	// the upstream rather than pushed.
+	HasDeletableArtifact bool
 }
 
 // SearchPageData contains data for rendering the search results page.
@@ -136,11 +139,13 @@ func supportedEcosystems() []string {
 		"alpine",
 		"arch",
 		"cargo",
+		"chef",
 		"composer",
 		"conan",
 		"conda",
 		"cran",
 		"deb",
+		"freebsd",
 		"gem",
 		"golang",
 		"hex",
@@ -189,6 +194,8 @@ func ecosystemColorClasses(ecosystem string) string {
 		return "bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300"
 	case "conan":
 		return "bg-teal-100 text-teal-700 dark:bg-teal-900/50 dark:text-teal-300"
+	case "chef":
+		return "bg-rose-100 text-rose-700 dark:bg-rose-900/50 dark:text-rose-300"
 	case "conda":
 		return "bg-green-100 text-green-700 dark:bg-green-900/50 dark:text-green-300"
 	case "cran":
@@ -207,6 +214,8 @@ func ecosystemColorClasses(ecosystem string) string {
 		return "bg-lime-100 text-lime-800 dark:bg-lime-900/50 dark:text-lime-300"
 	case "arch":
 		return "bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-300"
+	case "freebsd":
+		return "bg-red-200 text-red-900 dark:bg-red-950/60 dark:text-red-200"
 	default:
 		return "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"
 	}
@@ -359,13 +368,14 @@ index-url = ` + baseURL + `/pypi/simple/</code></pre>`),
 			Language: "Java/Kotlin",
 			Endpoint: "/gradle/",
 			Instructions: template.HTML(`<p class="config-note">Configure Gradle to use the proxy for HttpBuildCache:</p>
-<pre><code>// In settings.gradle(.kts)
+<pre><code>// In settings.gradle.kts
 buildCache {
   remote&lt;HttpBuildCache&gt; {
     url = uri("` + baseURL + `/gradle/")
-    push = true
+    isPush = System.getenv("CI") != null
   }
-}</code></pre>`),
+}</code></pre>
+<p class="config-note">Uploads need <code>gradle.build_cache.read_only: false</code> on the proxy.</p>`),
 		},
 		{
 			ID:       "nuget",
@@ -411,6 +421,16 @@ composer config -g repositories.proxy composer ` + baseURL + `/composer</code></
 			Instructions: template.HTML(`<p class="config-note">Configure Conan to use the proxy:</p>
 <pre><code>conan remote add proxy ` + baseURL + `/conan
 conan remote disable conancenter</code></pre>`),
+		},
+		{
+			ID:       "chef",
+			Name:     "Chef Supermarket",
+			Language: "Chef",
+			Endpoint: "/chef/",
+			Instructions: template.HTML(`<p class="config-note">Point Berkshelf at the proxy in your <code>Berksfile</code>:</p>
+<pre><code>source "` + baseURL + `/chef"</code></pre>
+<p class="config-note">Or in a Policyfile:</p>
+<pre><code>default_source :supermarket, "` + baseURL + `/chef"</code></pre>`),
 		},
 		{
 			ID:       "conda",
@@ -536,5 +556,25 @@ Server = ` + baseURL + `/arch/archlinux/$repo/os/$arch
 # Then run:
 pacman -Syu</code></pre>`),
 		},
+		freebsdRegistryConfig(baseURL),
+	}
+}
+
+// freebsdRegistryConfig describes the FreeBSD pkg endpoint for the dashboard.
+func freebsdRegistryConfig(baseURL string) RegistryConfig {
+	return RegistryConfig{
+		ID:       "freebsd",
+		Name:     "FreeBSD pkg",
+		Language: "FreeBSD",
+		Endpoint: "/freebsd/",
+		Instructions: template.HTML(`<p class="config-note">Configure pkg to use the proxy. On FreeBSD 15, do the same for FreeBSD-ports-kmods and FreeBSD-base, keeping their paths; FreeBSD 14 calls the ports repository FreeBSD.</p>
+<pre><code># /usr/local/etc/pkg/repos/FreeBSD.conf
+FreeBSD-ports: {
+  url: "` + baseURL + `/freebsd/freebsd/${ABI}/quarterly",
+  mirror_type: "none"
+}
+
+# Then run:
+pkg update</code></pre>`),
 	}
 }

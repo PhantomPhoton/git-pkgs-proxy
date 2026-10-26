@@ -162,48 +162,10 @@ func (h *ConanHandler) shouldCacheFile(filename string) bool {
 
 // proxyCached forwards a request with metadata caching.
 func (h *ConanHandler) proxyCached(w http.ResponseWriter, r *http.Request) {
-	cacheKey := strings.TrimPrefix(r.URL.Path, "/")
-	cacheKey = strings.ReplaceAll(cacheKey, "/", "_")
-	if r.URL.RawQuery != "" {
-		cacheKey += "_" + r.URL.RawQuery
-	}
+	cacheKey := hashedCacheKey(h.upstreamURL, r.URL.Path, r.URL.RawQuery)
 	upstreamURL := h.upstreamURL + r.URL.Path
 	if r.URL.RawQuery != "" {
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 	h.proxy.ProxyCached(w, r, upstreamURL, "conan", cacheKey, "*/*")
-}
-
-// proxyUpstream forwards a request to conan center without caching.
-func (h *ConanHandler) proxyUpstream(w http.ResponseWriter, r *http.Request) {
-	upstreamURL := h.upstreamURL + r.URL.Path
-	if r.URL.RawQuery != "" {
-		upstreamURL += "?" + r.URL.RawQuery
-	}
-
-	h.proxy.Logger.Debug("proxying to upstream", "url", upstreamURL)
-
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
-	if err != nil {
-		http.Error(w, "failed to create request", http.StatusInternalServerError)
-		return
-	}
-
-	// Copy authorization header for authenticated requests
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
-
-	resp, err := h.proxy.HTTPClient.Do(req)
-	if err != nil {
-		if writeUpstreamHeld(w, err) {
-			return
-		}
-		h.proxy.Logger.Error("upstream request failed", "error", err)
-		http.Error(w, "upstream request failed", http.StatusBadGateway)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	h.proxy.relayResponse(w, r, resp, nil)
 }

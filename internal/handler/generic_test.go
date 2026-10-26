@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -12,10 +13,28 @@ import (
 
 	"github.com/git-pkgs/proxy/internal/config"
 	upstreamhttp "github.com/git-pkgs/proxy/internal/httpclient"
+	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/registries/fetch"
 )
 
 const testReleaseAssetPath = "/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64"
+
+func TestGenericRetentionConfig(t *testing.T) {
+	cfg := config.Default()
+	cfg.Storage.Retention.Ecosystems = map[string]string{"generic": "30d"}
+	cfg.Storage.Retention.Packages = map[string]string{"pkg:generic/jqlang%2Fjq": "90d"}
+
+	rules, err := cfg.RetentionRules(retention.Default)
+	if err != nil {
+		t.Fatalf("RetentionRules() error = %v", err)
+	}
+	if got := rules.For(genericEcosystem, "pkg:generic/jqlang%2Fjq"); got != 90*24*time.Hour {
+		t.Errorf("jqlang/jq retention = %v, want 90d", got)
+	}
+	if got := rules.For(genericEcosystem, "pkg:generic/other%2Frepo"); got != 30*24*time.Hour {
+		t.Errorf("generic ecosystem retention = %v, want 30d", got)
+	}
+}
 
 func TestParseGitHubReleaseAsset(t *testing.T) {
 	tests := []struct {
@@ -294,6 +313,7 @@ func TestGenericHandler_RejectsUnknownUpstreamAndBadPaths(t *testing.T) {
 		{"traversal", http.MethodGet, "/github/../etc/passwd", http.StatusBadRequest},
 		{"encoded traversal", http.MethodGet, "/github/%2e%2e/etc/passwd", http.StatusBadRequest},
 		{"post", http.MethodPost, "/github/owner/repo/releases/download/v1/asset", http.StatusMethodNotAllowed},
+		{"hosted files with hosting off", http.MethodGet, "/hosted/tools/1.2.0/tool.tar.gz", http.StatusNotFound},
 	}
 
 	for _, tt := range tests {
@@ -328,7 +348,7 @@ func TestGenericHandler_ReleaseAssetIsCachedAndServedWhenUpstreamDown(t *testing
 	}))
 	defer upstream.Close()
 
-	proxy, _, store, _ := setupTestProxy(t)
+	proxy, db, store, _ := setupTestProxy(t)
 	store.seekable = true
 	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(upstream.Client()), fetch.WithMaxRetries(0))
 	proxy.Fetcher = fetcher
@@ -345,6 +365,13 @@ func TestGenericHandler_ReleaseAssetIsCachedAndServedWhenUpstreamDown(t *testing
 	}
 	if got := upstreamRequests.Load(); got != 1 {
 		t.Fatalf("upstream requests = %d, want 1", got)
+	}
+	pkg, err := db.GetPackageByEcosystemName(genericEcosystem, "jqlang/jq")
+	if err != nil || pkg == nil {
+		t.Fatalf("release package = %v, %v; want a cached package", pkg, err)
+	}
+	if pkg.PURL != "pkg:generic/jqlang%2Fjq" {
+		t.Errorf("release package PURL = %q, want pkg:generic/jqlang%%2Fjq", pkg.PURL)
 	}
 
 	// Second request must be served from cache, even with the upstream down.
@@ -602,4 +629,64 @@ func serveGenericRequest(h *GenericHandler, target string) *httptest.ResponseRec
 	w := httptest.NewRecorder()
 	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
 	return w
+}
+
+func TestGenericHandler_UpstreamNamedHostedWhileHostingIsOff(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "from upstream "+r.URL.Path)
+	}))
+	t.Cleanup(upstream.Close)
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	h := NewGenericHandler(proxy, map[string]string{"hosted": upstream.URL})
+
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/hosted/index.json", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "from upstream /index.json" {
+		t.Errorf("status = %d, body %q, want the upstream response", w.Code, w.Body)
+	}
+}
+
+func TestGenericHandler_ServesOnlyConfiguredPaths(t *testing.T) {
+	var requested []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.RequestURI())
+		_, _ = io.WriteString(w, "from upstream "+r.URL.Path)
+	}))
+	t.Cleanup(upstream.Close)
+	proxy, _, _, _ := setupTestProxy(t)
+	proxy.HTTPClient = upstream.Client()
+	fetcher := fetch.NewFetcher(fetch.WithHTTPClient(upstream.Client()), fetch.WithMaxRetries(0))
+	proxy.Fetcher = fetcher
+	t.Cleanup(func() { _ = fetcher.Close() })
+
+	h := NewGenericHandler(proxy, map[string]string{"github-api": upstream.URL, "open": upstream.URL}).
+		WithPaths(map[string][]string{"github-api": {"repos/*/*/releases/**", "rate_limit"}})
+
+	for _, target := range []string{
+		"/github-api/repos/jqlang/jq/releases/tags/jq-1.7.1",
+		"/github-api/rate_limit",
+		"/open/user/repos",
+	} {
+		if w := serveGenericRequest(h, target); w.Code != http.StatusOK {
+			t.Errorf("GET %s: status = %d, want 200: %s", target, w.Code, w.Body.String())
+		}
+	}
+
+	served := len(requested)
+	for _, target := range []string{
+		"/github-api/user/repos",
+		"/github-api/repos/acme/private/contents/secret.txt",
+		"/github-api/repos/jqlang/jq/releases",
+		"/github-api/repos/jqlang/jq%3F/releases/x",
+		"/github-api/repos/jqlang/jq/releases/%2575ser",
+		"/github-api/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
+	} {
+		if w := serveGenericRequest(h, target); w.Code != http.StatusNotFound {
+			t.Errorf("GET %s: status = %d, want 404", target, w.Code)
+		}
+	}
+	if len(requested) != served {
+		t.Errorf("upstream saw %v for paths outside generic_paths", requested[served:])
+	}
 }

@@ -26,6 +26,22 @@ func TestImageRefFromPURL(t *testing.T) {
 			wantRef: handler.ImageRef{Name: "library/alpine", References: []string{"3.20"}},
 		},
 		{
+			purl:    "pkg:docker/ghcr.io/team/app@1.0",
+			wantRef: handler.ImageRef{Registry: "ghcr.io", Name: "team/app", References: []string{"1.0"}},
+		},
+		{
+			purl:    "pkg:docker/registry.example:5000/team/app@" + digest,
+			wantRef: handler.ImageRef{Registry: "registry.example:5000", Name: "team/app", References: []string{digest}},
+		},
+		{
+			purl:    "pkg:docker/localhost/app@1.0",
+			wantRef: handler.ImageRef{Registry: "localhost", Name: "app", References: []string{"1.0"}},
+		},
+		{
+			purl:    "pkg:docker/localhost:5000/team/app@1.0",
+			wantRef: handler.ImageRef{Registry: "localhost:5000", Name: "team/app", References: []string{"1.0"}},
+		},
+		{
 			purl:          "pkg:docker/alpine@3.20?repository_url=ghcr.io",
 			platforms:     []string{"linux/arm64/v8"},
 			wantRef:       handler.ImageRef{Registry: "ghcr.io", Name: "alpine", References: []string{"3.20"}},

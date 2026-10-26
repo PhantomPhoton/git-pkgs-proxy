@@ -47,11 +47,11 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | npm | JavaScript | Yes | ✓ |
 | Cargo | Rust | Yes | ✓ |
 | RubyGems | Ruby | Yes | ✓ |
-| Go proxy | Go | | ✓ |
+| Go proxy | Go | Yes† | ✓ |
 | Hex | Elixir | Yes* | ✓ |
 | pub.dev | Dart | Yes | ✓ |
 | PyPI | Python | Yes | ✓ |
-| Maven | Java | | ✓ |
+| Maven | Java | Yes‡ | ✓ |
 | Gradle Build Cache | Java/Kotlin | | ✓ |
 | NuGet | .NET | Yes | ✓ |
 | Composer | PHP | Yes | ✓ |
@@ -66,14 +66,20 @@ The proxy never uploads artifact bytes to a scanner. Each scanner is notified wi
 | RPM | RHEL/Fedora | | ✓ |
 | Alpine | Alpine Linux | | ✓ |
 | Arch | Arch Linux | | ✓ |
-| Chef | Chef | | ✗ |
+| FreeBSD | FreeBSD (ports and pkgbase) | | ✓ |
+| Chef Supermarket | Chef | | ✓ |
 | Generic | Any | | ✓ |
+| Git | Any | | ✓ |
 | Helm | Kubernetes | Yes | ✓ |
 | Vagrant | Vagrant | | ✗ |
 
 Cooldown requires publish timestamps in metadata. Registries without a "Yes" in the cooldown column either don't expose timestamps or haven't been wired up yet.
 
 \* Hex cooldown requires disabling registry signature verification (`HEX_NO_VERIFY_REPO_ORIGIN=1`) since the proxy re-encodes the protobuf payload.
+
+† Go cooldown uses the time in each version's `.info`, which is the commit time of the tagged revision, not when the tag was pushed.
+
+‡ Maven cooldown uses the `Last-Modified` header of each version's `.pom`. On Maven Central that is the deploy time; a Nexus or Artifactory upstream may report when it cached the file instead. SNAPSHOT versions are not held back.
 
 ## Install
 
@@ -290,6 +296,8 @@ Add to your `~/.m2/settings.xml`:
 
 The `/maven/` endpoint uses Maven Central as primary upstream and falls back to the Gradle Plugin Portal for Gradle plugin marker metadata and related artifacts when the primary upstream returns not found.
 
+Further Maven repositories can be configured under `upstream.maven_repositories` and are served at `/maven/{name}/`, each from its own upstream (see [Maven repositories](docs/configuration.md#maven-repositories)). Point a second `<repository>` or Gradle `maven(url = ...)` entry at `http://localhost:8080/maven/{name}/`.
+
 For Gradle plugin resolution via the same proxy endpoint:
 
 ```kotlin
@@ -302,7 +310,7 @@ pluginManagement {
 
 ### Gradle HTTP Build Cache
 
-Configure in `settings.gradle(.kts)`:
+Configure in `settings.gradle.kts`:
 
 ```kotlin
 buildCache {
@@ -311,10 +319,12 @@ buildCache {
   }
   remote<HttpBuildCache> {
     url = uri("http://localhost:8080/gradle/")
-    push = true
+    isPush = System.getenv("CI") != null
   }
 }
 ```
+
+The proxy rejects uploads unless `gradle.build_cache.read_only` is set to `false`, see [docs/configuration.md](docs/configuration.md#gradle-build-cache).
 
 ### NuGet
 
@@ -369,6 +379,24 @@ conan remote disable conancenter
 
 Or configure in `~/.conan2/remotes.json`.
 
+### Chef Supermarket (Berkshelf, Policyfiles)
+
+Point Berkshelf at the proxy in your `Berksfile`:
+
+```ruby
+source "http://localhost:8080/chef"
+```
+
+Or set the default source of a Policyfile:
+
+```ruby
+default_source :supermarket, "http://localhost:8080/chef"
+```
+
+The proxy serves the `/universe` dependency index and the cookbook API, rewriting every download location to itself while leaving dependency constraints unchanged. Cookbook archives are fetched through the Supermarket download redirect and cached, so they stay available when the Supermarket is down. With `cache_metadata` on, the universe and cookbook metadata follow the usual TTL and stale fallback.
+
+To proxy a private Supermarket instead of `supermarket.chef.io`, set `upstream.chef` (or `PROXY_UPSTREAM_CHEF`) and add credentials under `upstream.auth` if it needs them. See [docs/configuration.md](docs/configuration.md#upstream-registries).
+
 ### Conda
 
 Configure in `~/.condarc`:
@@ -386,6 +414,8 @@ Or set via command:
 ```bash
 conda config --add channels http://localhost:8080/conda/main
 ```
+
+pixi and other rattler-based clients use sharded repodata ([CEP 16](https://github.com/conda/ceps/blob/main/cep-0016.md)) where a channel offers it, as conda-forge does. Point them at the same channel URLs, for example `pixi init -c http://localhost:8080/conda/conda-forge`. The shard index and shards are cached as metadata when `cache_metadata` is on.
 
 ### CRAN (R)
 
@@ -754,6 +784,62 @@ Avoid `mirror.archlinuxarm.org` as the upstream. It redirects each request to a
 changing regional mirror over plain HTTP, so the database and the packages can come
 from mirrors with a different sync state.
 
+### FreeBSD / pkg
+
+Override the repositories in `/usr/local/etc/pkg/repos/FreeBSD.conf`. Settings
+there are merged with `/etc/pkg/FreeBSD.conf`, so only the URL and mirror type
+change and the signature settings stay. The default repository name `freebsd`
+proxies the official mirror (`https://pkg.freebsd.org`). On FreeBSD 15:
+
+```
+FreeBSD-ports: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/quarterly",
+  mirror_type: "none"
+}
+FreeBSD-ports-kmods: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/kmods_quarterly_${VERSION_MINOR}",
+  mirror_type: "none"
+}
+FreeBSD-base: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/base_release_${VERSION_MINOR}",
+  mirror_type: "none"
+}
+```
+
+FreeBSD 14 has a single repository called `FreeBSD`:
+
+```
+FreeBSD: {
+  url: "http://localhost:8080/freebsd/freebsd/${ABI}/quarterly",
+  mirror_type: "none"
+}
+```
+
+Then:
+
+```bash
+pkg update
+```
+
+Keep the path after `${ABI}` that `pkg -vv` shows for each repository
+(`quarterly`, `latest`, `base_latest`, ...) and replace only the host part.
+
+The repository catalogues (`meta.conf`, `packagesite.pkg`, `data.pkg`) carry
+their signature inside the archive and are served byte-for-byte unchanged
+through the metadata cache (`metadata_ttl`, stale fallback). Enable
+`cache_metadata` so `pkg update` keeps working while the upstream is down.
+Packages under `Hashed/` have their content hash in the file name, so they are
+stored in the shared artifact cache as `pkg:bsd/freebsd/{name}@{version}` and
+remain available when the upstream is unreachable.
+
+Other files are passed through uncached. That includes the bootstrap package
+under `Latest/`, whose signature file is rewritten with every repository build,
+and package files without a hash in their name, which can be rebuilt under the
+same name. The denylist still applies to unhashed package files. Since only
+cached artifacts can be scanned, both kinds of package file are refused while
+a scanner covers `freebsd`; use repositories built with `pkg repo --hash` and
+bootstrap pkg without the proxy.
+
 ### GitHub Releases / mise (aqua backend)
 
 Configure named generic upstreams:
@@ -777,8 +863,26 @@ Release assets are cached permanently after the first download and keep
 installing while GitHub is down. Tag lookups through `api.github.com` are
 cached for `metadata_ttl` and served stale during an outage or rate limit.
 Commit a `mise.lock` and install with `mise install --locked` so pinned
-installs need no API call at all. Add a bearer token for `https://api.github.com`
-under `upstream.auth` if the fleet exceeds GitHub's anonymous rate limit.
+installs need no API call at all.
+
+If the fleet exceeds GitHub's anonymous rate limit, add a bearer token for
+`https://api.github.com` under `upstream.auth`. Everyone who can reach the
+proxy can then make requests with that token, so the proxy requires
+`generic_paths` listing the API paths it may serve, and the token should be a
+fine-grained one with read-only access to public repositories:
+
+```yaml
+upstream:
+  generic_paths:
+    github-api:
+      - "repos/*/*/releases"
+      - "repos/*/*/releases/**"
+      - "repos/*/*/tags"
+  auth:
+    "https://api.github.com":
+      type: bearer
+      token: "${GITHUB_TOKEN}"
+```
 
 Maven, mvnd, Node and Go downloads are cached the same way once their hosts
 are configured as generic upstreams; their version-pinned paths are built in
@@ -803,6 +907,28 @@ go.download_mirror = "http://localhost:8080/generic/golang"
 
 Other download hosts need their version-pinned paths declared in
 `upstream.generic_artifacts`.
+
+### Git repositories
+
+Configure named Git servers:
+
+```yaml
+upstream:
+  git:
+    github: "https://github.com"
+```
+
+Then point clones at the proxy:
+
+```bash
+git config --global url."http://localhost:8080/git/github/".insteadOf https://github.com/
+```
+
+Each repository is cached as a bare clone and refreshed whenever its branches
+or tags change upstream. Git LFS objects are cached in the artifact cache;
+git-lfs uses the proxy for them with no further setup. See [configuration](docs/configuration.md#git-repositories)
+for setting the rewrite through environment variables, size limits, private
+repositories and outage behavior.
 
 ## Configuration
 
@@ -855,7 +981,7 @@ storage:
   url: "file:///var/cache/proxy/artifacts"
   max_size: "10GB"  # Optional: evict LRU when exceeded
   retention:
-    default: "30d"  # Optional: evict artifacts not downloaded for 30 days
+    default: "30d"  # Optional: evict unused artifacts after 30 days; excludes generic
 
 database:
   driver: "sqlite"
@@ -1010,7 +1136,9 @@ proxy mirror --concurrency 8 pkg:npm/lodash@4.17.21
 proxy mirror --platform linux/amd64 pkg:docker/library/alpine@3.20
 ```
 
-The mirror command accepts the same storage and database flags as `serve`. Already-cached artifacts are skipped.
+The mirror command accepts the same storage and database flags as `serve`. Already-cached artifacts are skipped. If any package version fails to mirror, the command lists the errors and exits with status 1, so a CI step that warms the cache fails on a partial mirror.
+
+With `scanning.enabled`, the mirror command refuses every package and container image so nothing is cached unscanned. Each one is reported as failed, so the command exits with status 1. Scanners fetch the staged bytes from the running server, which this command does not start. Use the mirror API below instead, since its jobs run inside the server and go through the pre-cache scan. `--dry-run` still lists what would be mirrored.
 
 A mirror API is also available when the server is running:
 
@@ -1104,6 +1232,7 @@ Recently cached:
 | `GET /npm/*` | npm registry protocol |
 | `POST /npm/-/npm/v1/security/*` | npm/pnpm/Yarn audit endpoints, passed through to upstream |
 | `GET /npm/-/npm/v1/keys` | npm registry signing keys, passed through to upstream |
+| `GET /npm/-/v1/search`, `GET /npm/-/ping` | `npm search` and `npm ping`, passed through to upstream uncached |
 | `GET /cargo/*` | Cargo sparse index protocol |
 | `GET /gem/*` | RubyGems protocol |
 | `GET /go/*` | Go module proxy protocol |
@@ -1114,6 +1243,7 @@ Recently cached:
 | `GET /nuget/*` | NuGet V3 API |
 | `GET /composer/*` | Composer/Packagist protocol |
 | `GET /conan/*` | Conan C/C++ protocol |
+| `GET /chef/*` | Chef Supermarket protocol (universe, cookbook API and downloads) |
 | `GET /conda/*` | Conda/Anaconda protocol |
 | `GET /cran/*` | CRAN (R) protocol |
 | `GET /julia/*` | Julia Pkg server protocol |
@@ -1124,7 +1254,9 @@ Recently cached:
 | `GET /v2/homebrew/core/*` | Homebrew core bottle manifests and blobs from GHCR |
 | `GET /apk/{repository}/*` | Alpine APK repository protocol |
 | `GET /arch/{repository}/*` | Arch Linux pacman repository protocol |
+| `GET /freebsd/{repository}/*` | FreeBSD pkg repository protocol |
 | `GET /generic/{name}/*` | Generic HTTP download proxy (GitHub release assets, mise/aqua) |
+| `GET /git/{name}/{repo}/info/refs`, `POST /git/{name}/{repo}/git-upload-pack` | Git smart HTTP protocol, read-only |
 | `GET /debian/*` | Debian/APT repository protocol (main archive) |
 | `GET /debian/{repository}/*` | Debian/APT repository protocol (named archive, e.g. security) |
 | `GET /rpm/*` | RPM/Yum repository protocol |
@@ -1146,6 +1278,14 @@ Registered when `hosted.enabled` is set. Pushing and deleting require `Authoriza
 | `PUT /api/hosted/{ecosystem}/{name}/{version}` | Push the request body as the archive for a version (npm and composer) |
 | `GET /api/hosted/{ecosystem}/{name}` | List the archives pushed for a package |
 | `DELETE /api/hosted/{ecosystem}/{name}/{version}` | Delete a pushed version |
+
+### Cache API
+
+Registered when `cache_delete` is set. It has no authentication of its own.
+
+| Endpoint | Description |
+|----------|-------------|
+| `DELETE /api/cache/{ecosystem}/{name}/{version}` | Delete a version's cached files, or only `?filename=` |
 
 ### Enrichment API
 
@@ -1351,11 +1491,16 @@ The proxy exposes Prometheus metrics at `GET /metrics`. All metric names are pre
 |--------|------|--------|-------------|
 | `proxy_requests_total` | counter | `ecosystem`, `status` | Proxy responses by package ecosystem and HTTP status |
 | `proxy_request_duration_seconds` | histogram | `ecosystem`, `status` | Proxy request duration |
-| `proxy_cache_hits_total` | counter | `ecosystem` | Cache hits |
-| `proxy_cache_misses_total` | counter | `ecosystem` | Cache misses |
+| `proxy_cache_hits_total` | counter | `ecosystem`, `kind` | Cache hits. `kind` is `artifact` or `metadata`. |
+| `proxy_cache_misses_total` | counter | `ecosystem`, `kind` | Cache misses. `kind` is `artifact` or `metadata`; metadata misses are counted only while `cache_metadata` is on. |
 | `proxy_cache_size_bytes` | gauge | | Total size of cached artifacts |
 | `proxy_cached_artifacts_total` | gauge | | Number of cached artifacts |
+| `proxy_metadata_cache_served_bytes_total` | counter | `ecosystem` | Metadata bytes served from the metadata cache. |
+| `proxy_metadata_cache_size_bytes` | gauge | `ecosystem` | Size of cached metadata documents per ecosystem. |
+| `proxy_metadata_cache_entries` | gauge | `ecosystem` | Number of cached metadata documents per ecosystem. |
 | `proxy_artifacts_evicted_total` | counter | `reason`, `ecosystem` | Artifacts evicted by the size limit (`lru`) or by age (`retention`) |
+| `proxy_metadata_evicted_total` | counter | `ecosystem` | Cached metadata documents evicted by the size limit |
+| `proxy_fetch_lease_waits_total` | counter | `kind` | Cache misses (`artifact` or `metadata`) that waited for another instance sharing the database to fetch them |
 | `proxy_upstream_fetch_duration_seconds` | histogram | `ecosystem` | Time spent fetching from upstream |
 | `proxy_upstream_errors_total` | counter | `ecosystem`, `error_type` | Upstream fetch failures |
 | `proxy_storage_operation_duration_seconds` | histogram | `operation` | Storage read/write latency |
@@ -1415,11 +1560,17 @@ For history, trends and alerting, scrape `/metrics` with Prometheus. That is the
 
 The same figures are available as JSON from `GET /stats`, which reports `downloaded_bytes`, `downloads` and an `ecosystems` array carrying the per-ecosystem breakdown, served from the same 60-second snapshot the page and the gauges read. When the aggregation fails with no snapshot to fall back on, the response carries `stats_unavailable: true` rather than passing zeros off as a count -- the endpoint keeps answering with the artifact count and cache size either way.
 
+#### Artifact and metadata caches
+
+The proxy keeps two caches. Artifacts (tarballs, wheels, crates and so on) live in storage and are what `proxy_cache_size_bytes`, `proxy_ecosystem_downloaded_bytes` and the other artifact figures describe. Registry metadata is cached separately when `cache_metadata` is on. It is stored persistently in the `metadata_cache` table rather than held in memory.
+
+The `kind` label on `proxy_cache_hits_total` and `proxy_cache_misses_total` keeps the two apart, so an artifact hit rate is `sum(rate(proxy_cache_hits_total{kind="artifact"}[5m]))` over the same expression with misses added. Metadata has its own size and entry gauges plus `proxy_metadata_cache_served_bytes_total`. That one is a process counter rather than a database total, because metadata hits are not recorded per row. On `/ui/analytics` metadata appears in its own card and in the Runtime card's metadata lookups, never mixed into the artifact figures. The card and the two gauges read one 60-second snapshot, like the artifact figures. The bundled Grafana dashboard's hit ratio covers artifacts only, while its hits and misses panel shows each kind as its own series.
+
 #### Three ecosystem label sets
 
 `ecosystem` means three slightly different things across `/metrics`, and queries that join across them need to know which.
 
-**From the package record, normalized.** The six `proxy_ecosystem_*` gauges, `proxy_cache_hits_total`, `proxy_cache_misses_total`, `proxy_artifacts_evicted_total`, `proxy_integrity_failures_total` and the scan metrics. Aliases collapse here: `gem` reads as `rubygems`, `composer` as `packagist`, `go` as `golang`.
+**From the package record, normalized.** The six `proxy_ecosystem_*` gauges, `proxy_cache_hits_total`, `proxy_cache_misses_total`, the three `proxy_metadata_cache_*` metrics, `proxy_artifacts_evicted_total`, `proxy_metadata_evicted_total`, `proxy_integrity_failures_total` and the scan metrics. Aliases collapse here: `gem` reads as `rubygems`, `composer` as `packagist`, `go` as `golang`.
 
 **From the request path.** `proxy_requests_total`, `proxy_request_duration_seconds` and `proxy_response_bytes_total`. The names mostly coincide with the normalized ones -- these also report `rubygems`, `packagist` and `golang` -- but the Debian route reports `debian` where the package record says `deb`, and any path that is not a package endpoint reports `other`, which corresponds to no ecosystem at all.
 
@@ -1480,7 +1631,7 @@ Failing checks include an `"error"` field. Storage failures also include a `"ste
 
 `circuit_breakers` reports the state of each upstream's artifact-fetch circuit breaker (`"open"` or `"closed"`), keyed by upstream host — or by the `hostless-url-<digest>` placeholder described under [Monitoring](#monitoring) where the fetch URL has no host to read. The key is omitted until the proxy has fetched an artifact from at least one upstream, and a host appears only once a breaker has been created for it. Breakers trip after repeated upstream failures and retry the upstream after an exponential backoff. While one is open, artifact downloads for that host return HTTP 502 on a cache miss without contacting the upstream; already-cached artifacts are still served from storage, since the cache is checked before the fetcher. A breaker is reported as `"open"` throughout its backoff, including the half-open window in which it admits one probe request to test recovery. Breaker state is per process and in memory, so a restart clears it, but a restart is not needed for recovery: the backoff keeps retrying for as long as the breaker is open, so it closes on its own once the upstream serves again.
 
-`upstream_holds` lists upstream hosts that answered the proxy with HTTP 429, or 503 with a `Retry-After`, and the time until which the proxy sends them nothing. Every request to a held host, metadata and artifacts alike, fails locally for the duration the upstream asked for (capped at one hour), or for one minute doubling up to fifteen when the upstream gave no `Retry-After`. Cached metadata is served stale during a hold, and anything uncached returns HTTP 503 with the remaining `Retry-After` so a client can pace itself too. Metadata requests do not go through the circuit breaker, so without the hold a rate-limited upstream would keep receiving one request per cache miss, which is exactly the traffic it is asking the proxy to stop sending. The first non-limited response after a hold ends clears it, and `proxy_upstream_rate_limit_holds_total` counts the holds placed. The key is omitted while no host is held.
+`upstream_holds` lists upstream hosts that answered the proxy with HTTP 429, or 503 with a `Retry-After`, and the time until which the proxy sends them nothing. Every request to a held host, metadata and artifacts alike, fails locally for the duration the upstream asked for (capped at one hour), or for one minute doubling up to fifteen when the upstream gave no `Retry-After`. Cached metadata is served stale during a hold, and anything uncached returns HTTP 503 with the remaining `Retry-After` so a client can pace itself too. Metadata requests do not go through the circuit breaker, so without the hold a rate-limited upstream would keep receiving one request per cache miss, which is exactly the traffic it is asking the proxy to stop sending. The first non-limited response after a hold ends clears it, and `proxy_upstream_rate_limit_holds_total` counts the holds placed. Holds are recorded in the database, so instances sharing one honour each other's holds and list them here too. The key is omitted while no host is held.
 
 An open breaker does **not** set `status` to `"error"` or change the HTTP status code: it reports a specific upstream refusing to serve, not this proxy being unfit to receive traffic, and failing the readiness probe over one unhealthy upstream would pull the pod out of rotation for every other ecosystem too. Use `proxy_circuit_breaker_state` for alerting on it.
 
@@ -1532,6 +1683,8 @@ A Dockerfile is included in the repo. Build and run:
 docker build -t proxy .
 docker run -p 8080:8080 -v proxy-data:/data proxy
 ```
+
+With `--read-only`, also pass `--tmpfs /tmp`: the proxy writes some uploads to a temporary file before reading them.
 
 With Postgres and S3:
 
@@ -1620,6 +1773,12 @@ cache/artifacts/
     └── nginx/
         └── 1.24.0-1.fc39/
             └── nginx-1.24.0-1.fc39.x86_64.rpm
+```
+
+To delete one version's cached files, so the next request fetches them again, enable `cache_delete` and use the Delete buttons on the version page in the web UI, or the [cache API](docs/configuration.md#cache-delete-api):
+
+```bash
+curl -X DELETE 'http://localhost:8080/api/cache/maven/com.google.guava:guava/32.1.3-jre?filename=guava-32.1.3-jre.jar'
 ```
 
 Cache metadata is stored in SQLite (default) or PostgreSQL. To clear a local cache:

@@ -49,100 +49,41 @@ type cachedContainerManifest struct {
 	fetchedAt     time.Time
 }
 
-func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request, registryURL, name, reference string) {
+// serveManifest serves a manifest unless the denylist names the digest it
+// resolves to under cacheName, the name blobs are stored under.
+func (h *ContainerHandler) serveManifest(w http.ResponseWriter, r *http.Request, registryURL, name, cacheName, reference string) {
 	accept := containerManifestAccept(r)
-	cacheAccept := normalizeContainerManifestAccept(accept)
-	cached, fromFallback := h.loadContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept)
-
-	immutable := manifestDigestReferencePattern.MatchString(reference)
-	if cached != nil && (immutable || h.containerManifestFresh(cached)) {
-		writeContainerManifest(w, r, cached, false)
+	req := manifestRequest{
+		registryURL: registryURL,
+		name:        name,
+		reference:   reference,
+		accept:      accept,
+		cacheAccept: normalizeContainerManifestAccept(accept),
+		method:      r.Method,
+	}
+	cached, _ := h.loadContainerManifestForAccept(r.Context(), registryURL, name, reference, req.accept, req.cacheAccept)
+	if cached != nil && (req.immutable() || h.containerManifestFresh(cached)) {
+		h.writeManifest(w, r, cacheName, cached, false)
 		return
 	}
 
-	upstreamURL := fmt.Sprintf("%s/v2/%s/manifests/%s", registryURL, name, reference)
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, nil)
-	if err != nil {
-		h.containerError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create request")
-		return
+	outcome := h.coalescedManifest(r.Context(), req)
+	switch {
+	case outcome.manifest != nil:
+		h.writeManifest(w, r, cacheName, outcome.manifest, false)
+	case outcome.relay != nil:
+		outcome.relay.write(h.proxy, w, r)
+	case outcome.digestInvalid:
+		h.containerError(w, http.StatusBadGateway, "DIGEST_INVALID", "manifest digest verification failed")
+	default:
+		h.serveStaleManifestOrError(w, r, cacheName, reference, cached, outcome.err)
 	}
-	req.Header.Set("Accept", accept)
-	if cached != nil && cached.etag != "" {
-		req.Header.Set("If-None-Match", cached.etag)
-	}
-
-	resp, err := h.proxy.HTTPClient.Do(req)
-	if err != nil {
-		h.serveStaleManifestOrError(w, r, reference, cached, err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotModified && cached != nil {
-		cached.fetchedAt = time.Now()
-		if fromFallback {
-			// The shared entry holds another representation for other
-			// clients; only this client's own entries are refreshed.
-			h.storeContainerManifestLegacyEntries(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
-		} else {
-			h.storeContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept, cached)
-		}
-		writeContainerManifest(w, r, cached, false)
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		if shouldServeStaleManifest(resp.StatusCode) && (cached != nil || referrersTagPattern.MatchString(reference)) {
-			h.serveStaleManifestOrError(w, r, reference, cached, fmt.Errorf("upstream status %d", resp.StatusCode))
-			return
-		}
-		h.proxy.relayResponse(w, r, resp, copyContainerManifestHeaders)
-		return
-	}
-
-	if r.Method == http.MethodHead {
-		h.proxy.relayResponse(w, r, resp, copyContainerManifestHeaders)
-		return
-	}
-
-	body, err := h.proxy.ReadMetadata(resp.Body)
-	if err != nil {
-		h.serveStaleManifestOrError(w, r, reference, cached, fmt.Errorf("reading manifest: %w", err))
-		return
-	}
-	computedDigest := sha256Digest(body)
-	contentDigest := resp.Header.Get("Docker-Content-Digest")
-	for _, expected := range []string{reference, contentDigest} {
-		if strings.HasPrefix(expected, "sha256:") && expected != computedDigest {
-			h.proxy.Logger.Error("upstream manifest failed digest verification",
-				"name", name, "reference", reference, "expected", expected, "actual", computedDigest)
-			h.containerError(w, http.StatusBadGateway, "DIGEST_INVALID", "manifest digest verification failed")
-			return
-		}
-	}
-	if contentDigest == "" {
-		contentDigest = computedDigest
-	}
-
-	manifest := &cachedContainerManifest{
-		body:          body,
-		contentType:   resp.Header.Get(headerContentType),
-		contentDigest: contentDigest,
-		etag:          resp.Header.Get(headerETag),
-		size:          int64(len(body)),
-		lastModified:  parseHTTPTime(resp.Header.Get(headerLastModified)),
-		fetchedAt:     time.Now(),
-	}
-	h.storeContainerManifestForAccept(r.Context(), registryURL, name, reference, accept, cacheAccept, manifest)
-	if manifest.contentDigest != reference && manifestDigestReferencePattern.MatchString(manifest.contentDigest) {
-		h.storeContainerManifestForAccept(r.Context(), registryURL, name, manifest.contentDigest, accept, cacheAccept, manifest)
-	}
-	writeContainerManifest(w, r, manifest, false)
 }
 
-func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *http.Request, reference string, cached *cachedContainerManifest, err error) {
+func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *http.Request, cacheName, reference string, cached *cachedContainerManifest, err error) {
 	if cached != nil {
 		h.proxy.Logger.Warn("upstream manifest fetch failed, serving stale cache", "error", err)
-		writeContainerManifest(w, r, cached, true)
+		h.writeManifest(w, r, cacheName, cached, true)
 		return
 	}
 	if referrersTagPattern.MatchString(reference) {
@@ -155,6 +96,25 @@ func (h *ContainerHandler) serveStaleManifestOrError(w http.ResponseWriter, r *h
 	}
 	h.proxy.Logger.Error("failed to fetch manifest", "error", err)
 	h.containerError(w, http.StatusBadGateway, "INTERNAL_ERROR", "failed to fetch from upstream")
+}
+
+// manifestDenied writes a 403 and reports true when the denylist names
+// reference, a tag or digest, under the repository's cache name.
+func (h *ContainerHandler) manifestDenied(w http.ResponseWriter, cacheName, reference string) bool {
+	if reference == "" || !h.proxy.versionDenied("oci", cacheName, reference) {
+		return false
+	}
+	h.containerError(w, http.StatusForbidden, "DENIED",
+		ErrVersionDenied.Error()+": "+canonicalVersionPURL("oci", cacheName, reference))
+	return true
+}
+
+// writeManifest writes manifest unless the denylist names its digest.
+func (h *ContainerHandler) writeManifest(w http.ResponseWriter, r *http.Request, cacheName string, manifest *cachedContainerManifest, stale bool) {
+	if h.manifestDenied(w, cacheName, manifest.contentDigest) {
+		return
+	}
+	writeContainerManifest(w, r, manifest, stale)
 }
 
 func (h *ContainerHandler) containerManifestFresh(manifest *cachedContainerManifest) bool {
@@ -276,6 +236,7 @@ func (h *ContainerHandler) loadContainerManifest(ctx context.Context, cacheKey s
 	if err != nil {
 		return nil, err
 	}
+	h.proxy.recordMetadataRead(entry)
 
 	manifest := &cachedContainerManifest{body: body, size: int64(len(body))}
 	if entry.ContentType.Valid {
@@ -315,7 +276,10 @@ func writeContainerManifest(w http.ResponseWriter, r *http.Request, manifest *ca
 	if manifest.contentType != "" {
 		w.Header().Set(headerContentType, manifest.contentType)
 	}
-	w.Header().Set(headerContentLength, strconv.FormatInt(manifest.size, 10))
+	// A manifest known only from an upstream HEAD may lack a size.
+	if manifest.size >= 0 {
+		w.Header().Set(headerContentLength, strconv.FormatInt(manifest.size, 10))
+	}
 	if manifest.contentDigest != "" {
 		w.Header().Set("Docker-Content-Digest", manifest.contentDigest)
 	}

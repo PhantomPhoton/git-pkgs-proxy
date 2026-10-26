@@ -60,6 +60,7 @@
 package config
 
 import (
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -186,9 +187,26 @@ type Config struct {
 	// response headers within 60 seconds.
 	HTTPTimeout string `json:"http_timeout" yaml:"http_timeout"`
 
+	// WriteTimeout bounds response writes, including time spent downloading and
+	// scanning before the response starts. Default: "5m"; "0" disables it.
+	WriteTimeout string `json:"write_timeout" yaml:"write_timeout"`
+
+	// ArtifactTimeout bounds each upstream artifact download while serving
+	// requests, excluding scanning. Default: "5m"; "0" disables it.
+	// The mirror command keeps its unlimited artifact download timeout.
+	ArtifactTimeout string `json:"artifact_timeout" yaml:"artifact_timeout"`
+
 	// MirrorAPI enables the /api/mirror endpoints for starting mirror jobs via HTTP.
 	// Disabled by default to prevent unauthenticated users from triggering downloads.
 	MirrorAPI bool `json:"mirror_api" yaml:"mirror_api"`
+
+	// Mirror configures scheduled mirroring.
+	Mirror MirrorConfig `json:"mirror" yaml:"mirror"`
+
+	// CacheDelete enables DELETE /api/cache for removing cached artifacts, and
+	// the delete buttons on the UI's version page. It has no authentication of
+	// its own, so restrict /api/cache and /ui at the ingress when enabling it.
+	CacheDelete bool `json:"cache_delete" yaml:"cache_delete"`
 
 	// Hosted configures pushing packages to the proxy (/api/hosted).
 	Hosted HostedConfig `json:"hosted" yaml:"hosted"`
@@ -198,6 +216,12 @@ type Config struct {
 
 	// Health configures the /health endpoint behavior.
 	Health HealthConfig `json:"health" yaml:"health"`
+
+	// Git configures the Git repository cache served at /git/{name}/.
+	Git GitConfig `json:"git" yaml:"git"`
+
+	// envWarnings collects environment values LoadFromEnv ignored.
+	envWarnings []string
 }
 
 // CooldownConfig configures version cooldown periods.
@@ -437,7 +461,7 @@ type StorageConfig struct {
 // for days; "0" or empty means never evict by age.
 type RetentionConfig struct {
 	// Default applies to every ecosystem that supports retention and has no
-	// rule of its own.
+	// rule of its own, except generic, which requires an explicit rule.
 	Default string `json:"default" yaml:"default"`
 
 	// Ecosystems overrides the default per ecosystem key (e.g. "npm", "oci").
@@ -463,6 +487,7 @@ type GradleConfig struct {
 // GradleBuildCacheConfig configures Gradle HttpBuildCache safeguards.
 type GradleBuildCacheConfig struct {
 	// ReadOnly disables PUT uploads and keeps cache reads (GET/HEAD) enabled.
+	// Default: true; set false on the instance that CI uploads to.
 	ReadOnly bool `json:"read_only" yaml:"read_only"`
 
 	// MaxUploadSize caps a single PUT body size (e.g., "100MB"). Must be > 0.
@@ -620,6 +645,14 @@ type UpstreamConfig struct {
 	// Default: https://repo1.maven.org/maven2
 	Maven string `json:"maven" yaml:"maven"`
 
+	// MavenRepositories maps repository names to additional Maven repository
+	// base URLs, served at /maven/{name}/. upstream.maven stays the default
+	// at /maven/. A name must not be the first segment of a group ID, such
+	// as "org" or "tools", since it would hide those groups in the default
+	// repository; see validateMavenRepositoryName.
+	// Example: {"grails": "https://repo.grails.org/grails/restricted"}.
+	MavenRepositories map[string]string `json:"maven_repositories" yaml:"maven_repositories"`
+
 	// GradlePluginPortal is the upstream Gradle Plugin Portal Maven URL.
 	// Used to resolve Gradle plugin marker artifacts.
 	// Default: https://plugins.gradle.org/m2
@@ -652,6 +685,11 @@ type UpstreamConfig struct {
 	// Conan is the upstream Conan registry URL.
 	// Default: https://center.conan.io
 	Conan string `json:"conan" yaml:"conan"`
+
+	// Chef is the upstream Chef Supermarket URL, served at /chef/. Point it
+	// at a private Supermarket to proxy that instead of the public one.
+	// Default: https://supermarket.chef.io
+	Chef string `json:"chef" yaml:"chef"`
 
 	// Conda is the upstream Conda channel base URL.
 	// Default: https://conda.anaconda.org
@@ -712,6 +750,12 @@ type UpstreamConfig struct {
 	// Default when empty: {"archlinux": "https://geo.mirror.pkgbuild.com"}.
 	Arch map[string]string `json:"arch" yaml:"arch"`
 
+	// FreeBSD maps repository names to FreeBSD pkg mirror base URLs, served
+	// at /freebsd/{name}/. The remaining request path mirrors the upstream
+	// layout, e.g. /freebsd/freebsd/FreeBSD:14:amd64/latest/packagesite.pkg.
+	// Default when empty: {"freebsd": "https://pkg.freebsd.org"}.
+	FreeBSD map[string]string `json:"freebsd" yaml:"freebsd"`
+
 	// OCI maps names to OCI registry URLs. Requests to a named registry use
 	// the repository prefix upstream/{name}/, for example
 	// oci://proxy.example.com/upstream/ghcr/owner/chart.
@@ -740,6 +784,21 @@ type UpstreamConfig struct {
 	// which otherwise is the upstream name.
 	// Example: {"apache": ["dist/(?P<name>maven)/maven-3/(?P<version>[^/]+)/binaries/(?P<file>[^/]+)"]}.
 	GenericArtifacts map[string][]string `json:"generic_artifacts" yaml:"generic_artifacts"`
+
+	// GenericPaths maps a Generic upstream name to the paths it may serve,
+	// as patterns for the request path after /generic/{name}/ with the same
+	// syntax as GitUpstream.Repos: path.Match, where a pattern ending in
+	// "/**" also matches every path nested below its prefix. Other paths
+	// answer 404. Empty serves every path. Required when upstream.auth has
+	// credentials for the upstream, since everyone who can reach the proxy
+	// can use them for any path otherwise.
+	// Example: {"github-api": ["repos/*/*/releases/**"]}.
+	GenericPaths map[string][]string `json:"generic_paths" yaml:"generic_paths"`
+
+	// Git maps names to Git servers, served read-only at /git/{name}/{repo}
+	// from a local cache of bare repositories. See GitUpstream.
+	// Example: {"github": {"url": "https://github.com"}}.
+	Git map[string]GitUpstream `json:"git" yaml:"git"`
 
 	// Auth configures authentication for upstream registries.
 	// Keys are absolute URL scopes matched by scheme, host, effective port,
@@ -796,6 +855,9 @@ func (u *UpstreamConfig) Validate() error {
 	if err := validateNamedUpstreams("upstream.arch", u.Arch); err != nil {
 		return err
 	}
+	if err := validateNamedUpstreams("upstream.freebsd", u.FreeBSD); err != nil {
+		return err
+	}
 	if err := validateNamedUpstreams("upstream.go_sumdbs", u.GoSumDBs); err != nil {
 		return err
 	}
@@ -810,6 +872,20 @@ func (u *UpstreamConfig) Validate() error {
 	}
 	if err := u.validateGenericArtifacts(); err != nil {
 		return err
+	}
+	if err := u.validateGenericPaths(); err != nil {
+		return err
+	}
+	if err := u.validateGitUpstreams(); err != nil {
+		return err
+	}
+	if err := validateNamedUpstreams("upstream.maven_repositories", u.MavenRepositories); err != nil {
+		return err
+	}
+	for name := range u.MavenRepositories {
+		if err := validateMavenRepositoryName(name); err != nil {
+			return err
+		}
 	}
 	if err := validateNamedUpstreams("upstream.debian_repositories", u.DebianRepositories); err != nil {
 		return err
@@ -839,6 +915,51 @@ func (u *UpstreamConfig) validateGenericArtifacts() error {
 	return nil
 }
 
+// validateGenericPaths checks upstream.generic_paths patterns. An upstream that
+// upstream.auth has credentials for must list its paths, so configuring a
+// token does not let everyone who can reach the proxy send any request with
+// it, mirroring the repos rule for upstream.git.
+func (u *UpstreamConfig) validateGenericPaths() error {
+	for name, patterns := range u.GenericPaths {
+		if _, found := u.Generic[name]; !found {
+			return fmt.Errorf("invalid upstream.generic_paths name %q: no upstream.generic entry", name)
+		}
+		for _, pattern := range patterns {
+			if _, err := path.Match(strings.TrimSuffix(pattern, "/**"), ""); pattern == "" || err != nil {
+				return fmt.Errorf("invalid upstream.generic_paths.%s pattern %q", name, pattern)
+			}
+		}
+	}
+	for name, upstreamURL := range u.Generic {
+		if len(u.GenericPaths[name]) == 0 && u.HasAuthWithin(upstreamURL) {
+			return fmt.Errorf("upstream.generic.%s needs upstream.generic_paths.%s: upstream.auth has credentials for %s, "+
+				"and everyone who can reach the proxy could send any request with them", name, name, upstreamURL)
+		}
+	}
+	return nil
+}
+
+// GenericPathAllowed reports whether p, a request path after
+// /generic/{name}/, matches one of an upstream's upstream.generic_paths
+// patterns. No patterns allow every path. With patterns, a path holding a
+// character the upstream could read as the end of the path or as a different
+// path ('%', '?', '#' or a backslash) is refused, so the path that matched is
+// the one the upstream sees.
+func GenericPathAllowed(patterns []string, p string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	if strings.ContainsAny(p, `%?#\`) {
+		return false
+	}
+	for _, pattern := range patterns {
+		if matchRepoPattern(pattern, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // validateUpstream checks the upstream block, including the one setting in
 // it that depends on a top-level option.
 func (c *Config) validateUpstream() error {
@@ -850,6 +971,11 @@ func (c *Config) validateUpstream() error {
 	}
 	return nil
 }
+
+// HostedGenericRepository is the /generic/{name}/ path that serves files
+// pushed through /api/hosted/generic. While hosted packages are enabled, no
+// upstream.generic entry may use it.
+const HostedGenericRepository = "hosted"
 
 // CompileGenericArtifactPattern compiles an upstream.generic_artifacts pattern
 // so that it only matches a whole path, and checks it has the `version` and
@@ -865,6 +991,61 @@ func CompileGenericArtifactPattern(pattern string) (*regexp.Regexp, error) {
 		}
 	}
 	return re, nil
+}
+
+// mavenGroupRootList lists the first path segments of group IDs on Maven
+// Central and Google's Maven repository, one per line.
+//
+//go:embed maven_group_roots.txt
+var mavenGroupRootList string
+
+// mavenGroupRoots are the first segments of group IDs a repository name
+// must not take: those in mavenGroupRootList, and generic top-level domains
+// group IDs are commonly reversed from.
+var mavenGroupRoots = func() map[string]bool {
+	roots := map[string]bool{}
+	for _, tld := range []string{"app", "biz", "cloud", "com", "dev", "edu", "gov", "info", "int",
+		"io", "mil", "name", "net", "org", "pro", "tech", "xyz"} {
+		roots[tld] = true
+	}
+	for line := range strings.Lines(mavenGroupRootList) {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			roots[line] = true
+		}
+	}
+	return roots
+}()
+
+// mavenRepositoryNamePattern is what a repository name may look like: the
+// characters of a group ID segment, which clients send unescaped.
+var mavenRepositoryNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// countryCodeLength is the length of a country-code top-level domain.
+const countryCodeLength = 2
+
+// validateMavenRepositoryName refuses names that are likely the first
+// segment of a group ID. /maven/{name}/ is matched before the default
+// repository, so such a name would hide every group under it there:
+// a repository named "tools" would take /maven/tools/jackson/... away from
+// Maven Central. Names are limited to characters that reach the handler
+// unescaped. Paths are case-sensitive, so names are compared as they
+// are. Names of two characters or less are refused as country codes. The
+// list can't be complete, since group IDs are free-form, so the
+// documentation also asks for names that can't be a group root.
+func validateMavenRepositoryName(name string) error {
+	if !mavenRepositoryNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid upstream.maven_repositories name %q: use letters, digits, '.', '_' and '-', "+
+			"starting with a letter or digit, so the name works as a URL path segment", name)
+	}
+	if len(name) <= countryCodeLength {
+		return fmt.Errorf("invalid upstream.maven_repositories name %q: names of two characters or less "+
+			"could hide country-code group IDs in the default repository", name)
+	}
+	if mavenGroupRoots[name] {
+		return fmt.Errorf("invalid upstream.maven_repositories name %q: it would hide group IDs starting with %q "+
+			"in the default repository; use a name such as \"%s-repo\"", name, name, name)
+	}
+	return nil
 }
 
 // debianReservedRepositoryNames are the upstream.debian archive's own root
@@ -954,6 +1135,12 @@ func parseAuthURL(value string) (*url.URL, error) {
 }
 
 func authURLMatches(configured, target *url.URL) bool {
+	// An upstream resolves dot segments, so /scope/../other would leave the
+	// configured path while still matching it by prefix. Real package URLs
+	// never contain them, so they get no credentials at all.
+	if HasDotSegment(target.Path) {
+		return false
+	}
 	if !strings.EqualFold(configured.Scheme, target.Scheme) ||
 		!strings.EqualFold(configured.Hostname(), target.Hostname()) ||
 		authURLPort(configured) != authURLPort(target) {
@@ -969,6 +1156,25 @@ func authURLMatches(configured, target *url.URL) bool {
 	}
 	targetPath := strings.TrimSuffix(target.EscapedPath(), "/")
 	return targetPath == configuredPath || strings.HasPrefix(targetPath, configuredPath+"/")
+}
+
+// HasDotSegment reports whether the URL path p, or p decoded once more, has a
+// '.' or '..' segment. Backslashes count as separators, and ";params" are
+// ignored, since some upstream servers (Tomcat, Jetty) treat them that way.
+func HasDotSegment(p string) bool {
+	candidates := []string{p}
+	if decoded, err := url.PathUnescape(p); err == nil {
+		candidates = append(candidates, decoded)
+	}
+	for _, candidate := range candidates {
+		for segment := range strings.SplitSeq(strings.ReplaceAll(candidate, `\`, "/"), "/") {
+			segment, _, _ = strings.Cut(segment, ";")
+			if segment == "." || segment == ".." {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func authURLPort(value *url.URL) string {
@@ -1052,6 +1258,7 @@ func Default() *Config {
 			Composer:           "https://packagist.org",
 			ComposerRepository: "https://repo.packagist.org",
 			Conan:              "https://center.conan.io",
+			Chef:               "https://supermarket.chef.io",
 			Conda:              "https://conda.anaconda.org",
 			CRAN:               "https://cloud.r-project.org",
 			Julia:              "https://pkg.julialang.org",
@@ -1064,7 +1271,7 @@ func Default() *Config {
 		},
 		Gradle: GradleConfig{
 			BuildCache: GradleBuildCacheConfig{
-				ReadOnly:      false,
+				ReadOnly:      true,
 				MaxUploadSize: defaultGradleMaxUploadSizeStr,
 				MaxAge:        "168h",
 				MaxSize:       "",
@@ -1118,6 +1325,28 @@ func setEnvBool(dst *bool, key string) {
 	if v := os.Getenv(key); v != "" {
 		*dst = envBool(v)
 	}
+}
+
+// setGradleReadOnlyFromEnv parses strictly: an unrecognised value keeps
+// uploads off instead of opening them, and is reported via EnvWarnings.
+func (c *Config) setGradleReadOnlyFromEnv() {
+	const key = "PROXY_GRADLE_BUILD_CACHE_READ_ONLY"
+	v := os.Getenv(key)
+	if v == "" {
+		return
+	}
+	readOnly, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		c.Gradle.BuildCache.ReadOnly = true
+		c.envWarnings = append(c.envWarnings, fmt.Sprintf("ignoring %s=%q: not a boolean, keeping the Gradle build cache read-only", key, v))
+		return
+	}
+	c.Gradle.BuildCache.ReadOnly = readOnly
+}
+
+// EnvWarnings returns the environment values LoadFromEnv ignored.
+func (c *Config) EnvWarnings() []string {
+	return c.envWarnings
 }
 
 func setEnvStringSlice(dst *[]string, key string) {
@@ -1195,6 +1424,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.Upstream.Composer, "PROXY_UPSTREAM_COMPOSER")
 	setEnvString(&c.Upstream.ComposerRepository, "PROXY_UPSTREAM_COMPOSER_REPOSITORY")
 	setEnvString(&c.Upstream.Conan, "PROXY_UPSTREAM_CONAN")
+	setEnvString(&c.Upstream.Chef, "PROXY_UPSTREAM_CHEF")
 	setEnvString(&c.Upstream.Conda, "PROXY_UPSTREAM_CONDA")
 	setEnvString(&c.Upstream.CRAN, "PROXY_UPSTREAM_CRAN")
 	setEnvString(&c.Upstream.Julia, "PROXY_UPSTREAM_JULIA")
@@ -1212,6 +1442,7 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.Scanning.FetchBaseURL, "PROXY_SCANNING_FETCH_BASE_URL")
 	setEnvBool(&c.CacheMetadata, "PROXY_CACHE_METADATA")
 	setEnvBool(&c.MirrorAPI, "PROXY_MIRROR_API")
+	setEnvBool(&c.CacheDelete, "PROXY_CACHE_DELETE")
 	setEnvBool(&c.Hosted.Enabled, "PROXY_HOSTED_ENABLED")
 	setEnvString(&c.Hosted.Token, "PROXY_HOSTED_TOKEN")
 	setEnvString(&c.Hosted.MaxUploadSize, "PROXY_HOSTED_MAX_UPLOAD_SIZE")
@@ -1222,12 +1453,19 @@ func (c *Config) LoadFromEnv() {
 	setEnvString(&c.ArtifactMaxSize, "PROXY_ARTIFACT_MAX_SIZE")
 	setEnvString(&c.MetadataRewriteCacheSize, "PROXY_METADATA_REWRITE_CACHE_SIZE")
 	setEnvString(&c.HTTPTimeout, "PROXY_HTTP_TIMEOUT")
-	setEnvBool(&c.Gradle.BuildCache.ReadOnly, "PROXY_GRADLE_BUILD_CACHE_READ_ONLY")
+	setEnvString(&c.WriteTimeout, "PROXY_WRITE_TIMEOUT")
+	setEnvString(&c.ArtifactTimeout, "PROXY_ARTIFACT_TIMEOUT")
+	c.setGradleReadOnlyFromEnv()
 	setEnvString(&c.Gradle.BuildCache.MaxUploadSize, "PROXY_GRADLE_BUILD_CACHE_MAX_UPLOAD_SIZE")
 	setEnvString(&c.Gradle.BuildCache.MaxAge, "PROXY_GRADLE_BUILD_CACHE_MAX_AGE")
 	setEnvString(&c.Gradle.BuildCache.MaxSize, "PROXY_GRADLE_BUILD_CACHE_MAX_SIZE")
 	setEnvString(&c.Gradle.BuildCache.SweepInterval, "PROXY_GRADLE_BUILD_CACHE_SWEEP_INTERVAL")
 	setEnvString(&c.Health.StorageProbeInterval, "PROXY_HEALTH_STORAGE_PROBE_INTERVAL")
+	setEnvString(&c.Git.CacheDir, "PROXY_GIT_CACHE_DIR")
+	setEnvString(&c.Git.MaxSize, "PROXY_GIT_MAX_SIZE")
+	setEnvString(&c.Git.MaxRepoSize, "PROXY_GIT_MAX_REPO_SIZE")
+	setEnvString(&c.Git.RefreshWait, "PROXY_GIT_REFRESH_WAIT")
+	setEnvString(&c.Git.StaleMaxAge, "PROXY_GIT_STALE_MAX_AGE")
 }
 
 // validateAbsoluteURL returns an error if value is not a parseable URL with
@@ -1321,7 +1559,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	if err := validateHTTPTimeout(c.HTTPTimeout); err != nil {
+	if err := c.validateRequestTimeouts(); err != nil {
 		return err
 	}
 
@@ -1343,6 +1581,8 @@ func (c *Config) validateCacheArtifacts() error {
 		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with storage.direct_serve: no artifacts are stored to redirect to")
 	case c.MirrorAPI:
 		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with mirror_api: mirrored artifacts would never be served")
+	case len(c.Mirror.Schedules) > 0:
+		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with mirror.schedules: mirrored artifacts would never be served")
 	case c.Hosted.Enabled:
 		return fmt.Errorf("storage.cache_artifacts: false cannot be combined with hosted.enabled: pushed packages would never be served")
 	}
@@ -1375,6 +1615,18 @@ func (c *Config) validateComponents() error {
 	}
 
 	if err := c.Hosted.Validate(); err != nil {
+		return err
+	}
+	if _, reserved := c.Upstream.Generic[HostedGenericRepository]; reserved && c.Hosted.Enabled {
+		return fmt.Errorf("invalid upstream.generic name %q: reserved for pushed files at /generic/%s/ when hosted.enabled is set",
+			HostedGenericRepository, HostedGenericRepository)
+	}
+
+	if err := c.Mirror.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Git.Validate(); err != nil {
 		return err
 	}
 
@@ -1439,6 +1691,8 @@ func (g *GradleBuildCacheConfig) Validate() error {
 const (
 	defaultMetadataTTL                   = 5 * time.Minute  //nolint:mnd // sensible default
 	defaultDirectServeTTL                = 15 * time.Minute //nolint:mnd // sensible default
+	defaultWriteTimeout                  = 5 * time.Minute
+	defaultArtifactTimeout               = 5 * time.Minute
 	defaultHTTPTimeout                   = 30 * time.Second //nolint:mnd // sensible default
 	defaultHitFlushInterval              = time.Second
 	defaultMetadataMaxSize               = 100 << 20
@@ -1467,16 +1721,30 @@ func (c *Config) ParseMaxSize() int64 {
 	return size
 }
 
-func validateHTTPTimeout(s string) error {
+func (c *Config) validateRequestTimeouts() error {
+	for _, timeout := range []struct{ field, value string }{
+		{"http_timeout", c.HTTPTimeout},
+		{"write_timeout", c.WriteTimeout},
+		{"artifact_timeout", c.ArtifactTimeout},
+	} {
+		if err := validateRequestTimeout(timeout.field, timeout.value); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateRequestTimeout(field, s string) error {
 	if s == "" || s == "0" {
 		return nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("invalid http_timeout %q: %w", s, err)
+		return fmt.Errorf("invalid %s %q: %w", field, s, err)
 	}
 	if d < 0 {
-		return fmt.Errorf("invalid http_timeout %q: must be non-negative", s)
+		return fmt.Errorf("invalid %s %q: must be non-negative", field, s)
 	}
 	return nil
 }
@@ -1575,15 +1843,28 @@ func (c *Config) ParseArtifactMaxSize() int64 {
 // ParseHTTPTimeout returns the upstream HTTP client timeout.
 // Returns 30s if unset, 0 (no timeout) if explicitly set to "0".
 func (c *Config) ParseHTTPTimeout() time.Duration {
-	if c.HTTPTimeout == "" {
-		return defaultHTTPTimeout
+	return parseRequestTimeout(c.HTTPTimeout, defaultHTTPTimeout)
+}
+
+// ParseWriteTimeout returns the response write timeout, defaulting to 5m.
+// An explicit zero disables the timeout.
+func (c *Config) ParseWriteTimeout() time.Duration {
+	return parseRequestTimeout(c.WriteTimeout, defaultWriteTimeout)
+}
+
+// ParseArtifactTimeout returns the upstream artifact download timeout for
+// serving requests, defaulting to 5m. An explicit zero disables the timeout.
+func (c *Config) ParseArtifactTimeout() time.Duration {
+	return parseRequestTimeout(c.ArtifactTimeout, defaultArtifactTimeout)
+}
+
+func parseRequestTimeout(value string, fallback time.Duration) time.Duration {
+	if value == "" {
+		return fallback
 	}
-	if c.HTTPTimeout == "0" {
-		return 0
-	}
-	d, err := time.ParseDuration(c.HTTPTimeout)
+	d, err := time.ParseDuration(value)
 	if err != nil || d < 0 {
-		return defaultHTTPTimeout
+		return fallback
 	}
 	return d
 }

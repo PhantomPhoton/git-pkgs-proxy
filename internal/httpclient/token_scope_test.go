@@ -141,24 +141,92 @@ func TestTransportFollowsAnonymousTokenServiceOnAnotherHost(t *testing.T) {
 	}
 }
 
-func TestSameSite(t *testing.T) {
+// TestTransportDoesNotSendCredentialedTokenToHostWithOtherCredentials checks
+// that a registry with credentials of its own, but not the realm's, is not
+// handed a token minted from the realm's credentials.
+func TestTransportDoesNotSendCredentialedTokenToHostWithOtherCredentials(t *testing.T) {
+	var issued atomic.Int32
+	realm := tokenService(t, &issued)
+	var received []string
+	vendor := challengingRegistry(t, realm.URL, &received)
+
+	auth := func(rawURL string) (string, string) {
+		switch {
+		case strings.HasPrefix(rawURL, realm.URL):
+			return "Authorization", "Basic Y29ycDpwYXNz"
+		case strings.HasPrefix(rawURL, vendor.URL):
+			return "Authorization", "Basic dmVuZG9yOmtleQ=="
+		}
+		return "", ""
+	}
+	client := &http.Client{Transport: NewTransport(http.DefaultTransport, auth)}
+	if status := get(t, client, vendor.URL+"/v2/corp/private/blobs/sha256:abc"); status != http.StatusUnauthorized {
+		t.Errorf("status = %d, want the challenge passed back as 401", status)
+	}
+	for _, got := range received {
+		if got != "Basic dmVuZG9yOmtleQ==" {
+			t.Errorf("the vendor registry received Authorization %q, want only its own credentials", got)
+		}
+	}
+	if n := issued.Load(); n != 0 {
+		t.Errorf("token service was asked %d times on the vendor registry's behalf, want 0", n)
+	}
+}
+
+// TestTransportRequestsPullScopeForRequestedRepository checks that the token
+// is requested for pull access to the repository in the request path, not
+// whatever scope the challenge names.
+func TestTransportRequestsPullScopeForRequestedRepository(t *testing.T) {
+	var scopes [][]string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			scopes = append(scopes, r.URL.Query()["scope"])
+			_, _ = io.WriteString(w, `{"token":"t","expires_in":3600}`)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer t" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+srv.URL+`/token",service="registry.corp",scope="repository:corp/other:pull,push"`)
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, "blob")
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{Transport: NewTransport(http.DefaultTransport, credentialsFor(srv.URL))}
+	if status := get(t, client, srv.URL+"/v2/corp/app/manifests/latest"); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if len(scopes) != 1 || len(scopes[0]) != 1 || scopes[0][0] != "repository:corp/app:pull" {
+		t.Errorf("token requested with scopes %q, want [[repository:corp/app:pull]]", scopes)
+	}
+}
+
+func TestSameTokenService(t *testing.T) {
 	for _, tt := range []struct {
 		registry, realm string
 		want            bool
 	}{
-		{"https://registry-1.docker.io", "https://auth.docker.io", true},
-		{"https://registry.gitlab.com", "https://gitlab.com", true},
-		{"https://ghcr.io", "https://ghcr.io", true},
-		{"https://registry.corp.example", "https://auth.corp.example:8443", true},
-		{"https://evil.example", "https://auth.docker.io", false},
-		{"https://docker.io.evil.example", "https://auth.docker.io", false},
-		{"https://a.github.io", "https://b.github.io", false}, // public suffix: separate sites
-		{"http://127.0.0.1:5000", "http://127.0.0.1:5000", true},
-		{"http://127.0.0.1:5000", "http://127.0.0.1:5001", false},
-		{"http://localhost:5000", "http://localhost:5001", false},
+		{"https://registry-1.docker.io", "https://auth.docker.io/token", true},
+		{"https://index.docker.io", "https://auth.docker.io/token", true},
+		{"https://registry.gitlab.com", "https://gitlab.com/jwt/auth", true},
+		{"https://ghcr.io", "https://ghcr.io/token", true},
+		{"https://harbor.corp.example", "https://harbor.corp.example/service/token", true},
+		{"https://registry.corp.example", "https://auth.corp.example", false},
+		{"https://evil.example", "https://auth.docker.io/token", false},
+		{"https://docker.io.evil.example", "https://auth.docker.io/token", false},
+		{"https://evil.jfrog.io", "https://myco.jfrog.io/artifactory/api/docker/token", false},
+		{"https://evil.azurecr.io", "https://myco.azurecr.io/oauth2/token", false},
+		{"https://gitlab.com", "https://registry.gitlab.com", false},
+		{"http://registry-1.docker.io", "https://auth.docker.io/token", false},
+		{"https://registry-1.docker.io", "https://auth.docker.io:8443/token", false},
+		{"http://127.0.0.1:5000", "http://127.0.0.1:5000/token", true},
+		{"http://127.0.0.1:5000", "http://127.0.0.1:5001/token", false},
+		{"http://localhost:5000", "https://localhost:5000/token", false},
 	} {
-		if got := sameSite(mustParse(t, tt.registry), mustParse(t, tt.realm)); got != tt.want {
-			t.Errorf("sameSite(%s, %s) = %v, want %v", tt.registry, tt.realm, got, tt.want)
+		if got := sameTokenService(mustParse(t, tt.registry), mustParse(t, tt.realm)); got != tt.want {
+			t.Errorf("sameTokenService(%s, %s) = %v, want %v", tt.registry, tt.realm, got, tt.want)
 		}
 	}
 }

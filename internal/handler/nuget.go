@@ -18,7 +18,8 @@ const (
 
 // Packages are stored under pkg:nuget/{id} with the id lowercased, since
 // NuGet ids are case-insensitive. purl keeps nuget names as written, so
-// package rules are lowercased the same way before the default mapping.
+// package rules go through its comparison form, which lowercases them the
+// same way, before the default mapping.
 func init() {
 	retention.Default.Register(retention.Spec{Key: "nuget", CanonicalPackage: nugetRetentionKey})
 }
@@ -29,7 +30,8 @@ func nugetRetentionKey(p *purl.PURL) (string, bool) {
 	if p == nil {
 		return "", false
 	}
-	return retention.DefaultCanonical("nuget")(purl.New(p.Type, p.Namespace, strings.ToLower(p.Name), "", nil))
+	c := p.ComparisonForm()
+	return retention.DefaultCanonical("nuget")(purl.New(c.Type, c.Namespace, c.Name, "", nil))
 }
 
 // NuGetHandler handles NuGet V3 API protocol requests.
@@ -86,7 +88,7 @@ func (h *NuGetHandler) Routes() http.Handler {
 
 // handleServiceIndex serves the NuGet V3 service index with rewritten URLs.
 func (h *NuGetHandler) handleServiceIndex(w http.ResponseWriter, r *http.Request) {
-	h.proxy.Logger.Info("nuget service index request")
+	h.proxy.Logger.Debug("nuget service index request")
 
 	upstreamURL := h.upstreamURL + "/v3/index.json"
 
@@ -201,7 +203,7 @@ func (h *NuGetHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("nuget download request",
+	h.proxy.Logger.Debug("nuget download request",
 		"id", id, "version", version, "filename", filename)
 
 	// NuGet package IDs are case-insensitive, lowercase for storage

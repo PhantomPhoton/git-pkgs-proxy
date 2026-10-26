@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bufio"
 	"compress/gzip"
 	"encoding/json"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/git-pkgs/proxy/internal/jsonstream"
 	"github.com/git-pkgs/proxy/internal/retention"
 	"github.com/git-pkgs/purl"
 )
@@ -77,8 +79,14 @@ func (h *CondaHandler) Routes() http.Handler {
 
 	// Channel index (repodata)
 	mux.HandleFunc("GET /{channel}/{arch}/repodata.json", h.handleRepodata)
-	mux.HandleFunc("GET /{channel}/{arch}/repodata.json.bz2", h.proxyCached)
+	mux.HandleFunc("GET /{channel}/{arch}/repodata.json.bz2", h.handleRepodataVariant)
 	mux.HandleFunc("GET /{channel}/{arch}/current_repodata.json", h.handleRepodata)
+	mux.HandleFunc("GET /{channel}/{arch}/repodata_from_packages.json", h.handleRepodata)
+
+	// Sharded repodata (CEP 16)
+	mux.HandleFunc("GET /{channel}/{arch}/"+condaShardIndexFile, h.handleShardIndex)
+	mux.HandleFunc("GET /{channel}/{arch}/shards/{filename}", h.handleShard)
+	mux.HandleFunc("GET /{channel}/{arch}/"+condaCooldownShardDir+"/{bucket}/{rest...}", h.handleCooldownShard)
 
 	// Package downloads (cache these)
 	mux.HandleFunc("GET /{channel}/{arch}/{filename}", h.handleDownload)
@@ -92,8 +100,17 @@ func (h *CondaHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	arch := r.PathValue("arch")
 	filename := r.PathValue("filename")
 
+	if strings.HasSuffix(filename, condaShardSuffix) {
+		h.handleShard(w, r)
+		return
+	}
+
 	// Only cache actual package files
 	if !h.isPackageFile(filename) {
+		if isCondaRepodataVariant(filename) && h.cooldownEnabled() {
+			refuseUnfilteredRepodata(w)
+			return
+		}
 		h.proxyUpstream(w, r)
 		return
 	}
@@ -107,12 +124,15 @@ func (h *CondaHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Include channel in package name
 	packageName := channel + "/" + name
 
-	h.proxy.Logger.Info("conda download request",
+	h.proxy.Logger.Debug("conda download request",
 		"channel", channel, "arch", arch, "name", name, "version", version)
 
 	upstreamURL := h.upstreamURL + r.URL.Path
+	// The same filename can hold different bytes in each subdir, so the
+	// subdir is part of the cache key.
+	cacheFilename := arch + "/" + filename
 
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "conda", packageName, version, filename, upstreamURL)
+	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "conda", packageName, version, cacheFilename, upstreamURL)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return
@@ -127,9 +147,15 @@ func (h *CondaHandler) isPackageFile(filename string) bool {
 }
 
 // parseFilename extracts name and version from a Conda package filename.
+func (h *CondaHandler) parseFilename(filename string) (name, version string) {
+	return CondaFilenameIdentity(filename)
+}
+
+// CondaFilenameIdentity returns the name and version a download of filename
+// is cached under, or empty strings when it is not a package file name.
 // Conda filenames are: {name}-{version}-{build}.{ext}
 // e.g., "numpy-1.24.0-py311h64a7726_0.conda"
-func (h *CondaHandler) parseFilename(filename string) (name, version string) {
+func CondaFilenameIdentity(filename string) (name, version string) {
 	// Remove extension
 	base := filename
 	for _, ext := range []string{".conda", ".tar.bz2"} {
@@ -163,9 +189,34 @@ func (h *CondaHandler) parseFilename(filename string) (name, version string) {
 	return name, version
 }
 
+// isCondaRepodataVariant reports whether filename is a form of a subdir's
+// repodata other than the plain JSON documents the proxy filters, such as
+// repodata.json.zst, repodata.json.bz2 or repodata.jlap patches. Package
+// files are told apart by the caller.
+func isCondaRepodataVariant(filename string) bool {
+	return strings.HasPrefix(filename, "repodata") || strings.HasPrefix(filename, "current_repodata")
+}
+
+// handleRepodataVariant serves repodata.json.bz2 from the metadata cache,
+// unless cooldown is on: the proxy filters only the JSON, so a compressed
+// copy would list versions still in cooldown.
+func (h *CondaHandler) handleRepodataVariant(w http.ResponseWriter, r *http.Request) {
+	if h.cooldownEnabled() {
+		refuseUnfilteredRepodata(w)
+		return
+	}
+	h.proxyCached(w, r)
+}
+
+// refuseUnfilteredRepodata answers 404 for a repodata variant the proxy
+// can't filter. conda and mamba then fall back to repodata.json.
+func refuseUnfilteredRepodata(w http.ResponseWriter) {
+	http.Error(w, "only repodata.json is served while cooldown is enabled", http.StatusNotFound)
+}
+
 // handleRepodata proxies repodata.json, applying cooldown filtering when enabled.
 func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
-	if h.proxy.Cooldown == nil || !h.proxy.Cooldown.Enabled() {
+	if !h.cooldownEnabled() {
 		h.proxyCached(w, r)
 		return
 	}
@@ -209,81 +260,110 @@ func (h *CondaHandler) handleRepodata(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = decoded.Close() }()
 		reader = decoded
 	}
-	body, err := h.proxy.ReadMetadata(reader)
-	if err != nil {
-		http.Error(w, "failed to read response", http.StatusBadGateway)
-		return
-	}
-
-	filtered, err := h.applyCooldownFiltering(body)
-	if err != nil {
-		h.proxy.Logger.Warn("failed to filter repodata, proxying original", "error", err)
-		w.Header().Set(headerContentType, "application/json")
-		_, _ = w.Write(body)
-		return
-	}
-
+	// conda-forge's linux-64 repodata.json is several hundred MB, so it is
+	// filtered as it streams rather than read through ReadMetadata. Once
+	// output has started, an error aborts the response so the client never
+	// takes a truncated or unfiltered index as complete.
+	out := &countingWriter{w: w}
+	buffered := bufio.NewWriterSize(out, repodataWriteBuffer)
 	w.Header().Set(headerContentType, "application/json")
-	_, _ = w.Write(filtered)
+	err = h.filterRepodata(io.LimitReader(reader, maxRepodataSize), buffered)
+	if err == nil {
+		err = buffered.Flush()
+	}
+	if err != nil {
+		h.proxy.Logger.Error("failed to filter conda repodata", "url", upstreamURL, "error", err)
+		if out.n == 0 {
+			http.Error(w, "failed to read response", http.StatusBadGateway)
+			return
+		}
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// countingWriter records whether anything has reached the response yet.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // condaTimestampDivisor converts Conda's millisecond timestamps to seconds.
 const condaTimestampDivisor = 1000
 
-// applyCooldownFiltering removes entries from repodata.json that were
-// published too recently based on their timestamp field.
-func (h *CondaHandler) applyCooldownFiltering(body []byte) ([]byte, error) {
-	if h.proxy.Cooldown == nil || !h.proxy.Cooldown.Enabled() {
-		return body, nil
-	}
+const (
+	repodataWriteBuffer = 64 << 10
+	// maxRepodataSize stops a runaway upstream body. It is well above the
+	// largest conda-forge index, which is under 500 MB.
+	maxRepodataSize = 4 << 30
+)
 
-	var repodata map[string]any
-	if err := json.Unmarshal(body, &repodata); err != nil {
-		return nil, err
-	}
-
-	for _, key := range []string{"packages", "packages.conda"} {
-		packages, ok := repodata[key].(map[string]any)
-		if !ok {
-			continue
+// filterRepodata copies repodata.json from r to w, leaving out entries in
+// packages and packages.conda that are still inside their cooldown. Kept
+// entries and every other member are written with their upstream bytes.
+func (h *CondaHandler) filterRepodata(r io.Reader, w io.Writer) error {
+	return jsonstream.CopyObject(json.NewDecoder(r), w, func(m *jsonstream.Member) error {
+		if m.Key != "packages" && m.Key != "packages.conda" {
+			return m.Copy()
 		}
-
-		for filename, entry := range packages {
-			entryMap, ok := entry.(map[string]any)
-			if !ok {
-				continue
+		return m.Object(func(entry *jsonstream.Member) error {
+			raw, err := entry.Raw()
+			if err != nil {
+				return err
 			}
-
-			ts, ok := entryMap["timestamp"].(float64)
-			if !ok || ts == 0 {
-				continue
+			if h.inCooldown(entry.Key, raw) {
+				return nil
 			}
+			return entry.Write(raw)
+		})
+	})
+}
 
-			publishedAt := time.Unix(int64(ts)/condaTimestampDivisor, 0)
+type repodataEntry struct {
+	Name      string  `json:"name"`
+	Version   string  `json:"version"`
+	Timestamp float64 `json:"timestamp"`
+}
 
-			name, _ := entryMap["name"].(string)
-			if name == "" {
-				continue
-			}
-
-			packagePURL := canonicalPackagePURL("conda", name)
-
-			if !h.proxy.Cooldown.IsAllowed("conda", packagePURL, publishedAt) {
-				version, _ := entryMap["version"].(string)
-				h.proxy.Logger.Info("cooldown: filtering conda package",
-					"name", name, "version", version, "filename", filename)
-				delete(packages, filename)
-			}
-		}
+// inCooldown reports whether a repodata entry was published too recently.
+// Entries without a name or timestamp are kept.
+func (h *CondaHandler) inCooldown(filename string, raw []byte) bool {
+	var entry repodataEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return false
 	}
+	return h.recordInCooldown(filename, entry.Name, entry.Version, entry.Timestamp)
+}
 
-	return json.Marshal(repodata)
+// recordInCooldown reports whether a package record with a millisecond
+// timestamp was published too recently. Records without a name or
+// timestamp are kept.
+func (h *CondaHandler) recordInCooldown(filename, name, version string, timestamp float64) bool {
+	if name == "" || timestamp == 0 {
+		return false
+	}
+	publishedAt := time.Unix(int64(timestamp)/condaTimestampDivisor, 0)
+	if h.proxy.Cooldown.IsAllowed("conda", canonicalPackagePURL("conda", name), publishedAt) {
+		return false
+	}
+	h.proxy.Logger.Info("cooldown: filtering conda package",
+		"name", name, "version", version, "filename", filename)
+	return true
+}
+
+// metadataCacheKey is the metadata cache key of a request path.
+func (h *CondaHandler) metadataCacheKey(urlPath string) string {
+	return hashedCacheKey(h.upstreamURL, urlPath)
 }
 
 // proxyCached forwards a metadata request with caching.
 func (h *CondaHandler) proxyCached(w http.ResponseWriter, r *http.Request) {
-	cacheKey := strings.TrimPrefix(r.URL.Path, "/")
-	cacheKey = strings.ReplaceAll(cacheKey, "/", "_")
+	cacheKey := h.metadataCacheKey(r.URL.Path)
 	// Large JSON indexes can exceed the metadata limit uncompressed. Conda
 	// clients decode Content-Encoding, so cache and relay gzip verbatim. The
 	// already-compressed repodata.json.bz2 route must stay on identity.

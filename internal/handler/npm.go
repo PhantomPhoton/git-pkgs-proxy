@@ -32,6 +32,11 @@ const (
 	// npmKeysPath serves the registry signing keys `npm audit signatures` reads.
 	npmKeysPath = "/-/npm/v1/keys"
 
+	// npmSearchPath is what `npm search` queries, with the terms in the query
+	// string. npmPingPath is what `npm ping` checks.
+	npmSearchPath = "/-/v1/search"
+	npmPingPath   = "/-/ping"
+
 	// npmSecurityMaxBody caps the audit payload. Buffering it lets an oversized
 	// body be refused before the upstream request starts.
 	npmSecurityMaxBody = 16 << 20
@@ -88,8 +93,19 @@ func (h *NPMHandler) Routes() http.Handler {
 			return
 		}
 
-		if r.URL.Path == npmKeysPath {
+		switch r.URL.Path {
+		case npmKeysPath:
 			h.proxy.ProxyUpstream(w, r, h.upstreamURL+npmKeysPath,
+				[]string{headerAccept, headerAcceptEncoding})
+			return
+		case npmSearchPath, npmPingPath:
+			// Every query has its own answer, so these are relayed uncached
+			// and keep their query string.
+			upstreamURL := h.upstreamURL + r.URL.Path
+			if r.URL.RawQuery != "" {
+				upstreamURL += "?" + r.URL.RawQuery
+			}
+			h.proxy.ProxyUpstream(w, r, upstreamURL,
 				[]string{headerAccept, headerAcceptEncoding})
 			return
 		}
@@ -198,7 +214,7 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	h.proxy.Logger.Info("npm metadata request", "package", packageName, "path", packagePath)
+	h.proxy.Logger.Debug("npm metadata request", "package", packageName, "path", packagePath)
 
 	registryURL, cacheKey := h.sourceFor(packageName)
 	// A version or dist-tag is its own path segment. Escaping the whole path
@@ -207,17 +223,7 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 	upstreamURL := registryURL + "/" + registryPath
 	metadataCacheKey := npmMetadataCacheKey(cacheKey, packagePath, packageName)
 
-	// Prefer the smaller abbreviated packument format but include application/json
-	// as a fallback so upstreams that reject the abbreviated type (e.g. JFrog
-	// Artifactory, which returns 406) can still respond with full metadata.
-	// When cooldown is enabled we must use full metadata exclusively because the
-	// abbreviated format omits the "time" map required for version age filtering.
-	// Operators can also force full metadata so clients that gate on publish
-	// age (for example Yarn's npmMinimalAgeGate) keep working through the proxy.
-	accept := npmAcceptDefault
-	if h.proxy.NPMFullMetadata || (h.proxy.Cooldown != nil && h.proxy.Cooldown.Enabled()) {
-		accept = contentTypeJSON
-	}
+	accept := h.packumentAccept()
 
 	specifier, versionLookup := npmVersionSpecifier(packagePath, packageName)
 	if h.serveLocalMetadata(w, r, npmMetadataRequest{packageName, specifier, versionLookup, upstreamURL, accept, metadataCacheKey}) {
@@ -234,7 +240,11 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	upstream := h.proxy.fetchMetadataDocument(r.Context(), "npm", metadataCacheKey, upstreamURL, accept)
+	var validate func([]byte) error
+	if !versionLookup {
+		validate = h.packumentValidator()
+	}
+	upstream := h.proxy.fetchMetadataDocument(r.Context(), "npm", metadataCacheKey, upstreamURL, accept, validate)
 	if err := upstream.err; err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			if versionLookup {
@@ -267,7 +277,8 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 			JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
 			return
 		}
-		if len(h.proxy.Denylist.Versions(canonicalPackagePURL("npm", packageName))) != 0 {
+		if h.proxy.mustFilterMetadata("npm", packageName) {
+			h.proxy.Logger.Error("failed to filter npm metadata", "package", packageName, "error", err)
 			JSONError(w, http.StatusBadGateway, "failed to filter package metadata")
 			return
 		}
@@ -282,11 +293,72 @@ func (h *NPMHandler) handlePackageMetadata(w http.ResponseWriter, r *http.Reques
 	serveRewrittenMetadata(w, r, rewritten)
 }
 
+// packumentAccept returns the Accept header packuments are requested with.
+// It prefers the smaller abbreviated packument format but includes
+// application/json as a fallback so upstreams that reject the abbreviated type
+// (e.g. JFrog Artifactory, which returns 406) can still respond with full
+// metadata. When cooldown is enabled we must use full metadata exclusively
+// because the abbreviated format omits the "time" map required for version age
+// filtering. Operators can also force full metadata so clients that gate on
+// publish age (for example Yarn's npmMinimalAgeGate) keep working through the
+// proxy.
+//
+// Every request for a packument uses it, since they share one cache row: a
+// request with another Accept would replace the document the others are
+// served with one in the other format.
+func (h *NPMHandler) packumentAccept() string {
+	if h.proxy.NPMFullMetadata || h.proxy.cooldownEnabled() {
+		return contentTypeJSON
+	}
+	return npmAcceptDefault
+}
+
+// errAbbreviatedPackument rejects an abbreviated packument where the full one
+// is needed.
+var errAbbreviatedPackument = errors.New("abbreviated packument where full metadata is required")
+
+// packumentValidator returns the check a packument must pass to be served or
+// cached, or nil when any document will do. Packuments share one cache row
+// whatever format they were fetched in, so one cached in abbreviated form
+// before cooldown or full metadata was turned on would otherwise still be
+// served, and used for the cooldown tarball check, while it stayed fresh or
+// as a stale copy when upstream failed. It has no "time" map, so cooldown
+// would let every version through. Rejecting it makes the lookup fetch the
+// full document instead.
+func (h *NPMHandler) packumentValidator() func([]byte) error {
+	if h.packumentAccept() != contentTypeJSON {
+		return nil
+	}
+	return requireFullPackument
+}
+
+// requireFullPackument rejects an abbreviated packument: one with the
+// top-level "modified" field the abbreviated format carries and no "time"
+// map. A full document without a time map, as some registries serve, is
+// let through as before, and so is anything that is not a JSON object,
+// leaving it to the usual handling.
+func requireFullPackument(body []byte) error {
+	var hasTime, hasModified bool
+	err := forEachJSONMember(body, func(m jsonMember) error {
+		switch key := m.key(body); {
+		case jsonKeyIs(key, "time"):
+			hasTime = true
+		case jsonKeyIs(key, "modified"):
+			hasModified = true
+		}
+		return nil
+	})
+	if err == nil && hasModified && !hasTime {
+		return errAbbreviatedPackument
+	}
+	return nil
+}
+
 // handleFilteredNPMVersionMetadata serves /pkg/<version> and /pkg/<tag> from the
 // filtered packument so cooldown and dist-tags match the root metadata response.
 func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *http.Request, packageName, specifier, accept, registryURL, cacheKey, metadataCacheKey string) {
 	_, packumentPath := npmMetadataPath(packageName)
-	packument, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", cacheKey, registryURL+"/"+packumentPath, accept)
+	packument, _, _, err := h.proxy.fetchOrCacheMetadata(r.Context(), "npm", cacheKey, registryURL+"/"+packumentPath, "", h.packumentValidator(), accept)
 	if err != nil {
 		if errors.Is(err, ErrUpstreamNotFound) {
 			JSONError(w, http.StatusNotFound, ErrPackageNotFound.Error())
@@ -316,7 +388,8 @@ func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *
 			JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
 			return
 		}
-		if len(h.proxy.Denylist.Versions(canonicalPackagePURL("npm", packageName))) != 0 {
+		if h.proxy.mustFilterMetadata("npm", packageName) {
+			h.proxy.Logger.Error("failed to filter npm metadata", "package", packageName, "error", err)
 			JSONError(w, http.StatusBadGateway, "failed to filter package metadata")
 			return
 		}
@@ -434,7 +507,9 @@ func (h *NPMHandler) rewriteMetadataWithLocal(packageName string, body []byte, l
 				return nil, nil, ErrVersionDenied
 			}
 			var out bytes.Buffer
-			h.writeNPMVersion(&out, packageName, version, body)
+			if h.writeNPMVersion(&out, packageName, version, body) {
+				h.logTarballRewrites(packageName, 1)
+			}
 			return out.Bytes(), []string{version}, nil
 		}
 		if len(h.proxy.Denylist.Versions(canonicalPackagePURL("npm", packageName))) != 0 {
@@ -586,6 +661,7 @@ func (d *npmPackument) write(writeValue func(out *bytes.Buffer, i int) error) ([
 func (h *NPMHandler) writeNPMVersions(out *bytes.Buffer, packageName string, versionsRaw []byte, keep map[string]any, local []npmLocalEntry) error {
 	out.WriteByte('{')
 	first := true
+	rewritten := 0
 	err := forEachJSONMember(versionsRaw, func(m jsonMember) error {
 		version, err := jsonKey(m.key(versionsRaw))
 		if err != nil {
@@ -600,9 +676,12 @@ func (h *NPMHandler) writeNPMVersions(out *bytes.Buffer, packageName string, ver
 		first = false
 		out.Write(m.key(versionsRaw))
 		out.WriteByte(':')
-		h.writeNPMVersion(out, packageName, version, m.value(versionsRaw))
+		if h.writeNPMVersion(out, packageName, version, m.value(versionsRaw)) {
+			rewritten++
+		}
 		return nil
 	})
+	h.logTarballRewrites(packageName, rewritten)
 	for _, e := range local {
 		if !first {
 			out.WriteByte(',')
@@ -618,48 +697,50 @@ func (h *NPMHandler) writeNPMVersions(out *bytes.Buffer, packageName string, ver
 }
 
 // writeNPMVersion writes one version entry with its dist.tarball pointing at
-// this proxy. An entry without a string tarball is written unchanged.
-func (h *NPMHandler) writeNPMVersion(out *bytes.Buffer, packageName, version string, raw []byte) {
+// this proxy, and reports whether it rewrote the tarball. An entry without a
+// string tarball is written unchanged.
+func (h *NPMHandler) writeNPMVersion(out *bytes.Buffer, packageName, version string, raw []byte) bool {
 	dist, ok, err := findJSONMember(raw, "dist")
 	if err != nil || !ok {
 		out.Write(raw)
-		return
+		return false
 	}
 	distRaw := dist.value(raw)
 	tarball, ok, err := findJSONMember(distRaw, "tarball")
 	if err != nil || !ok || distRaw[tarball.valStart] != '"' {
 		out.Write(raw)
-		return
+		return false
 	}
 	var oldTarball string
 	if err := json.Unmarshal(tarball.value(distRaw), &oldTarball); err != nil {
 		out.Write(raw)
-		return
+		return false
 	}
 
 	newTarball := h.proxyTarballURL(packageName, version, oldTarball)
 	encoded, err := json.Marshal(newTarball)
 	if err != nil {
 		out.Write(raw)
-		return
+		return false
 	}
 	out.Write(raw[:dist.valStart+tarball.valStart])
 	out.Write(encoded)
 	out.Write(raw[dist.valStart+tarball.valEnd:])
-
-	h.proxy.Logger.Debug("rewrote tarball URL",
-		"package", packageName, "version", version,
-		"old", oldTarball, "new", newTarball)
+	return true
 }
 
-// writeFilteredJSONObject writes the object obj holds, keeping the members
-// whose decoded key keep accepts.
-func writeFilteredJSONObject(out *bytes.Buffer, obj []byte, keep func(string) bool) error {
-	return writeFilteredJSONObjectWith(out, obj, keep, nil)
+// logTarballRewrites logs once per document how many tarball URLs it
+// rewrote. A line per version flooded debug logs: packages such as eslint
+// list hundreds of versions, and with cooldown on every request rewrites
+// the document again.
+func (h *NPMHandler) logTarballRewrites(packageName string, count int) {
+	if count > 0 {
+		h.proxy.Logger.Debug("rewrote tarball URLs", "package", packageName, "count", count)
+	}
 }
 
-// writeFilteredJSONObjectWith is writeFilteredJSONObject followed by extra
-// string members.
+// writeFilteredJSONObjectWith keeps members whose decoded keys match keep,
+// then appends extra string members.
 func writeFilteredJSONObjectWith(out *bytes.Buffer, obj []byte, keep func(string) bool, extra [][2]string) error {
 	out.WriteByte('{')
 	first := true
@@ -816,7 +897,7 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxy.Logger.Info("npm download request",
+	h.proxy.Logger.Debug("npm download request",
 		"package", packageName, "version", version, "filename", filename)
 
 	if h.proxy.versionDenied("npm", packageName, version) {
@@ -841,10 +922,23 @@ func (h *NPMHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	registryURL, cacheKey := h.sourceFor(packageName)
 	metadata := sync.OnceValues(func() ([]byte, error) {
 		upstreamURL := registryURL + "/" + url.PathEscape(packageName)
-		body, _, err := h.proxy.FetchOrCacheMetadata(r.Context(), "npm", cacheKey, upstreamURL, contentTypeJSON)
+		body, _, _, err := h.proxy.fetchOrCacheMetadata(r.Context(), "npm", cacheKey, upstreamURL, "", h.packumentValidator(), h.packumentAccept())
 		return body, err
 	})
-	if h.versionInCooldown(packageName, version, metadata) {
+	inCooldown, err := h.versionInCooldown(packageName, version, metadata)
+	if err != nil {
+		if h.proxy.serveCachedDespiteCooldownError(w, r, "npm", packageName, version, h.routes.cacheFilename(packageName, filename), err) {
+			return
+		}
+		if writeUpstreamHeld(w, err) {
+			return
+		}
+		h.proxy.Logger.Warn("cooldown: could not read npm publish time",
+			"package", packageName, "version", version, "error", err)
+		JSONError(w, http.StatusBadGateway, "failed to check cooldown")
+		return
+	}
+	if inCooldown {
 		h.proxy.Logger.Info("cooldown: withholding npm tarball",
 			"package", packageName, "version", version)
 		JSONError(w, http.StatusNotFound, ErrVersionNotFound.Error())
@@ -876,18 +970,21 @@ func (h *NPMHandler) getTarball(r *http.Request, registryURL, packageName, versi
 	if cached, err := h.proxy.GetCachedArtifact(r.Context(), "npm", packageName, version, cacheFilename); err != nil || cached != nil {
 		return cached, err
 	}
-	downloadURL := fmt.Sprintf("%s/%s/-/%s", registryURL, escapeNPMDownloadPackage(packageName), url.PathEscape(filename))
-	var sri string
+	// The packument says where the tarball is and what it must hash to.
+	// Without it the tarball could not be verified, and an unverified copy
+	// would be cached and served to everyone, so the download fails instead.
 	body, err := metadata()
-	if err == nil {
-		if tarball := npmVersionTarball(body, version); tarball != "" {
-			downloadURL, err = validateTarballURL(tarball, registryURL)
-			if err != nil {
-				return nil, err
-			}
-		}
-		sri = npmVersionIntegrity(body, version)
+	if err != nil {
+		return nil, fmt.Errorf("fetching npm metadata to verify tarball: %w", err)
 	}
+	downloadURL := fmt.Sprintf("%s/%s/-/%s", registryURL, escapeNPMDownloadPackage(packageName), url.PathEscape(filename))
+	if tarball := npmVersionTarball(body, version); tarball != "" {
+		downloadURL, err = validateTarballURL(tarball, registryURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	sri := npmVersionIntegrity(body, version)
 	return h.proxy.GetOrFetchArtifactFromURLWithIntegrity(r.Context(), "npm", packageName, version, cacheFilename, downloadURL, sri)
 }
 
@@ -949,7 +1046,8 @@ func validateTarballURL(raw, registryURL string) (string, error) {
 // proxy has never seen, persisting the parsed time so the packument is
 // fetched and parsed at most once per version. A version with no usable
 // publish time is allowed through, matching how applyCooldownFiltering
-// treats it.
+// treats it. A packument that can't be fetched or parsed is an error, so a
+// failing upstream can't let a version through.
 //
 // The versions row is keyed by the plain version PURL, which does not say
 // which registry the version came from, so routed packages leave it alone:
@@ -958,39 +1056,38 @@ func validateTarballURL(raw, registryURL string) (string, error) {
 // for a private version of the same name, a private time would hold back the
 // public version, and moving a route to another upstream would keep the old
 // one's times.
-func (h *NPMHandler) versionInCooldown(packageName, version string, metadata func() ([]byte, error)) bool {
-	if h.proxy.Cooldown == nil || !h.proxy.Cooldown.Enabled() {
-		return false
+func (h *NPMHandler) versionInCooldown(packageName, version string, metadata func() ([]byte, error)) (bool, error) {
+	if !h.proxy.cooldownApplies("npm", packageName) {
+		return false, nil
 	}
 
 	_, routed := h.routes.match(packageName)
 	versionPURL := canonicalVersionPURL("npm", packageName, version)
 	if !routed {
 		if ver, err := h.proxy.DB.GetVersionByPURL(versionPURL); err == nil && ver != nil && ver.PublishedAt.Valid {
-			return !h.proxy.Cooldown.IsAllowed("npm", canonicalPackagePURL("npm", packageName), ver.PublishedAt.Time)
+			return !h.proxy.Cooldown.IsAllowed("npm", canonicalPackagePURL("npm", packageName), ver.PublishedAt.Time), nil
 		}
 	}
 
 	body, err := metadata()
+	if errors.Is(err, ErrUpstreamNotFound) {
+		return false, nil
+	}
 	if err != nil {
-		h.proxy.Logger.Warn("cooldown: could not fetch npm metadata for download check",
-			"package", packageName, "version", version, "error", err)
-		return false
+		return false, err
 	}
 
 	published, ok, err := lookupJSONString(body, "time", version)
 	if err != nil {
-		h.proxy.Logger.Warn("cooldown: could not parse npm metadata for download check",
-			"package", packageName, "version", version, "error", err)
-		return false
+		return false, fmt.Errorf("parsing npm metadata: %w", err)
 	}
 	if !ok {
-		return false
+		return false, nil
 	}
 
 	publishedAt, err := time.Parse(time.RFC3339, published)
 	if err != nil {
-		return false
+		return false, nil
 	}
 
 	if !routed {
@@ -1000,7 +1097,7 @@ func (h *NPMHandler) versionInCooldown(packageName, version string, metadata fun
 		}
 	}
 
-	return !h.proxy.Cooldown.IsAllowed("npm", canonicalPackagePURL("npm", packageName), publishedAt)
+	return !h.proxy.Cooldown.IsAllowed("npm", canonicalPackagePURL("npm", packageName), publishedAt), nil
 }
 
 // npmMetadataPath returns the package name and the encoded registry path.

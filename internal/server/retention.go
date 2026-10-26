@@ -47,23 +47,29 @@ func (s *Server) startRetentionLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.ParseRetentionSweepInterval())
 	defer ticker.Stop()
 
-	sweepRetention(ctx, s.db, s.logger, reg, rules, time.Now())
+	s.sweepRetention(ctx, reg, rules)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sweepRetention(ctx, s.db, s.logger, reg, rules, time.Now())
+			s.sweepRetention(ctx, reg, rules)
 		}
 	}
 }
 
-// notCovered returns the known ecosystem keys that are not in covered.
+func (s *Server) sweepRetention(ctx context.Context, reg *retention.Registry, rules retention.Rules) {
+	s.runExclusive(ctx, "retention", func() {
+		sweepRetention(ctx, s.db, s.logger, reg, rules, time.Now())
+	})
+}
+
+// notCovered returns the known ecosystem keys the global default cannot reach.
 func notCovered(covered []string) []string {
 	var missing []string
 	for _, key := range retention.KnownKeys {
-		if !slices.Contains(covered, key) {
+		if key == "generic" || !slices.Contains(covered, key) {
 			missing = append(missing, key)
 		}
 	}

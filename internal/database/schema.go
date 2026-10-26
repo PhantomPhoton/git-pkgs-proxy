@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -78,6 +79,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -85,6 +87,18 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
 	queued_at DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at);
+
+CREATE TABLE IF NOT EXISTS job_runs (
+	name TEXT NOT NULL PRIMARY KEY,
+	started_at DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fetch_leases (
+	key TEXT NOT NULL PRIMARY KEY,
+	owner TEXT NOT NULL,
+	expires_at DATETIME NOT NULL,
+	failed BOOLEAN NOT NULL DEFAULT FALSE
+);
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
 	id INTEGER PRIMARY KEY,
@@ -116,10 +130,14 @@ CREATE TABLE IF NOT EXISTS metadata_cache (
 	size INTEGER,
 	last_modified DATETIME,
 	fetched_at DATETIME,
+	last_accessed_at DATETIME,
 	created_at DATETIME,
 	updated_at DATETIME
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_eco_name ON metadata_cache(ecosystem, name);
+CREATE INDEX IF NOT EXISTS idx_metadata_storage_path ON metadata_cache(storage_path);
+CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache(COALESCE(last_accessed_at, updated_at));
+CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts(COALESCE(last_accessed_at, fetched_at));
 
 CREATE TABLE IF NOT EXISTS metadata_dates (
 	ecosystem TEXT NOT NULL,
@@ -128,6 +146,11 @@ CREATE TABLE IF NOT EXISTS metadata_dates (
 	etag TEXT NOT NULL,
 	last_modified INTEGER NOT NULL,
 	PRIMARY KEY (ecosystem, proxy_url, name)
+);
+
+CREATE TABLE IF NOT EXISTS upstream_holds (
+	host TEXT NOT NULL PRIMARY KEY,
+	until_ms INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS migrations (
@@ -198,6 +221,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -205,6 +229,18 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
 	queued_at TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at);
+
+CREATE TABLE IF NOT EXISTS job_runs (
+	name TEXT NOT NULL PRIMARY KEY,
+	started_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fetch_leases (
+	key TEXT NOT NULL PRIMARY KEY,
+	owner TEXT NOT NULL,
+	expires_at TIMESTAMP NOT NULL,
+	failed BOOLEAN NOT NULL DEFAULT FALSE
+);
 
 CREATE TABLE IF NOT EXISTS vulnerabilities (
 	id SERIAL PRIMARY KEY,
@@ -236,10 +272,14 @@ CREATE TABLE IF NOT EXISTS metadata_cache (
 	size BIGINT,
 	last_modified TIMESTAMP,
 	fetched_at TIMESTAMP,
+	last_accessed_at TIMESTAMP,
 	created_at TIMESTAMP,
 	updated_at TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_metadata_eco_name ON metadata_cache(ecosystem, name);
+CREATE INDEX IF NOT EXISTS idx_metadata_storage_path ON metadata_cache(storage_path);
+CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache((COALESCE(last_accessed_at, updated_at)) NULLS FIRST);
+CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts((COALESCE(last_accessed_at, fetched_at)) NULLS FIRST);
 
 CREATE TABLE IF NOT EXISTS metadata_dates (
 	ecosystem TEXT NOT NULL,
@@ -248,6 +288,11 @@ CREATE TABLE IF NOT EXISTS metadata_dates (
 	etag TEXT NOT NULL,
 	last_modified BIGINT NOT NULL,
 	PRIMARY KEY (ecosystem, proxy_url, name)
+);
+
+CREATE TABLE IF NOT EXISTS upstream_holds (
+	host TEXT NOT NULL PRIMARY KEY,
+	until_ms BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS migrations (
@@ -277,6 +322,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -300,6 +346,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -411,6 +458,11 @@ var migrations = []migration{
 	{"011_add_metadata_dates", migrateAddMetadataDates},
 	{"012_add_artifact_source", migrateAddArtifactSource},
 	{"013_add_artifact_manifest", migrateAddArtifactManifest},
+	{"014_add_metadata_last_accessed", migrateAddMetadataLastAccessed},
+	{"015_add_job_runs", migrateAddJobRuns},
+	{"016_add_fetch_leases", migrateAddFetchLeases},
+	{"017_add_artifact_content_hash_index", migrateAddArtifactContentHashIndex},
+	{"018_add_upstream_holds", migrateAddUpstreamHolds},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -480,9 +532,19 @@ func (db *DB) recordAllMigrations() error {
 	return nil
 }
 
+// schemaLock serialises schema creation and migrations across instances
+// sharing a Postgres database.
+const schemaLock = "schema"
+
 // MigrateSchema applies any unapplied migrations in order.
 // For a fully migrated database this executes a single SELECT query.
+// Instances sharing a Postgres database run it one after the other, so each
+// sees the migrations the one before it recorded.
 func (db *DB) MigrateSchema() error {
+	return db.WithLock(context.Background(), schemaLock, db.migrateSchema)
+}
+
+func (db *DB) migrateSchema() error {
 	applied, err := db.appliedMigrations()
 	if err != nil {
 		return err
@@ -700,12 +762,75 @@ func migrateAddPendingDeletes(db *DB) error {
 	return nil
 }
 
+// migrateAddJobRuns creates the table that records when a scheduled job
+// last started, so instances sharing the database run it once per interval.
+func migrateAddJobRuns(db *DB) error {
+	ts := sqliteDatetime
+	if db.dialect == DialectPostgres {
+		ts = postgresTimestamp
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS job_runs (
+		name TEXT NOT NULL PRIMARY KEY,
+		started_at %s NOT NULL
+	)`, ts)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating job_runs table: %w", err)
+	}
+	return nil
+}
+
+// migrateAddFetchLeases creates the table instances sharing a Postgres
+// database use to fetch each cache miss from upstream only once.
+func migrateAddFetchLeases(db *DB) error {
+	ts := sqliteDatetime
+	if db.dialect == DialectPostgres {
+		ts = postgresTimestamp
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS fetch_leases (
+		key TEXT NOT NULL PRIMARY KEY,
+		owner TEXT NOT NULL,
+		expires_at %s NOT NULL,
+		failed BOOLEAN NOT NULL DEFAULT FALSE
+	)`, ts)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating fetch_leases table: %w", err)
+	}
+	return nil
+}
+
+// migrateAddUpstreamHolds creates the table through which instances sharing
+// the database honour each other's upstream rate-limit holds.
+func migrateAddUpstreamHolds(db *DB) error {
+	millis := "INTEGER"
+	if db.dialect == DialectPostgres {
+		millis = "BIGINT"
+	}
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS upstream_holds (
+		host TEXT NOT NULL PRIMARY KEY,
+		until_ms %s NOT NULL
+	)`, millis)
+	if _, err := db.Exec(query); err != nil {
+		return fmt.Errorf("creating upstream_holds table: %w", err)
+	}
+	return nil
+}
+
 // migrateAddPendingDeletesQueuedAtIndex indexes the column reclaim orders
 // the queue by, which grows large after a retention sweep.
 func migrateAddPendingDeletesQueuedAtIndex(db *DB) error {
 	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_deletes_queued_at ON pending_deletes(queued_at)`)
 	if err != nil {
 		return fmt.Errorf("creating pending_deletes queued_at index: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactContentHashIndex indexes artifacts by content, so an
+// artifact already stored under another name can be found by its hash.
+func migrateAddArtifactContentHashIndex(db *DB) error {
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)`)
+	if err != nil {
+		return fmt.Errorf("creating artifacts content_hash index: %w", err)
 	}
 	return nil
 }
@@ -817,6 +942,40 @@ func migrateAddArtifactManifest(db *DB) error {
 	}
 	if _, err := db.Exec(`ALTER TABLE artifacts ADD COLUMN manifest TEXT`); err != nil {
 		return fmt.Errorf("adding column manifest to artifacts: %w", err)
+	}
+	return nil
+}
+
+// migrateAddMetadataLastAccessed records when cached metadata was last served,
+// for size eviction. Existing rows are backfilled in the background
+// (BackfillMetadataLastAccessed), so startup does not wait for them.
+func migrateAddMetadataLastAccessed(db *DB) error {
+	hasCol, err := db.HasColumn("metadata_cache", "last_accessed_at")
+	if err != nil {
+		return fmt.Errorf("checking column last_accessed_at: %w", err)
+	}
+	if !hasCol {
+		ts := sqliteDatetime
+		if db.dialect == DialectPostgres {
+			ts = postgresTimestamp
+		}
+		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE metadata_cache ADD COLUMN last_accessed_at %s", ts)); err != nil {
+			return fmt.Errorf("adding column last_accessed_at to metadata_cache: %w", err)
+		}
+	}
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_metadata_storage_path ON metadata_cache(storage_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache(COALESCE(last_accessed_at, updated_at))`,
+		`CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts(COALESCE(last_accessed_at, fetched_at))`,
+	}
+	if db.dialect == DialectPostgres {
+		indexes[1] = `CREATE INDEX IF NOT EXISTS idx_metadata_last_used ON metadata_cache((COALESCE(last_accessed_at, updated_at)) NULLS FIRST)`
+		indexes[2] = `CREATE INDEX IF NOT EXISTS idx_artifacts_last_used ON artifacts((COALESCE(last_accessed_at, fetched_at)) NULLS FIRST)`
+	}
+	for _, q := range indexes {
+		if _, err := db.Exec(q); err != nil {
+			return fmt.Errorf("indexing metadata_cache: %w", err)
+		}
 	}
 	return nil
 }

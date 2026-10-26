@@ -1,6 +1,8 @@
-# More than one replica requires config.data.database on Postgres,
-# config.data.storage on object storage, deploymentStrategy: RollingUpdate,
-# and a PVC access mode other than ReadWriteOnce (or persistence disabled).
+# More than one replica requires config.data.database on Postgres and
+# deploymentStrategy: RollingUpdate. Storage can be object storage (with
+# persistence disabled) or a file:// URL on a ReadWriteMany volume
+# (persistence.accessModes: [ReadWriteMany]). With upstream.git, each
+# replica also needs its own git.cache_dir.
 replicaCount: 1
 
 nameOverride: ""
@@ -100,6 +102,10 @@ containerSecurityContext:
   capabilities:
     drop:
       - ALL
+
+# /tmp is an emptyDir, since the root filesystem is read-only.
+tmpDir:
+  sizeLimit: ""
 
 resources: {}
 #  requests:
