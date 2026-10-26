@@ -184,9 +184,7 @@ func (h *JuliaHandler) cachedPackage(ctx context.Context, hash string) *CacheRes
 
 // JuliaPackageDownload returns the URL of a package's tarball on the Pkg
 // server at upstreamURL, or the default one when empty, and the file name the
-// Julia handler caches it under. The handler caches a package tarball as
-// version treeHash, the git tree hash of the package's source, under the
-// package's name in the General registry.
+// Julia handler caches it under.
 func JuliaPackageDownload(upstreamURL, uuid, treeHash string) (url, filename string, err error) {
 	if !validJuliaUUID(uuid) {
 		return "", "", fmt.Errorf("invalid julia package uuid %q", uuid)

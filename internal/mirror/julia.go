@@ -25,12 +25,8 @@ func (r RegistryVersions) FindPackage(ctx context.Context, ecosystem, name strin
 	return reg.FetchPackage(ctx, name)
 }
 
-// mirrorJulia mirrors the source tarball of a version of a package in the
-// General registry from the Pkg server, under the name and tree hash the
-// Julia handler caches it as. The registry gives the tree hash, and the
-// tarball is fetched unchecked, as the handler fetches it: Pkg checks the
-// tree hash of what it extracts. The registry and the package's artifacts
-// are not mirrored.
+// mirrorJulia fetches the tarball unchecked because Pkg checks the tree hash
+// of what it extracts.
 func (m *Mirror) mirrorJulia(ctx context.Context, pv PackageVersion, tracker *progressTracker) {
 	fail := func(err error) { m.recordFailure(tracker, pv, err) }
 	uuid := strings.ToLower(pv.Qualifiers["uuid"])

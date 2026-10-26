@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
 CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
+CREATE INDEX IF NOT EXISTS idx_artifacts_filename ON artifacts(filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -222,6 +223,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
 CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
+CREATE INDEX IF NOT EXISTS idx_artifacts_filename ON artifacts(filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS pending_deletes (
@@ -323,6 +325,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
 CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
+CREATE INDEX IF NOT EXISTS idx_artifacts_filename ON artifacts(filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -347,6 +350,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_version_filename ON artifacts(version_purl, filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path ON artifacts(storage_path);
 CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash);
+CREATE INDEX IF NOT EXISTS idx_artifacts_filename ON artifacts(filename);
 CREATE INDEX IF NOT EXISTS idx_artifacts_last_accessed ON artifacts(last_accessed_at);
 `
 
@@ -463,6 +467,7 @@ var migrations = []migration{
 	{"016_add_fetch_leases", migrateAddFetchLeases},
 	{"017_add_artifact_content_hash_index", migrateAddArtifactContentHashIndex},
 	{"018_add_upstream_holds", migrateAddUpstreamHolds},
+	{"019_add_artifact_filename_index", migrateAddArtifactFilenameIndex},
 }
 
 // isTableNotFound returns true if the error indicates a missing table.
@@ -831,6 +836,16 @@ func migrateAddArtifactContentHashIndex(db *DB) error {
 	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)`)
 	if err != nil {
 		return fmt.Errorf("creating artifacts content_hash index: %w", err)
+	}
+	return nil
+}
+
+// migrateAddArtifactFilenameIndex indexes artifacts by filename, for
+// lookups that don't know the version, such as CachedArtifactNames.
+func migrateAddArtifactFilenameIndex(db *DB) error {
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_artifacts_filename ON artifacts(filename)`)
+	if err != nil {
+		return fmt.Errorf("creating artifacts filename index: %w", err)
 	}
 	return nil
 }
