@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -138,7 +139,7 @@ func TestHelmChartLookupFollowsIndex(t *testing.T) {
 	proxy.MetadataTTL = time.Hour
 	h := NewHelmHandler(proxy, "http://proxy.example", map[string]string{"stable": upstream.URL})
 	index := func() metadataResult {
-		return h.fetchIndex(httptest.NewRequest(http.MethodGet, "/", nil), "stable", upstream.URL)
+		return h.fetchIndex(context.Background(), "stable", upstream.URL)
 	}
 
 	first, err := h.findChartDownload("stable", upstream.URL, index(), digestA, "a-1.0.0.tgz")
