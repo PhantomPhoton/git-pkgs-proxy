@@ -95,7 +95,7 @@ func buildHexSigned(payload []byte) []byte {
 func TestHexFilterPackageReleases(t *testing.T) {
 	pkg := buildHexPackage("phoenix", []string{testVersion100, "2.0.0", "3.0.0"})
 
-	filtered, err := filterPackageReleases(pkg, map[string]bool{"2.0.0": true})
+	filtered, err := filterPackageReleases(pkg, map[string]bool{"2.0.0": true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1555,7 +1555,7 @@ func (p *Proxy) cachedMetadataState(ctx context.Context, ecosystem, cacheKey str
 	if entry != nil && p.MetadataTTL > 0 && entry.FetchedAt.Valid && time.Since(entry.FetchedAt.Time) < p.MetadataTTL {
 		data, ct, err := p.readCachedMetadata(ctx, entry, validate)
 		if err == nil {
-			hit := metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String}.describedBy(entry)
+			hit := metadataResult{body: data, contentType: ct, contentEncoding: entry.ContentEncoding.String, fromCache: true}.describedBy(entry)
 			return entry, &hit
 		}
 		if validate != nil {
@@ -1564,6 +1564,31 @@ func (p *Proxy) cachedMetadataState(ctx context.Context, ecosystem, cacheKey str
 		// Cache file missing/unreadable, fall through to upstream
 	}
 	return entry, nil
+}
+
+// refreshMetadata is lookupMetadata for a document whose cached copy is known
+// to be out of date although it is within its TTL. It skips the TTL and asks
+// upstream, revalidating the cached copy with its validators, and falls back
+// to that copy if upstream fails, which the result reports as stale.
+// Concurrent refreshes of one document share a fetch.
+func (p *Proxy) refreshMetadata(ctx context.Context, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding string, validate func([]byte) error) metadataResult {
+	if containsPathTraversal(cacheKey) {
+		return metadataResult{err: fmt.Errorf("invalid cache key: %q", cacheKey)}
+	}
+	key := metadataCoalesceKey(ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate != nil) + "\x00refresh"
+	res, shared := p.coalesceMetadata(ctx, key, func(fetchCtx context.Context) metadataResult {
+		var entry *database.MetadataCacheEntry
+		if p.CacheMetadata && p.DB != nil {
+			entry, _ = p.DB.GetMetadataCache(ecosystem, cacheKey)
+		}
+		return p.fetchMetadataFromUpstream(fetchCtx, ecosystem, cacheKey, upstreamURL, accept, acceptEncoding, validate, entry)
+	})
+	if shared && res.err == nil && validate != nil {
+		if err := validate(res.body); err != nil {
+			return metadataResult{err: err}
+		}
+	}
+	return res
 }
 
 // fetchMetadataFromUpstream fetches metadata after a cache miss, caches it,
@@ -1634,6 +1659,9 @@ type metadataResult struct {
 	// stale is set when the body is the cached copy served because upstream
 	// failed.
 	stale bool
+	// fromCache is set when the body is a stored copy within its TTL, read
+	// without asking upstream.
+	fromCache bool
 }
 
 // describedBy returns res with the digest that entry, the cache row its body
