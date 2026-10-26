@@ -581,33 +581,43 @@ func (db *DB) GetCachedArtifactCount() (int64, error) {
 }
 
 // ClearArtifactCache marks an artifact uncached if its record still points at
-// storagePath, and reports whether it did. A record a newer fetch has moved
-// elsewhere is left alone, so a clear never orphans the object that fetch
-// committed.
+// storagePath, queues storagePath for deletion in the same transaction, and
+// reports whether it did. A record a newer fetch has moved elsewhere is left
+// alone, so a clear never orphans the object that fetch committed. If
+// queueing fails, the record keeps its path.
 func (db *DB) ClearArtifactCache(versionPURL, filename, storagePath string) (bool, error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	query := db.Rebind(`
 		UPDATE artifacts
 		SET storage_path = NULL, content_hash = NULL, size = NULL,
 		    content_type = NULL, fetched_at = NULL, updated_at = ?
 		WHERE version_purl = ? AND filename = ? AND storage_path = ?
 	`)
-	res, err := db.Exec(query, time.Now(), versionPURL, filename, storagePath)
+	res, err := tx.Exec(query, time.Now(), versionPURL, filename, storagePath)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
-	return n > 0, err
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := tx.Exec(db.Rebind(queuePendingDeleteQuery), storagePath, time.Now().UTC()); err != nil {
+		return false, fmt.Errorf("queueing %s for deletion: %w", storagePath, err)
+	}
+	return true, tx.Commit()
 }
 
-// DiscardArtifact clears the record as ClearArtifactCache does and queues
-// storagePath for deletion, for callers that must not delete an object another
+// DiscardArtifact clears the record and queues storagePath as
+// ClearArtifactCache does, for callers that must not delete an object another
 // request may be reading.
 func (db *DB) DiscardArtifact(versionPURL, filename, storagePath string) error {
-	cleared, err := db.ClearArtifactCache(versionPURL, filename, storagePath)
-	if err != nil || !cleared {
-		return err
-	}
-	return db.QueuePendingDelete(storagePath)
+	_, err := db.ClearArtifactCache(versionPURL, filename, storagePath)
+	return err
 }
 
 // QueuePendingDelete queues a storage path no record points at any more.
