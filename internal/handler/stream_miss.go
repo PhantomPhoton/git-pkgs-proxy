@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -13,12 +14,12 @@ import (
 	"github.com/opencontainers/go-digest"
 )
 
-// On a cache miss the proxy used to store the whole artifact before sending
-// any of it, so a client with an idle timeout (git-lfs gives up after 30
-// seconds without data, pacman after 10) could give up on a large one. A
-// marked request instead gets the bytes as they arrive from upstream while
-// they are stored: the caller that starts the shared fetch is handed a
-// stream, and callers joining it still wait for the stored artifact.
+// On a cache miss a marked request is sent the bytes as they arrive from
+// upstream while they are stored, rather than after the whole artifact is
+// stored. Clients with idle timeouts need this for large artifacts: git-lfs
+// gives up after 30 seconds without data, pacman after 10. The caller that
+// starts the shared fetch is handed the stream; callers joining it still wait
+// for the stored artifact.
 
 type streamCacheMissKey struct{}
 
@@ -138,15 +139,9 @@ func (p *Proxy) storeFetched(ctx context.Context, ecosystem, name, version, file
 var errNoReaderLeft = errors.New("neither storage nor the client is reading the artifact")
 
 // storeWhileServing copies the upstream body to storage and to the client at
-// once. The client's copy is checked against upstreamHash and declared as it
-// is read, and a mismatch fails it before its last bytes, so the response is
-// aborted and the client discards it; storeArtifact checks the stored copy
-// the same way and doesn't cache it. A client that goes away leaves the copy
-// to storage running. A storage error leaves the client's copy running, so
-// the client still gets the artifact; that is logged and counted, since every
-// request would otherwise succeed while nothing is cached. The client's
-// stream ends once the last byte is checked, before storeArtifact's scan and
-// database update.
+// once, at the upstream's speed; see missFeed for a client that can't keep up.
+// The client's copy is checked before its last bytes, so a mismatch aborts
+// the response. A storage failure leaves the client's copy running.
 func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared string, artifact *fetch.Artifact) (artifacts.Artifact, string, error) {
 	hash := strings.ToLower(upstreamHash)
 	checks, err := newIntegrityChecks(hash, declared)
@@ -155,10 +150,10 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 		return artifacts.Artifact{}, "", err
 	}
 
-	clientR, clientW := io.Pipe()
-	var client io.ReadCloser = clientR
+	feed := newMissFeed(clientFeedLimit)
+	var client io.ReadCloser = feed
 	if hash != "" || declared != "" {
-		if client, err = checks.wrapFailOnMismatch(clientR, func(reason string) {
+		if client, err = checks.wrapFailOnMismatch(feed, func(reason string) {
 			p.Logger.Warn("artifact sent on a cache miss failed its integrity check; aborting the response",
 				"purl", versionPURL, "filename", filename, "reason", reason)
 		}); err != nil {
@@ -181,7 +176,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 		stream.Artifact.Digest = digest.Digest("sha256:" + hash)
 	}
 	if !h.offer(stream) {
-		_ = clientR.Close()
+		_ = feed.Close()
 		return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact)
 	}
 
@@ -205,13 +200,17 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 		storeDone <- stored{a, path, err}
 	}()
 
-	readErr, clientOK := copyToBoth(artifact.Body, storeW, clientW)
+	readErr := copyToBoth(artifact.Body, storeW, feed)
 	_ = artifact.Body.Close()
 	_ = storeW.CloseWithError(readErr)
-	_ = clientW.CloseWithError(readErr)
+	feed.end(readErr)
 
 	out := <-storeDone
-	if out.err != nil && readErr == nil && clientOK {
+	if feed.lagging() {
+		// Opened before returning, so an unrecorded object is still there.
+		feed.resolve(p.openStoredForFeed(ctx, out.artifact, out.path, out.err))
+	}
+	if out.err != nil && readErr == nil && feed.fedFully() {
 		p.Logger.Error("artifact sent to the client but not cached",
 			"purl", versionPURL, "filename", filename, "url", upstreamURL, "error", out.err)
 		metrics.RecordArtifactServedUncached(ecosystem, metrics.FailureDetail{
@@ -220,14 +219,27 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 	return out.artifact, out.path, out.err
 }
 
-// copyToBoth copies src to store and client until src ends, dropping either
-// destination once a write to it fails. It returns the error that ended the
-// copy, nil at the end of src, and whether the client took every byte.
-func copyToBoth(src io.Reader, store, client io.Writer) (error, bool) {
+// openStoredForFeed opens the stored copy for a client that fell behind. An
+// unrecorded object is opened too: it is deleted only after this returns.
+func (p *Proxy) openStoredForFeed(ctx context.Context, a artifacts.Artifact, path string, storeErr error) (io.ReadCloser, error) {
+	if storeErr != nil && !errors.Is(storeErr, errUnrecorded) {
+		return nil, storeErr
+	}
+	res, err := p.openStoredArtifact(ctx, a, path)
+	if err != nil {
+		return nil, err
+	}
+	return res.Reader, nil
+}
+
+// copyToBoth copies src to store and to the client's feed until src ends,
+// dropping the store once a write to it fails. It returns the error that
+// ended the copy, nil at the end of src. Feeding the client never blocks.
+func copyToBoth(src io.Reader, store io.Writer, client *missFeed) error {
 	buffer := artifactCopyBufferPool.Get().(*[]byte)
 	defer artifactCopyBufferPool.Put(buffer)
 	buf := *buffer
-	storeOK, clientOK := true, true
+	storeOK := true
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
@@ -236,20 +248,176 @@ func copyToBoth(src io.Reader, store, client io.Writer) (error, bool) {
 					storeOK = false
 				}
 			}
-			if clientOK {
-				if _, werr := client.Write(buf[:n]); werr != nil {
-					clientOK = false
-				}
-			}
-			if !storeOK && !clientOK {
-				return errNoReaderLeft, false
+			// A client that has gone, or that waits for the stored copy,
+			// has no use for the rest once storing has failed.
+			if !client.push(buf[:n]) && !storeOK {
+				return errNoReaderLeft
 			}
 		}
 		if errors.Is(err, io.EOF) {
-			return nil, clientOK
+			return nil
 		}
 		if err != nil {
-			return err, false
+			return err
 		}
 	}
+}
+
+// clientFeedLimit bounds the bytes held for a client that reads a streamed
+// miss slower than they arrive. A variable so tests can lower it.
+var clientFeedLimit = 8 << 20
+
+// missFeed is the client's side of a streamed miss. The upstream read pushes
+// into it without blocking, so a slow client can't hold back the copy to
+// storage, the fetch lease or the callers waiting on the fetch. Once the
+// client is more than the limit behind, it stops being fed: it reads what
+// is held, then continues from the stored copy where it left off.
+type missFeed struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	chunks [][]byte
+	held   int
+	limit  int
+	// fed counts the bytes pushed before the client fell behind, where it
+	// continues in the stored copy.
+	fed    int64
+	ended  bool
+	endErr error
+	behind bool
+	closed bool
+	early  bool // closed before reading everything it was fed
+
+	stored    io.ReadCloser
+	storedErr error
+	resolved  bool
+	skipped   bool
+}
+
+func newMissFeed(limit int) *missFeed {
+	m := &missFeed{limit: limit}
+	m.cond = sync.NewCond(&m.mu)
+	return m
+}
+
+// push queues a copy of b and reports whether the client is still fed.
+func (m *missFeed) push(b []byte) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed || m.behind {
+		return false
+	}
+	if m.held+len(b) > m.limit {
+		m.behind = true
+		return false
+	}
+	m.chunks = append(m.chunks, append([]byte(nil), b...))
+	m.held += len(b)
+	m.fed += int64(len(b))
+	m.cond.Broadcast()
+	return true
+}
+
+// end records how the upstream read ended.
+func (m *missFeed) end(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ended, m.endErr = true, err
+	m.cond.Broadcast()
+}
+
+func (m *missFeed) lagging() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.behind && !m.closed
+}
+
+// fedFully reports whether the client was sent every byte from upstream.
+func (m *missFeed) fedFully() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return !m.behind && !m.early
+}
+
+// resolve gives a client that fell behind the stored copy, or the error
+// that left none.
+func (m *missFeed) resolve(r io.ReadCloser, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		if r != nil {
+			_ = r.Close()
+		}
+		return
+	}
+	m.stored, m.storedErr, m.resolved = r, err, true
+	m.cond.Broadcast()
+}
+
+func (m *missFeed) Read(p []byte) (int, error) {
+	m.mu.Lock()
+	for {
+		switch {
+		case m.closed:
+			m.mu.Unlock()
+			return 0, io.ErrClosedPipe
+		case len(m.chunks) > 0:
+			n := copy(p, m.chunks[0])
+			if m.chunks[0] = m.chunks[0][n:]; len(m.chunks[0]) == 0 {
+				m.chunks[0] = nil
+				m.chunks = m.chunks[1:]
+			}
+			m.held -= n
+			m.mu.Unlock()
+			return n, nil
+		case m.behind && m.resolved:
+			r, err, skipped := m.stored, m.storedErr, m.skipped
+			m.skipped = true
+			m.mu.Unlock()
+			if err != nil {
+				return 0, err
+			}
+			if !skipped {
+				if err := skipTo(r, m.fed); err != nil {
+					return 0, err
+				}
+			}
+			return r.Read(p)
+		case !m.behind && m.ended:
+			err := m.endErr
+			m.mu.Unlock()
+			if err == nil {
+				err = io.EOF
+			}
+			return 0, err
+		}
+		m.cond.Wait()
+	}
+}
+
+func (m *missFeed) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	m.early = !m.ended || len(m.chunks) > 0
+	m.chunks, m.held = nil, 0
+	if m.stored != nil {
+		_ = m.stored.Close()
+	}
+	m.cond.Broadcast()
+	return nil
+}
+
+// skipTo moves r past the first n bytes.
+func skipTo(r io.Reader, n int64) error {
+	if s, ok := r.(io.Seeker); ok {
+		_, err := s.Seek(n, io.SeekStart)
+		return err
+	}
+	if _, err := io.CopyN(io.Discard, r, n); err != nil {
+		return fmt.Errorf("skipping to byte %d of the stored artifact: %w", n, err)
+	}
+	return nil
 }

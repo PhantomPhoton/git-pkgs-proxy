@@ -340,3 +340,59 @@ func TestRecordedAt(t *testing.T) {
 		t.Error("failed lookup taken as recorded")
 	}
 }
+
+// TestUnrecordedStreamedMiss streams an unrecorded refetch to the caller
+// that started it: it holds no reader on the stored object, so the object is
+// deleted once the waiters are done, and the waiters still get it.
+func TestUnrecordedStreamedMiss(t *testing.T) {
+	for _, behind := range []bool{false, true} {
+		t.Run(map[bool]string{false: "fed", true: "behind"}[behind], func(t *testing.T) {
+			if behind {
+				old := clientFeedLimit
+				clientFeedLimit = 4
+				t.Cleanup(func() { clientFeedLimit = old })
+			}
+			proxy, store := setupUnrecorded(t)
+			fetcher := newGatedFetcher(unrecordedContent)
+			proxy.Fetcher = fetcher
+
+			leader := make(chan *CacheResult, 1)
+			go func() {
+				res, err := fetchGone(StreamCacheMiss(context.Background()), proxy)
+				if err != nil {
+					t.Errorf("leader: %v", err)
+				}
+				leader <- res
+			}()
+			<-fetcher.entered
+			waiter := make(chan *CacheResult, 1)
+			go func() {
+				res, err := fetchGone(context.Background(), proxy)
+				if err != nil {
+					t.Errorf("waiter: %v", err)
+				}
+				waiter <- res
+			}()
+			waitForWaiters(t, proxy, 1)
+			close(fetcher.release)
+
+			lead := <-leader
+			if lead == nil || lead.Artifact.Size != -1 {
+				t.Fatalf("leader = %+v, want a stream", lead)
+			}
+			w := <-waiter
+			if w == nil {
+				t.FailNow()
+			}
+			readAndClose(t, w)
+			deadline := time.Now().Add(5 * time.Second)
+			for len(storedFiles(store)) != 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if got := storedFiles(store); len(got) != 0 {
+				t.Errorf("stored files after the waiter closed = %v, want none", got)
+			}
+			readAndClose(t, lead)
+		})
+	}
+}

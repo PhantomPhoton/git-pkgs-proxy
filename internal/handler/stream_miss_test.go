@@ -442,3 +442,126 @@ func TestCacheMissStoredAfterResponseWithoutDetach(t *testing.T) {
 		t.Fatal("artifact not cached once the response ended")
 	}
 }
+
+// lowerFeedLimit makes a client fall behind after n bytes.
+func lowerFeedLimit(t *testing.T, n int) {
+	t.Helper()
+	old := clientFeedLimit
+	clientFeedLimit = n
+	t.Cleanup(func() { clientFeedLimit = old })
+}
+
+// TestCacheMissSlowClientDoesNotHoldBackFetch has the caller that starts a
+// streamed miss read nothing until a second caller, waiting on the same
+// fetch, has the stored artifact. The slow client then gets every byte, the
+// ones past the limit from the stored copy.
+func TestCacheMissSlowClientDoesNotHoldBackFetch(t *testing.T) {
+	for _, seekable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("seekable=%v", seekable), func(t *testing.T) { testSlowClient(t, seekable) })
+	}
+}
+
+func testSlowClient(t *testing.T, seekable bool) {
+	t.Helper()
+	lowerFeedLimit(t, 64<<10)
+	proxy, _, store, _ := setupTestProxy(t)
+	store.seekable = seekable
+	fetcher := newGatedFetcher(streamMissContent)
+	proxy.Fetcher = fetcher
+	get := func(ctx context.Context) (*CacheResult, error) {
+		return proxy.GetOrFetchArtifactFromURL(ctx, "npm", "big", "1.0.0", "big-1.0.0.tgz", "https://example.com/big.tgz")
+	}
+
+	slow := make(chan *CacheResult, 1)
+	go func() {
+		res, err := get(StreamCacheMiss(context.Background()))
+		if err != nil {
+			t.Errorf("slow client: %v", err)
+		}
+		slow <- res
+	}()
+	<-fetcher.entered
+	waiter := make(chan *CacheResult, 1)
+	go func() {
+		res, err := get(context.Background())
+		if err != nil {
+			t.Errorf("waiter: %v", err)
+		}
+		waiter <- res
+	}()
+	waitForWaiters(t, proxy, 1)
+	close(fetcher.release)
+
+	lead := <-slow
+	if lead == nil {
+		t.FailNow()
+	}
+	defer func() { _ = lead.Reader.Close() }()
+	if lead.Artifact.Size != -1 {
+		t.Fatalf("slow client got size %d, want a stream", lead.Artifact.Size)
+	}
+	select {
+	case res := <-waiter:
+		if res == nil {
+			t.FailNow()
+		}
+		body, err := io.ReadAll(res.Reader)
+		_ = res.Reader.Close()
+		if err != nil || string(body) != streamMissContent {
+			t.Fatalf("waiter: %d bytes, %v", len(body), err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter held back by a client that reads nothing")
+	}
+
+	body, err := io.ReadAll(lead.Reader)
+	if err != nil || string(body) != streamMissContent {
+		t.Fatalf("slow client: %d bytes, %v; want the whole artifact", len(body), err)
+	}
+	if fetcher.calls.Load() != 1 {
+		t.Errorf("upstream fetches = %d, want 1", fetcher.calls.Load())
+	}
+}
+
+// TestCacheMissSlowClientFailsWithoutStoredCopy: a client that fell behind
+// has nothing to continue from when storing fails, so its response fails
+// rather than ending short.
+func TestCacheMissSlowClientFailsWithoutStoredCopy(t *testing.T) {
+	lowerFeedLimit(t, 64<<10)
+	proxy, _, store, _ := setupTestProxy(t)
+	store.storeErr = errors.New("no space left on device")
+	proxy.Fetcher = &countingFetcher{content: streamMissContent}
+
+	res, err := proxy.GetOrFetchArtifactFromURL(StreamCacheMiss(context.Background()), "npm", "big", "1.0.0", "big-1.0.0.tgz", "https://example.com/big.tgz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Reader)
+	_ = res.Reader.Close()
+	if err == nil {
+		t.Fatalf("read %d bytes without error; want the response to fail", len(body))
+	}
+}
+
+func TestMissFeedCloseWhileWaiting(t *testing.T) {
+	m := newMissFeed(4)
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Read(make([]byte, 8))
+		done <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	_ = m.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Errorf("Read after Close = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read still blocked after Close")
+	}
+	if m.push([]byte("ab")) {
+		t.Error("push to a closed feed reported the client fed")
+	}
+	m.resolve(io.NopCloser(strings.NewReader("x")), nil)
+}
