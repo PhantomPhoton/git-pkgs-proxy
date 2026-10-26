@@ -30,6 +30,7 @@ func NewMirrorVersions(upstream config.UpstreamConfig, client *http.Client) mirr
 func (s *Server) newMirror(proxy *handler.Proxy, workers int) *mirror.Mirror {
 	m := mirror.New(proxy, s.db, s.storage, s.logger, workers)
 	m.Images = s.newContainerHandler(proxy)
+	m.Charts = handler.NewHelmHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.Helm)
 	UseMirrorUpstreams(m, s.cfg.Upstream, proxy.HTTPClient)
 	return m
 }
@@ -91,6 +92,17 @@ func mirrorVersionsURL(u config.UpstreamConfig, purlType, name string) (string, 
 		// Pkg server serving General, so General's are used whatever the
 		// upstream.
 		return "", nil
+	case "helm":
+		// The namespace names the repository; see RegistryVersions.
+		repository, _, ok := strings.Cut(name, "/")
+		if !ok {
+			return "", errors.New("helm charts need the upstream.helm repository as the namespace, such as pkg:helm/{repository}/{chart}")
+		}
+		repositoryURL, ok := u.Helm[repository]
+		if !ok {
+			return "", fmt.Errorf("unknown Helm repository %q: it isn't in upstream.helm", repository)
+		}
+		return strings.TrimSuffix(repositoryURL, "/"), nil
 	default:
 		return "", fmt.Errorf("listing %s versions isn't supported; give a version", purlType)
 	}

@@ -125,6 +125,7 @@ func evictBatch(ctx context.Context, db *database.DB, store storage.Storage, log
 
 		// Clear before deleting: a record a newer fetch moved has left this
 		// path queued, and a request may still open it within the grace period.
+		// The clear queues the path too, so it is never left unrecorded.
 		recordCleared, err := clearEntry(db, logger, entry)
 		if err != nil {
 			logger.Warn("eviction: failed to clear record",
@@ -138,15 +139,9 @@ func evictBatch(ctx context.Context, db *database.DB, store storage.Storage, log
 		// Metadata goes now too: readers hold the whole document in memory,
 		// and a row refetched meanwhile refetches again on a missing blob.
 		if err := store.Delete(ctx, path); err != nil {
-			logger.Warn("eviction: failed to delete from storage, queueing it", "path", path, "error", err)
-			if err := db.QueuePendingDelete(path); err != nil {
-				logger.Warn("eviction: failed to queue object for deletion", "path", path, "error", err)
-			}
-		} else if entry.Kind == database.CacheEntryMetadata {
-			// Queued with the row's delete in case the process stopped here.
-			if err := db.RemovePendingDelete(path); err != nil {
-				logger.Warn("eviction: failed to dequeue deleted object", "path", path, "error", err)
-			}
+			logger.Warn("eviction: failed to delete from storage, leaving it queued", "path", path, "error", err)
+		} else if err := db.RemovePendingDelete(path); err != nil {
+			logger.Warn("eviction: failed to dequeue deleted object", "path", path, "error", err)
 		}
 
 		if entry.Size.Valid {

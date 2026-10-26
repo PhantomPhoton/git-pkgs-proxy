@@ -59,13 +59,15 @@ func mirrorWithVersions(t *testing.T, cfg *config.Config, versions mirror.Versio
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	proxy, _ := NewMirrorProxy(cfg, db, store, logger)
+	proxy.CacheMetadata = true // as proxy mirror does
 	m := mirror.New(proxy, db, store, logger, 1)
+	m.Charts = handler.NewHelmHandler(proxy, cfg.BaseURL, cfg.Upstream.Helm)
 	m.Versions = versions
 	m.JuliaUpstream = cfg.Upstream.Julia
 	if versions == nil {
 		m.Versions = NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
 	}
-	progress, err := m.Run(context.Background(), &mirror.PURLSource{PURLs: purls})
+	progress, err := m.Run(context.Background(), &mirror.PURLSource{PURLs: purls, Versions: m.Versions})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}

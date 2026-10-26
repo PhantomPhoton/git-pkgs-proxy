@@ -173,6 +173,46 @@ func TestDiscardArtifactClearsAndQueues(t *testing.T) {
 	})
 }
 
+// When the replaced path can't be queued, the write is rolled back, so the
+// record keeps pointing at the old object instead of orphaning it.
+func TestUpsertArtifactRollsBackWhenQueueingFails(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		upsertPendingArtifact(t, db, "npm/pending/1.0.0/a/pending-1.0.0.tgz")
+		if _, err := db.Exec(`DROP TABLE pending_deletes`); err != nil {
+			t.Fatalf("dropping pending_deletes: %v", err)
+		}
+
+		err := db.UpsertArtifact(&Artifact{
+			VersionPURL: pendingVersionPURL,
+			Filename:    pendingFilename,
+			UpstreamURL: "https://example.com/" + pendingFilename,
+			StoragePath: sql.NullString{String: "npm/pending/1.0.0/b/pending-1.0.0.tgz", Valid: true},
+		})
+		if err == nil {
+			t.Fatal("UpsertArtifact succeeded without queueing the replaced path")
+		}
+		if got := recordedPath(t, db).String; got != "npm/pending/1.0.0/a/pending-1.0.0.tgz" {
+			t.Errorf("record points at %q, want the old path kept", got)
+		}
+	})
+}
+
+func TestDiscardArtifactRollsBackWhenQueueingFails(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		upsertPendingArtifact(t, db, "npm/pending/1.0.0/a/pending-1.0.0.tgz")
+		if _, err := db.Exec(`DROP TABLE pending_deletes`); err != nil {
+			t.Fatalf("dropping pending_deletes: %v", err)
+		}
+
+		if err := db.DiscardArtifact(pendingVersionPURL, pendingFilename, "npm/pending/1.0.0/a/pending-1.0.0.tgz"); err == nil {
+			t.Fatal("DiscardArtifact succeeded without queueing the path")
+		}
+		if got := recordedPath(t, db).String; got != "npm/pending/1.0.0/a/pending-1.0.0.tgz" {
+			t.Errorf("record points at %q, want it kept", got)
+		}
+	})
+}
+
 func TestGetDuePendingDeletes(t *testing.T) {
 	runWithBothDatabases(t, func(t *testing.T, db *DB) {
 		for _, path := range []string{"old", "referenced"} {

@@ -125,6 +125,7 @@ import (
 	"github.com/git-pkgs/proxy/internal/config"
 	"github.com/git-pkgs/proxy/internal/database"
 	"github.com/git-pkgs/proxy/internal/denylist"
+	"github.com/git-pkgs/proxy/internal/handler"
 	"github.com/git-pkgs/proxy/internal/memlimit"
 	"github.com/git-pkgs/proxy/internal/mirror"
 	"github.com/git-pkgs/proxy/internal/server"
@@ -558,17 +559,12 @@ func runMirror() {
 	proxy.MetadataTTL = cfg.ParseMetadataTTL()
 	proxy.MetadataMaxSize = cfg.ParseMetadataMaxSize()
 
-	m := mirror.New(proxy, db, store, logger, *concurrency)
-	m.Images = images
-	server.UseMirrorUpstreams(m, cfg.Upstream, proxy.HTTPClient)
+	m := newCommandMirror(cfg, proxy, images, db, store, logger, *concurrency)
 	switch s := source.(type) {
 	case *mirror.PURLSource:
 		s.Versions = m.Versions
 	case *mirror.SBOMSource:
 		s.Versions = m.Versions
-	}
-	if cfg.Scanning.Enabled {
-		refuseUnscannedMirroring(m)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -614,6 +610,20 @@ func runMirror() {
 		_ = db.Close()
 		os.Exit(code) //nolint:gocritic // db closed above
 	}
+}
+
+// newCommandMirror builds the mirror proxy mirror runs, which fetches and
+// lists versions from the configured upstreams.
+func newCommandMirror(cfg *config.Config, proxy *handler.Proxy, images *handler.ContainerHandler,
+	db *database.DB, store storage.Storage, logger *slog.Logger, workers int) *mirror.Mirror {
+	m := mirror.New(proxy, db, store, logger, workers)
+	m.Images = images
+	m.Charts = handler.NewHelmHandler(proxy, cfg.BaseURL, cfg.Upstream.Helm)
+	server.UseMirrorUpstreams(m, cfg.Upstream, proxy.HTTPClient)
+	if cfg.Scanning.Enabled {
+		refuseUnscannedMirroring(m)
+	}
+	return m
 }
 
 // mirrorExitCode returns the exit status for a finished mirror run: 1 when any

@@ -96,6 +96,7 @@ func TestMirrorVersionsURL(t *testing.T) {
 	custom.ComposerRoutes = map[string]string{"acme/*": "https://composer.example.com"}
 	custom.CRAN = "https://cran.example.com"
 	custom.HomebrewAPI = "https://brew.example.com/api"
+	custom.Helm = map[string]string{"stable": "https://charts.example.com/stable/"}
 	custom.Cargo = "https://index.example.com"
 	custom.Conda = "https://conda.example.com"
 	custom.Julia = "https://julia.example.com"
@@ -128,7 +129,9 @@ func TestMirrorVersionsURL(t *testing.T) {
 		{"conda channel", custom, "conda", "numpy", "", "upstream.conda"},
 		{"julia default", config.Default().Upstream, "julia", "JSON", "", ""},
 		{"julia server lists from General", custom, "julia", "JSON", "", ""},
-		{"helm", custom, "helm", "nginx", "", "give a version"},
+		{"helm", custom, "helm", "stable/nginx", "https://charts.example.com/stable", ""},
+		{"helm without repository", custom, "helm", "nginx", "", "namespace"},
+		{"helm unknown repository", custom, "helm", "other/nginx", "", "upstream.helm"},
 		{"swift", custom, "swift", "apple/swift-nio", "", "give a version"},
 		{"apk", custom, "apk", "curl", "", "give a version"},
 	}
