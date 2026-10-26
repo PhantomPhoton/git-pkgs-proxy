@@ -34,7 +34,7 @@ The proxy is a caching HTTP server that sits between package manager clients and
 1. Client requests `GET /npm/lodash`
 2. NPMHandler receives request
 3. Handler fetches metadata from upstream `registry.npmjs.org/lodash`
-4. Handler rewrites tarball URLs in metadata to point at proxy
+4. Handler rewrites tarball URLs in metadata to point at proxy, and filters versions withheld by cooldown or the denylist (`internal/metadata/npm`)
 5. Handler returns modified metadata to client
 
 Metadata is not cached - always fetched fresh. This ensures clients see new versions immediately.
@@ -294,7 +294,7 @@ HTTP protocol handlers for each registry type.
 **NPMHandler:**
 - `handlePackageMetadata()` - Proxy + rewrite metadata
 - `handleDownload()` - Serve cached artifact
-- Rewrites tarball URLs to point at proxy
+- Fetches, caches and serves packuments, and caches their rewrites; the rewrite itself is `internal/metadata/npm`
 
 **CargoHandler:**
 - `handleConfig()` - Return registry config
@@ -309,6 +309,14 @@ HTTP protocol handlers for each registry type.
 - Serves `/git/{name}/{repo}` from `internal/gitcache`, read-only over smart HTTP
 - Validates repository paths and the `repos` allowlist, and maps cache errors to statuses
 - Serves the Git LFS API under `{repo}.git/info/lfs/`: forwards download batches upstream and points each object at `objects/{oid}/{size}`, which is served from the artifact cache (ecosystem `git`, name `{name}/{repo}`, version the object ID); a miss uses the download URL kept from the batch or asks the upstream batch API for a fresh one, recorded without its signed query, copies the object from another repository when its content is already stored, and checks the object against its sha256 ID; a batch the upstream can't answer is answered from the cache
+
+### `internal/metadata/npm`
+
+The npm metadata rewrite, separated from the handler so it can run where the proxy's infrastructure can't, such as WASI. It takes a packument's bytes and everything else as explicit inputs (proxy URL, cooldown policy, the time cooldown is evaluated at, denied versions, pushed versions) and returns the rewritten document with the versions it kept. It filters versions by cooldown and the denylist, moves `latest` off a withheld version, lists pushed versions in place of upstream ones, and points each tarball URL at the proxy, copying everything else byte for byte. It does no I/O and never reads the clock; callbacks report what it did, which the handler logs. It imports no database, storage, metrics, HTTP or logging packages, which a test checks.
+
+### `internal/jsonscan`
+
+Reads and rewrites members of a JSON document in place, by byte offsets, without decoding the whole document. Shared by the npm and Composer metadata rewrites.
 
 ### `internal/gitcache`
 
