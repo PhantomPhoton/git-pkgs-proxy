@@ -58,6 +58,20 @@ func (r RegistryVersions) FindVersion(ctx context.Context, ecosystem, name, vers
 }
 
 func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name string) ([]registries.Version, error) {
+	reg, err := r.registry(ecosystem, name)
+	if err != nil {
+		return nil, err
+	}
+	if purl.EcosystemToPURLType(ecosystem) == "helm" {
+		// The namespace names the repository, which URL resolves to the
+		// index the chart is listed in.
+		_, name, _ = strings.Cut(name, "/")
+	}
+	return reg.FetchVersions(ctx, name)
+}
+
+// registry returns the client for the registry name is listed in.
+func (r RegistryVersions) registry(ecosystem, name string) (registries.Registry, error) { //nolint:ireturn // registries.New returns the interface
 	purlType := purl.EcosystemToPURLType(ecosystem)
 	var baseURL string
 	if r.URL != nil {
@@ -70,14 +84,5 @@ func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name str
 	if client == nil {
 		client = registries.DefaultClient()
 	}
-	reg, err := registries.New(purlType, baseURL, client)
-	if err != nil {
-		return nil, err
-	}
-	if purlType == "helm" {
-		// The namespace names the repository, which URL resolves to the
-		// index the chart is listed in.
-		_, name, _ = strings.Cut(name, "/")
-	}
-	return reg.FetchVersions(ctx, name)
+	return registries.New(purlType, baseURL, client)
 }

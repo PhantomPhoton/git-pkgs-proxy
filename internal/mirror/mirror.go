@@ -36,6 +36,10 @@ type Mirror struct {
 	// schedules. Nil lists them from the public registries.
 	Versions VersionLister
 
+	// JuliaUpstream is the Pkg server Julia packages are fetched from. Empty
+	// uses https://pkg.julialang.org.
+	JuliaUpstream string
+
 	// RefusePackages, when set, fails every item Images does not take with
 	// this reason instead of fetching it, so nothing is cached.
 	RefusePackages string
@@ -241,6 +245,10 @@ func (m *Mirror) mirrorOne(ctx context.Context, pv PackageVersion, tracker *prog
 	}
 	if pv.Ecosystem == "helm" {
 		m.mirrorHelm(ctx, pv, tracker)
+		return
+	}
+	if pv.Ecosystem == "julia" {
+		m.mirrorJulia(ctx, pv, tracker)
 		return
 	}
 	result, err := m.proxy.GetOrFetchArtifact(ctx, pv.Ecosystem, pv.Name, pv.Version, "")

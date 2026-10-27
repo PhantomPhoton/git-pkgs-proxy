@@ -1569,6 +1569,8 @@ A Composer release is mirrored with the dist archive `upstream.composer` lists f
 
 A Helm chart is mirrored from a repository in `upstream.helm`, named as the namespace, for example `pkg:helm/prometheus-community/prometheus@27.1.0` with `prometheus-community` configured. The chart is fetched from the first URL the repository's `index.yaml` lists for that version, checked against the listed digest, and cached under the repository and digest `/helm/{name}/charts/...` serves it from. The index is cached as well, so with [`cache_metadata`](#metadata-caching) on `helm pull` works while the repository is down. Without a version every version in the index is mirrored. Charts named without a repository, or from one that isn't configured, are refused, and so are charts the index lists in an OCI registry: helm pulls those through `/v2`, so mirror them as `pkg:oci` images.
 
+A Julia package is mirrored with the source tarball `upstream.julia` serves at `/package/{uuid}/{tree-hash}`, cached under the package's name and tree hash as `/julia/package/...` serves it. The PURL needs the `uuid` qualifier, for example `pkg:julia/Example@0.5.5?uuid=7876af07-990d-54b4-ab0e-23690620f79a`. Only packages of the General registry can be mirrored: the uuid and tree hash are read from General on GitHub, also with another `upstream.julia`, since they are the same on every Pkg server serving General. The tarball isn't checked by the proxy, as when serving; Pkg checks the tree hash of what it unpacks, except on Windows. Dependencies, the artifacts in a package's `Artifacts.toml` and the registry aren't mirrored. An offline `Pkg.add` also needs the registry: one installed on the client, or the one the proxy cached when a client last fetched it, which it serves offline with `cache_metadata` on.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |
@@ -1589,7 +1591,7 @@ proxy mirror pkg:npm/lodash@4.17.21 pkg:cargo/serde@1.0.0
 
 ### Unversioned PURLs
 
-A PURL without a version, here or in a mirror API job, mirrors every version the configured upstream lists, through the same client, so `upstream.auth` and `upstream.allow_private_hosts` apply. npm packages in `upstream.npm_routes` are listed from their route. Listing works for npm, gem, golang, hex (from `upstream.hex_api`), pub, pypi, maven, nuget, composer, cran and brew. For cargo, conda and julia the upstream doesn't serve the API used for listing, so versions come from the public registry while the upstream is the default one; with another upstream, and for Composer packages in `upstream.composer_routes` or any other ecosystem, give a version.
+A PURL without a version, here or in a mirror API job, mirrors every version the configured upstream lists, through the same client, so `upstream.auth` and `upstream.allow_private_hosts` apply. npm packages in `upstream.npm_routes` are listed from their route. Listing works for npm, gem, golang, hex (from `upstream.hex_api`), pub, pypi, maven, nuget, composer, cran and brew. For cargo and conda the upstream doesn't serve the API used for listing, so versions come from the public registry while the upstream is the default one; with another upstream, and for Composer packages in `upstream.composer_routes` or any other ecosystem, give a version. Julia versions are always listed from the General registry.
 
 ### Container images
 

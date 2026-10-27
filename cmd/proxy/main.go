@@ -619,7 +619,7 @@ func newCommandMirror(cfg *config.Config, proxy *handler.Proxy, images *handler.
 	m := mirror.New(proxy, db, store, logger, workers)
 	m.Images = images
 	m.Charts = handler.NewHelmHandler(proxy, cfg.BaseURL, cfg.Upstream.Helm)
-	m.Versions = server.NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
+	server.UseMirrorUpstreams(m, cfg.Upstream, proxy.HTTPClient)
 	if cfg.Scanning.Enabled {
 		refuseUnscannedMirroring(m)
 	}

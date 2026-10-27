@@ -110,7 +110,7 @@ func (h *JuliaHandler) handleRegistry(w http.ResponseWriter, r *http.Request) {
 	h.proxy.Logger.Debug("julia registry request", "uuid", uuid, "hash", hash)
 
 	upstreamURL := h.upstreamURL + r.URL.Path
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", juliaRegistryName, hash, hash+".tar.gz", upstreamURL)
+	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", juliaRegistryName, hash, juliaTarball(hash), upstreamURL)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch registry")
 		return
@@ -137,14 +137,69 @@ func (h *JuliaHandler) handlePackage(w http.ResponseWriter, r *http.Request) {
 
 	h.proxy.Logger.Info("julia package request", "name", name, "uuid", uuid, "hash", hash)
 
+	if name == uuid {
+		if result := h.cachedPackage(r.Context(), hash); result != nil {
+			ServeArtifactRequest(w, r, result)
+			return
+		}
+	}
+
 	upstreamURL := h.upstreamURL + r.URL.Path
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", name, hash, hash+".tar.gz", upstreamURL)
+	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", name, hash, juliaTarball(hash), upstreamURL)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch package")
 		return
 	}
 
 	ServeArtifactRequest(w, r, result)
+}
+
+// cachedPackage returns the package tarball with tree hash hash from the
+// cache, under whatever name it was cached as, or nil. Without the name map,
+// which needs the registry from upstream, a request can't be matched to the
+// name its package was cached under, but the tarball is identified by its
+// tree hash alone. The registry and artifact tarballs cached under the same
+// file name are skipped.
+func (h *JuliaHandler) cachedPackage(ctx context.Context, hash string) *CacheResult {
+	if h.proxy.DB == nil {
+		return nil
+	}
+	filename := juliaTarball(hash)
+	names, err := h.proxy.DB.CachedArtifactNames("julia", filename)
+	if err != nil {
+		h.proxy.Logger.Warn("looking up cached julia package", "hash", hash, "error", err)
+		return nil
+	}
+	for _, name := range names {
+		if name == juliaRegistryName || name == juliaArtifactName {
+			continue
+		}
+		result, err := h.proxy.GetCachedArtifact(ctx, "julia", name, hash, filename)
+		if err == nil && result != nil {
+			return result
+		}
+	}
+	return nil
+}
+
+// JuliaPackageDownload returns the URL of a package's tarball on the Pkg
+// server at upstreamURL, or the default one when empty, and the file name the
+// Julia handler caches it under.
+func JuliaPackageDownload(upstreamURL, uuid, treeHash string) (url, filename string, err error) {
+	if !validJuliaUUID(uuid) {
+		return "", "", fmt.Errorf("invalid julia package uuid %q", uuid)
+	}
+	if !juliaHexPattern.MatchString(treeHash) {
+		return "", "", fmt.Errorf("invalid julia tree hash %q", treeHash)
+	}
+	base := configuredUpstreamURL(upstreamURL, juliaUpstream)
+	return base + "/package/" + uuid + "/" + treeHash, juliaTarball(treeHash), nil
+}
+
+// juliaTarball is the file name a registry, package or artifact tarball is
+// cached under.
+func juliaTarball(hash string) string {
+	return hash + ".tar.gz"
 }
 
 // handleArtifact serves an immutable binary artifact tarball. Artifacts are
@@ -159,7 +214,7 @@ func (h *JuliaHandler) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	h.proxy.Logger.Debug("julia artifact request", "hash", hash)
 
 	upstreamURL := h.upstreamURL + r.URL.Path
-	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", juliaArtifactName, hash, hash+".tar.gz", upstreamURL)
+	result, err := h.proxy.GetOrFetchArtifactFromURL(r.Context(), "julia", juliaArtifactName, hash, juliaTarball(hash), upstreamURL)
 	if err != nil {
 		h.proxy.serveArtifactError(w, err, "failed to fetch artifact")
 		return
