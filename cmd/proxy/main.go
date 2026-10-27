@@ -240,6 +240,7 @@ func runServe() {
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_CARGO_DOWNLOAD       Cargo download upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_GEM                  RubyGems upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_GO                   Go module proxy upstream URL\n")
+		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_GO_VULNDB            Go vulnerability database URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_HEX                  Hex repository upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_HEX_API              Hex API upstream URL\n")
 		fmt.Fprintf(os.Stderr, "  PROXY_UPSTREAM_PUB                  pub registry upstream URL\n")

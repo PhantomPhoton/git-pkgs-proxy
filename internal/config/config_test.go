@@ -21,6 +21,7 @@ func upstreamConfigValues(upstream UpstreamConfig) map[string]string {
 		"cargo_download":       upstream.CargoDownload,
 		"gem":                  upstream.Gem,
 		"go":                   upstream.Go,
+		"go_vulndb":            upstream.GoVulnDB,
 		"hex":                  upstream.Hex,
 		"hex_api":              upstream.HexAPI,
 		"pub":                  upstream.Pub,
@@ -53,6 +54,7 @@ func defaultUpstreamValues() map[string]string {
 		"cargo_download":       "https://static.crates.io/crates",
 		"gem":                  "https://rubygems.org",
 		"go":                   "https://proxy.golang.org",
+		"go_vulndb":            "https://vuln.go.dev",
 		"hex":                  "https://repo.hex.pm",
 		"hex_api":              "https://hex.pm",
 		"pub":                  "https://pub.dev",
@@ -85,6 +87,7 @@ func upstreamEnvironmentVariables() map[string]string {
 		"cargo_download":       "PROXY_UPSTREAM_CARGO_DOWNLOAD",
 		"gem":                  "PROXY_UPSTREAM_GEM",
 		"go":                   "PROXY_UPSTREAM_GO",
+		"go_vulndb":            "PROXY_UPSTREAM_GO_VULNDB",
 		"hex":                  "PROXY_UPSTREAM_HEX",
 		"hex_api":              "PROXY_UPSTREAM_HEX_API",
 		"pub":                  "PROXY_UPSTREAM_PUB",
@@ -379,6 +382,7 @@ upstream:
   cargo_download: "https://upstream.example.com/cargo_download"
   gem: "https://upstream.example.com/gem"
   go: "https://upstream.example.com/go"
+  go_vulndb: "https://upstream.example.com/go_vulndb"
   hex: "https://upstream.example.com/hex"
   hex_api: "https://upstream.example.com/hex_api"
   pub: "https://upstream.example.com/pub"

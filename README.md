@@ -239,6 +239,14 @@ the `go` command contacts the database directly as before. Set
 checksum databases are listed under `upstream.go_sumdbs`, see
 [Go checksum database](docs/configuration.md#go-checksum-database).
 
+govulncheck can use the proxy for the Go vulnerability database:
+
+```bash
+govulncheck -db http://localhost:8080/go/vulndb ./...
+```
+
+See [Go vulnerability database](docs/configuration.md#go-vulnerability-database).
+
 ### Homebrew
 
 Point Homebrew's JSON API and artifact domain at the proxy:
