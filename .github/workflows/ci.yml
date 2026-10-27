@@ -110,3 +110,13 @@ jobs:
             --set 'ingress.hosts[0].paths[0].path=/' \
             --set 'ingress.hosts[0].paths[0].pathType=Prefix' \
             >/dev/null
+          helm template proxy deploy/charts/proxy \
+            --set 'extraVolumes[0].name=corp-ca' \
+            --set 'extraVolumes[0].configMap.name=corp-ca' \
+            --set 'extraVolumeMounts[0].name=corp-ca' \
+            --set 'extraVolumeMounts[0].mountPath=/etc/proxy/ca' \
+            --set 'extraVolumeMounts[0].readOnly=true' \
+            --set 'extraInitContainers[0].name=wait-for-db' \
+            --set 'extraInitContainers[0].image=busybox:1.37' \
+            --set 'extraInitContainers[0].command={sh,-c,exit 0}' \
+            >/dev/null

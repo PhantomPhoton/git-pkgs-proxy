@@ -56,6 +56,29 @@ extraEnvFrom: []
 #  - secretRef:
 #      name: proxy-object-storage
 
+# Additional volumes for the pod and mounts for the proxy container, for
+# example a ConfigMap holding a private CA certificate. Go adds certificates
+# from the directories in SSL_CERT_DIR to its trusted roots (set it with
+# extraEnv); SSL_CERT_FILE replaces the system bundle instead. All upstream
+# TLS, including Git fetches, goes through the proxy process.
+extraVolumes: []
+#  - name: corp-ca
+#    configMap:
+#      name: corp-ca
+
+extraVolumeMounts: []
+#  - name: corp-ca
+#    mountPath: /etc/proxy/ca
+#    readOnly: true
+
+# Init containers run before the proxy starts. They can use extraVolumes, but
+# extraVolumeMounts applies only to the proxy container, so each init container
+# needs its own volumeMounts.
+extraInitContainers: []
+#  - name: wait-for-db
+#    image: busybox:1.37
+#    command: ["sh", "-c", "until nc -z postgres 5432; do sleep 2; done"]
+
 persistence:
   enabled: true
   # Keep this aligned with config.data.storage.url and config.data.database.path
