@@ -1052,6 +1052,7 @@ func (p *Proxy) runSharedFetch(ctx context.Context, key string, f *inflightFetch
 		f.unrecorded = &unrecordedObject{delete: func() { p.deleteUnrecorded(path) }}
 		f.unrecorded.refs.Add(1) // until the waiters are counted
 		if handedOver {
+			h.holdUnrecorded(f.unrecorded)
 			return nil, nil
 		}
 		f.unrecorded.refs.Add(1) // this caller

@@ -46,6 +46,9 @@ type missHandoff struct {
 	stream    *CacheResult
 	taken     bool
 	abandoned bool
+	// feed is the stream's source. Set and read only on the fetch's
+	// goroutine.
+	feed *missFeed
 }
 
 type missHandoffKey struct{}
@@ -65,6 +68,14 @@ func (h *missHandoff) offer(stream *CacheResult) bool {
 	h.stream, h.taken = stream, true
 	close(h.ready)
 	return true
+}
+
+// holdUnrecorded gives a client that fell behind, and reads the stored copy
+// of u, its own hold on u until it closes, so u isn't deleted under it.
+func (h *missHandoff) holdUnrecorded(u *unrecordedObject) {
+	if h.feed != nil {
+		h.feed.holdUntilClose(u)
+	}
 }
 
 // handedOver reports whether the caller took a stream.
@@ -179,6 +190,7 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 		_ = feed.Close()
 		return p.storeArtifact(ctx, ecosystem, name, version, filename, pkgPURL, versionPURL, upstreamURL, upstreamHash, declared, artifact)
 	}
+	h.feed = feed
 
 	storeR, storeW := io.Pipe()
 	type stored struct {
@@ -207,7 +219,8 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 
 	out := <-storeDone
 	if feed.lagging() {
-		// Opened before returning, so an unrecorded object is still there.
+		// Opened before returning, so an unrecorded object is still there;
+		// runSharedFetch then gives the client a hold on it.
 		feed.resolve(p.openStoredForFeed(ctx, out.artifact, out.path, out.err))
 	}
 	if out.err != nil && readErr == nil && feed.fedFully() {
@@ -220,7 +233,8 @@ func (p *Proxy) storeWhileServing(ctx context.Context, h *missHandoff, ecosystem
 }
 
 // openStoredForFeed opens the stored copy for a client that fell behind. An
-// unrecorded object is opened too: it is deleted only after this returns.
+// unrecorded object is opened too: it is deleted only after this returns, and
+// the client holds it from then on (missHandoff.holdUnrecorded).
 func (p *Proxy) openStoredForFeed(ctx context.Context, a artifacts.Artifact, path string, storeErr error) (io.ReadCloser, error) {
 	if storeErr != nil && !errors.Is(storeErr, errUnrecorded) {
 		return nil, storeErr
@@ -291,6 +305,8 @@ type missFeed struct {
 	storedErr error
 	resolved  bool
 	skipped   bool
+	// release drops the client's hold on an unrecorded stored copy.
+	release func()
 }
 
 func newMissFeed(limit int) *missFeed {
@@ -353,6 +369,18 @@ func (m *missFeed) resolve(r io.ReadCloser, err error) {
 	m.cond.Broadcast()
 }
 
+// holdUntilClose takes a hold on u for a client reading its stored copy and
+// releases it when the client closes.
+func (m *missFeed) holdUntilClose(u *unrecordedObject) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed || m.stored == nil {
+		return
+	}
+	u.refs.Add(1)
+	m.release = u.release
+}
+
 func (m *missFeed) Read(p []byte) (int, error) {
 	m.mu.Lock()
 	for {
@@ -396,8 +424,8 @@ func (m *missFeed) Read(p []byte) (int, error) {
 
 func (m *missFeed) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
@@ -406,7 +434,14 @@ func (m *missFeed) Close() error {
 	if m.stored != nil {
 		_ = m.stored.Close()
 	}
+	release := m.release
+	m.release = nil
 	m.cond.Broadcast()
+	m.mu.Unlock()
+	if release != nil {
+		// Outside the lock: the last release deletes the object.
+		release()
+	}
 	return nil
 }
 
