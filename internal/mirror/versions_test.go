@@ -96,3 +96,23 @@ func TestSourceFromRequestUsesMirrorVersions(t *testing.T) {
 		t.Errorf("SBOM source lists versions through %v, want the mirror's lister", got)
 	}
 }
+
+func TestPURLSourceKeepsJuliaUUID(t *testing.T) {
+	const uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+	versions := &fakeVersions{versions: []string{"0.5.5"}}
+	source := &PURLSource{
+		PURLs:    []string{"pkg:julia/Example@0.5.4?uuid=" + uuid, "pkg:julia/Example?uuid=" + uuid},
+		Versions: versions,
+	}
+
+	items := enumerate(t, source)
+
+	qualifiers := map[string]string{"uuid": uuid}
+	want := []PackageVersion{
+		{Ecosystem: "julia", Name: "Example", Version: "0.5.4", Qualifiers: qualifiers},
+		{Ecosystem: "julia", Name: "Example", Version: "0.5.5", Qualifiers: qualifiers},
+	}
+	if !reflect.DeepEqual(items, want) {
+		t.Errorf("items = %v, want %v", items, want)
+	}
+}

@@ -31,8 +31,16 @@ func (s *Server) newMirror(proxy *handler.Proxy, workers int) *mirror.Mirror {
 	m := mirror.New(proxy, s.db, s.storage, s.logger, workers)
 	m.Images = s.newContainerHandler(proxy)
 	m.Charts = handler.NewHelmHandler(proxy, s.cfg.BaseURL, s.cfg.Upstream.Helm)
-	m.Versions = NewMirrorVersions(s.cfg.Upstream, proxy.HTTPClient)
+	UseMirrorUpstreams(m, s.cfg.Upstream, proxy.HTTPClient)
 	return m
+}
+
+// UseMirrorUpstreams points m at the configured upstreams: it lists
+// versions from them, through client, and fetches Julia packages from
+// upstream.julia.
+func UseMirrorUpstreams(m *mirror.Mirror, upstream config.UpstreamConfig, client *http.Client) {
+	m.Versions = NewMirrorVersions(upstream, client)
+	m.JuliaUpstream = upstream.Julia
 }
 
 // mirrorVersionsURL returns the registry base URL to list a package's
@@ -80,7 +88,10 @@ func mirrorVersionsURL(u config.UpstreamConfig, purlType, name string) (string, 
 		}
 		return "", nil
 	case "julia":
-		return publicOnly("upstream.julia", u.Julia, d.Julia)
+		// Packages are identified by uuid and tree hash, the same on every
+		// Pkg server serving General, so General's are used whatever the
+		// upstream.
+		return "", nil
 	case "helm":
 		// The namespace names the repository; see RegistryVersions.
 		repository, _, ok := strings.Cut(name, "/")

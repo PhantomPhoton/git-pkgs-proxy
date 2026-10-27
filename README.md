@@ -104,6 +104,27 @@ using SQLite and filesystem artifact storage under `/data`. See
 [`deploy/charts/proxy/values.yaml`](deploy/charts/proxy/values.yaml) for ingress,
 external database and object-storage configuration options.
 
+To trust a private CA, for example when upstreams sit behind a TLS-intercepting
+corporate proxy or are internal registries signed by an in-house CA, mount the
+certificate with `extraVolumes` and `extraVolumeMounts` and add its directory
+to `SSL_CERT_DIR`. The proxy process makes all upstream TLS connections itself,
+Git fetches included, so no other configuration is needed. Public CAs stay
+trusted alongside the private one:
+
+```yaml
+extraVolumes:
+  - name: corp-ca
+    configMap:
+      name: corp-ca   # e.g. key corp-ca.crt, PEM-encoded
+extraVolumeMounts:
+  - name: corp-ca
+    mountPath: /etc/proxy/ca
+    readOnly: true
+extraEnv:
+  - name: SSL_CERT_DIR
+    value: /etc/ssl/certs:/etc/proxy/ca
+```
+
 ## Quick Start
 
 ```bash

@@ -394,3 +394,36 @@ func TestGetRetentionCandidatesTimezone(t *testing.T) {
 		}
 	})
 }
+
+func TestArtifactFilenameIndex(t *testing.T) {
+	runWithBothDatabases(t, func(t *testing.T, db *DB) {
+		indexQuery := `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_artifacts_filename'`
+		if db.Dialect() == DialectPostgres {
+			indexQuery = `SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_artifacts_filename'`
+		}
+		hasIndex := func() bool {
+			t.Helper()
+			var count int
+			if err := db.Get(&count, indexQuery); err != nil {
+				t.Fatalf("querying indexes: %v", err)
+			}
+			return count == 1
+		}
+
+		if !hasIndex() {
+			t.Error("fresh schema has no idx_artifacts_filename")
+		}
+		if _, err := db.Exec(`DROP INDEX idx_artifacts_filename`); err != nil {
+			t.Fatalf("dropping index: %v", err)
+		}
+		if err := migrateAddArtifactFilenameIndex(db); err != nil {
+			t.Fatalf("migration: %v", err)
+		}
+		if err := migrateAddArtifactFilenameIndex(db); err != nil {
+			t.Fatalf("migration is not idempotent: %v", err)
+		}
+		if !hasIndex() {
+			t.Error("migration did not create idx_artifacts_filename")
+		}
+	})
+}

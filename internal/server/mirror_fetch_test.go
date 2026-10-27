@@ -63,6 +63,7 @@ func mirrorWithVersions(t *testing.T, cfg *config.Config, versions mirror.Versio
 	m := mirror.New(proxy, db, store, logger, 1)
 	m.Charts = handler.NewHelmHandler(proxy, cfg.BaseURL, cfg.Upstream.Helm)
 	m.Versions = versions
+	m.JuliaUpstream = cfg.Upstream.Julia
 	if versions == nil {
 		m.Versions = NewMirrorVersions(cfg.Upstream, proxy.HTTPClient)
 	}

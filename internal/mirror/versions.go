@@ -64,34 +64,49 @@ func (r RegistryVersions) FindVersion(ctx context.Context, ecosystem, name, vers
 }
 
 func (r RegistryVersions) fetchVersions(ctx context.Context, ecosystem, name string) ([]registries.Version, error) {
-	purlType := purl.EcosystemToPURLType(ecosystem)
-	var baseURL string
-	if r.URL != nil {
-		var err error
-		if baseURL, err = r.URL(purlType, name); err != nil {
-			return nil, err
-		}
-	}
-	client := r.Client
-	if client == nil {
-		client = registries.DefaultClient()
-	}
-	if ecosystem == "swift" {
-		var err error
-		if name, err = swiftIdentity(ctx, client, baseURL, name); err != nil {
-			return nil, err
-		}
-	}
-	reg, err := registries.New(purlType, baseURL, client)
+	reg, err := r.registry(ecosystem, name)
 	if err != nil {
 		return nil, err
 	}
-	if purlType == "helm" {
+	switch purl.EcosystemToPURLType(ecosystem) {
+	case "helm":
 		// The namespace names the repository, which URL resolves to the
 		// index the chart is listed in.
 		_, name, _ = strings.Cut(name, "/")
+	case "swift":
+		var baseURL string
+		if baseURL, err = r.baseURL("swift", name); err != nil {
+			return nil, err
+		}
+		if name, err = swiftIdentity(ctx, r.client(), baseURL, name); err != nil {
+			return nil, err
+		}
 	}
 	return reg.FetchVersions(ctx, name)
+}
+
+// registry returns the client for the registry name is listed in.
+func (r RegistryVersions) registry(ecosystem, name string) (registries.Registry, error) { //nolint:ireturn // registries.New returns the interface
+	purlType := purl.EcosystemToPURLType(ecosystem)
+	baseURL, err := r.baseURL(purlType, name)
+	if err != nil {
+		return nil, err
+	}
+	return registries.New(purlType, baseURL, r.client())
+}
+
+func (r RegistryVersions) baseURL(purlType, name string) (string, error) {
+	if r.URL == nil {
+		return "", nil
+	}
+	return r.URL(purlType, name)
+}
+
+func (r RegistryVersions) client() *registries.Client {
+	if r.Client == nil {
+		return registries.DefaultClient()
+	}
+	return r.Client
 }
 
 // swiftIdentity returns the registry identity, scope.name, of the name of a
