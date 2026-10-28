@@ -223,36 +223,6 @@ func (db *DB) SetVersionPublishedAt(versionPURL, packagePURL string, publishedAt
 	return nil
 }
 
-// FillVersionPublishedAt records a version's publish time, in UTC, only where
-// none is stored yet, creating the versions row if needed. Callers that see
-// the same version on every metadata request write it once without reading
-// first.
-func (db *DB) FillVersionPublishedAt(versionPURL, packagePURL string, publishedAt time.Time) error {
-	now := time.Now()
-	query := `
-		INSERT INTO versions (purl, package_purl, published_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(purl) DO UPDATE SET
-			published_at = excluded.published_at,
-			updated_at = excluded.updated_at
-		WHERE versions.published_at IS NULL
-	`
-	if db.dialect == DialectPostgres {
-		query = `
-			INSERT INTO versions (purl, package_purl, published_at, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT(purl) DO UPDATE SET
-				published_at = EXCLUDED.published_at,
-				updated_at = EXCLUDED.updated_at
-			WHERE versions.published_at IS NULL
-		`
-	}
-	if _, err := db.Exec(query, versionPURL, packagePURL, publishedAt.UTC(), now, now); err != nil {
-		return fmt.Errorf("filling version publish time: %w", err)
-	}
-	return nil
-}
-
 // Artifact queries
 
 func (db *DB) GetArtifact(versionPURL, filename string) (*Artifact, error) {

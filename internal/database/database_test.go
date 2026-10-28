@@ -1112,48 +1112,6 @@ func BenchmarkMigrateSchemaFullyMigrated(b *testing.B) {
 	}
 }
 
-func TestFillVersionPublishedAt(t *testing.T) {
-	runWithBothDatabases(t, func(t *testing.T, db *DB) {
-		const purl, pkg = "pkg:npm/leftpad@1.0.0", "pkg:npm/leftpad"
-		first := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
-		publishedAt := func() sql.NullTime {
-			t.Helper()
-			got, err := db.GetVersionByPURL(purl)
-			if err != nil || got == nil {
-				t.Fatalf("GetVersionByPURL: %v, %v", got, err)
-			}
-			return got.PublishedAt
-		}
-
-		// A row without a time, as the artifact cache writes it, is filled.
-		if err := db.UpsertVersion(&Version{PURL: purl, PackagePURL: pkg}); err != nil {
-			t.Fatalf("UpsertVersion: %v", err)
-		}
-		if err := db.FillVersionPublishedAt(purl, pkg, first.In(time.FixedZone("CEST", 2*60*60))); err != nil {
-			t.Fatalf("FillVersionPublishedAt: %v", err)
-		}
-		if got := publishedAt(); !got.Valid || !got.Time.Equal(first) {
-			t.Fatalf("PublishedAt = %v, want %v", got, first)
-		}
-
-		// A stored time is kept.
-		if err := db.FillVersionPublishedAt(purl, pkg, first.Add(time.Hour)); err != nil {
-			t.Fatalf("FillVersionPublishedAt again: %v", err)
-		}
-		if got := publishedAt(); !got.Time.Equal(first) {
-			t.Fatalf("PublishedAt after a second fill = %v, want %v kept", got.Time, first)
-		}
-
-		// A version the proxy hasn't seen gets a row.
-		if err := db.FillVersionPublishedAt("pkg:npm/leftpad@2.0.0", pkg, first); err != nil {
-			t.Fatalf("FillVersionPublishedAt new: %v", err)
-		}
-		if got, err := db.GetVersionByPURL("pkg:npm/leftpad@2.0.0"); err != nil || got == nil || !got.PublishedAt.Time.Equal(first) {
-			t.Fatalf("new version = %+v, %v, want published %v", got, err, first)
-		}
-	})
-}
-
 func TestVersionPublishedAtPreserved(t *testing.T) {
 	runWithBothDatabases(t, func(t *testing.T, db *DB) {
 		publishedAt := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
