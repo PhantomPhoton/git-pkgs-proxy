@@ -1330,6 +1330,8 @@ Some metadata never changes once published, and is cached like an artifact, with
 
 Composer archive downloads look up their upstream URL in the same cached metadata, so an archive is resolved without asking Packagist again and stays installable while it is down. Only a version or file the cached metadata does not list yet is looked up upstream. With or without `cache_metadata`, a cached archive of a tagged release from the default repository is served without any metadata lookup; with cooldown enabled it is checked against the publish time recorded when the archive was first resolved. Branch (dev) versions, routed packages and archives picked by a query string such as `?sha=` are always resolved from the metadata.
 
+Swift release lists and manifests are cached with the upstream's `Link` header, which carries the release list's pages and the version-specific manifests a client chooses from.
+
 The `proxy mirror` command always enables metadata caching regardless of this setting.
 
 ### Metadata TTL
@@ -1571,6 +1573,8 @@ A Helm chart is mirrored from a repository in `upstream.helm`, named as the name
 
 A Julia package is mirrored with the source tarball `upstream.julia` serves at `/package/{uuid}/{tree-hash}`, cached under the package's name and tree hash as `/julia/package/...` serves it. The PURL needs the `uuid` qualifier, for example `pkg:julia/Example@0.5.5?uuid=7876af07-990d-54b4-ab0e-23690620f79a`. Only packages of the General registry can be mirrored: the uuid and tree hash are read from General on GitHub, also with another `upstream.julia`, since they are the same on every Pkg server serving General. The tarball isn't checked by the proxy, as when serving; Pkg checks the tree hash of what it unpacks, except on Windows. Dependencies, the artifacts in a package's `Artifacts.toml` and the registry aren't mirrored. An offline `Pkg.add` also needs the registry: one installed on the client, or the one the proxy cached when a client last fetched it, which it serves offline with `cache_metadata` on.
 
+A Swift release is mirrored from `upstream.swift` with its source archive, checked against the SHA-256 checksum in the release metadata and cached under the key `/swift/{scope}/{name}/{version}.zip` serves. Give the registry scope as the namespace, for example `pkg:swift/apple/swift-argument-parser@1.5.0` for `apple.swift-argument-parser`, or the source repository, as SBOM tools write it: `pkg:swift/github.com/apple/swift-argument-parser@1.5.0` is looked up through the upstream's `/identifiers`, and the first identity it lists is mirrored. The release metadata, the package's release list and the release's `Package.swift` with its version-specific manifests are stored in the metadata cache too, so `swift package resolve` works with the upstream unreachable. Serving them, and the archive, offline needs `cache_metadata` on the server, since the archive is served with the checksum from the release metadata.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--sbom` | | Path to CycloneDX or SPDX SBOM file |
@@ -1591,7 +1595,7 @@ proxy mirror pkg:npm/lodash@4.17.21 pkg:cargo/serde@1.0.0
 
 ### Unversioned PURLs
 
-A PURL without a version, here or in a mirror API job, mirrors every version the configured upstream lists, through the same client, so `upstream.auth` and `upstream.allow_private_hosts` apply. npm packages in `upstream.npm_routes` are listed from their route. Listing works for npm, gem, golang, hex (from `upstream.hex_api`), pub, pypi, maven, nuget, composer, cran and brew. For cargo and conda the upstream doesn't serve the API used for listing, so versions come from the public registry while the upstream is the default one; with another upstream, and for Composer packages in `upstream.composer_routes` or any other ecosystem, give a version. Julia versions are always listed from the General registry.
+A PURL without a version, here or in a mirror API job, mirrors every version the configured upstream lists, through the same client, so `upstream.auth` and `upstream.allow_private_hosts` apply. npm packages in `upstream.npm_routes` are listed from their route. Listing works for npm, gem, golang, hex (from `upstream.hex_api`), pub, pypi, maven, nuget, composer, cran, brew and swift. For cargo and conda the upstream doesn't serve the API used for listing, so versions come from the public registry while the upstream is the default one; with another upstream, and for Composer packages in `upstream.composer_routes` or any other ecosystem, give a version. Julia versions are always listed from the General registry.
 
 ### Container images
 

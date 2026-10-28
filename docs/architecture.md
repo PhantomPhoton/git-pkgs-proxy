@@ -304,6 +304,7 @@ HTTP protocol handlers for each registry type.
 **SwiftHandler:**
 - Proxies the Swift Package Registry v1 read endpoints
 - Rewrites release URLs and caches source archives
+- With `cache_metadata`, caches release metadata, release lists and manifests (with their `Link` header) and serves them when the upstream fails
 
 **GitHandler:**
 - Serves `/git/{name}/{repo}` from `internal/gitcache`, read-only over smart HTTP
