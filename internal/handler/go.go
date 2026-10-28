@@ -63,7 +63,7 @@ func (h *GoHandler) Routes() http.Handler {
 	// Go module paths can contain slashes, so just use the handler directly
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// govulncheck sends HEAD for index/modules.json.gz to check that a
-		// GOVULNDB other than vuln.go.dev is a vulnerability database.
+		// -db other than vuln.go.dev is a vulnerability database.
 		if r.Method != http.MethodGet && (r.Method != http.MethodHead || !strings.HasPrefix(r.URL.Path, "/vulndb/")) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -83,7 +83,7 @@ func (h *GoHandler) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// So do vulnerability database requests, which govulncheck sends when
-	// GOVULNDB points at /go/vulndb. A module path's first element holds a
+	// -db points at /go/vulndb. A module path's first element holds a
 	// dot, so neither prefix can be a module.
 	if rest, ok := strings.CutPrefix(path, "vulndb/"); ok {
 		h.handleVulnDB(w, r, rest)

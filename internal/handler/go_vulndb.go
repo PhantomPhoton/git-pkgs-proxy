@@ -14,8 +14,7 @@ import (
 )
 
 const (
-	// defaultGoVulnDBURL is the database govulncheck uses when GOVULNDB is
-	// not set.
+	// defaultGoVulnDBURL is the database govulncheck uses without -db.
 	defaultGoVulnDBURL = "https://vuln.go.dev"
 
 	// goVulnDBMaxIDLength bounds an entry ID in a request path. Go IDs look
@@ -34,7 +33,7 @@ func (h *GoHandler) SetVulnDB(vulnDBURL string) {
 	h.vulnDBURL = configuredUpstreamURL(vulnDBURL, defaultGoVulnDBURL)
 }
 
-// handleVulnDB serves the Go vulnerability database (GOVULNDB) at
+// handleVulnDB serves the Go vulnerability database at
 // /vulndb/{path}. Only the files the database API defines are passed on:
 // index/db.json, index/modules.json, index/vulns.json and ID/{id}.json, each
 // also as .json.gz, which is what govulncheck fetches. Every file can change,

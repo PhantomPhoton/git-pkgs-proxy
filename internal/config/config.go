@@ -622,7 +622,7 @@ type UpstreamConfig struct {
 	GoSumDBsOffline bool `json:"go_sumdbs_offline" yaml:"go_sumdbs_offline"`
 
 	// GoVulnDB is the Go vulnerability database served at /go/vulndb, for
-	// govulncheck with GOVULNDB pointing at the proxy.
+	// govulncheck -db pointing at the proxy.
 	// Default: https://vuln.go.dev
 	GoVulnDB string `json:"go_vulndb" yaml:"go_vulndb"`
 
