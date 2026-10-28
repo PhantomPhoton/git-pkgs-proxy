@@ -300,6 +300,7 @@ Each upstream used by a built-in package route can be set in YAML or JSON under 
 | `upstream.gem` | `PROXY_UPSTREAM_GEM` | `https://rubygems.org` |
 | `upstream.go` | `PROXY_UPSTREAM_GO` | `https://proxy.golang.org` |
 | `upstream.go_sumdbs_offline` | `PROXY_UPSTREAM_GO_SUMDBS_OFFLINE` | `false` |
+| `upstream.go_vulndb` | `PROXY_UPSTREAM_GO_VULNDB` | `https://vuln.go.dev` |
 | `upstream.hex` | `PROXY_UPSTREAM_HEX` | `https://repo.hex.pm` |
 | `upstream.hex_api` | `PROXY_UPSTREAM_HEX_API` | `https://hex.pm` |
 | `upstream.pub` | `PROXY_UPSTREAM_PUB` | `https://pub.dev` |
@@ -677,6 +678,48 @@ cut at 4 KiB; without it the response is passed on unchanged.
 If `upstream.go` points at a module proxy that serves the checksum database
 itself, such as Athens, point the entry there instead, for example
 `sum.golang.org: "https://athens.example/sumdb/sum.golang.org"`.
+
+### Go vulnerability database
+
+```yaml
+upstream:
+
+  # The Go vulnerability database, served at /go/vulndb.
+  go_vulndb: "https://vuln.go.dev"
+```
+
+Point govulncheck at the proxy with its `-db` flag:
+
+```bash
+govulncheck -db https://proxy.example.com/go/vulndb ./...
+```
+
+The proxy passes on the files the
+[database API](https://go.dev/security/vuln/database#api) defines:
+`index/db.json`, `index/modules.json`, `index/vulns.json` and `ID/{id}.json`,
+each also as `.json.gz`, which is what govulncheck fetches. Other paths get
+404 without reaching the database. The files are stored and served
+byte-for-byte: a `.json.gz` file is gzip data, not a response with
+`Content-Encoding: gzip`.
+
+With `cache_metadata` enabled, every file follows `metadata_ttl`, entries
+included, since the database updates an entry when its `modified` date
+changes. A response that is not JSON (after decompressing a `.json.gz` file)
+is refused and not stored. When the database cannot be reached, cached files
+are served however old, with a `Warning` header. Without `cache_metadata`
+the requests are forwarded and nothing is stored.
+
+On a network where clients cannot reach `vuln.go.dev`, only files someone
+fetched through the proxy before an outage are available during it. To have
+every entry cached, fetch the indexes and all entries through the proxy while
+it is online, for example:
+
+```bash
+base=https://proxy.example.com/go/vulndb
+for f in db modules vulns; do curl -sfo /dev/null "$base/index/$f.json.gz"; done
+curl -sf "$base/index/vulns.json" | jq -r '.[].id' |
+  xargs -I{} curl -sfo /dev/null "$base/ID/{}.json.gz"
+```
 
 ### Debian archives
 
