@@ -67,12 +67,15 @@ type rewriteEntry struct {
 
 // cooldownRewriteTTL is how long a rewrite made with cooldown on is served.
 // Versions leave cooldown as time passes, so a cached rewrite would otherwise
-// keep hiding them.
-const cooldownRewriteTTL = time.Minute
+// keep hiding them. Cooldowns run to days, and a package manager that checks
+// every lockfile entry on each install, as pnpm 12 does, would otherwise
+// have the whole lockfile rewritten again on every install more than a
+// minute after the last.
+const cooldownRewriteTTL = time.Hour
 
 // size is how much of the cache's room the entry takes.
 func (e *rewriteEntry) size() int64 {
-	return int64(len(e.body) + len(e.gzipped))
+	return int64(len(e.plain) + len(e.gzipped))
 }
 
 // inflightRewrite is one rewrite that concurrent callers share. m and err are
@@ -93,11 +96,50 @@ type metadataValidators struct {
 
 // rewrittenMetadata is a rewritten metadata document with its validators.
 // gzipped is the document gzip-compressed, or nil when there is no
-// compressed copy to serve.
+// compressed copy to serve. The cache keeps only gzipped when there is one,
+// so plain is nil then; content returns the document either way.
 type rewrittenMetadata struct {
-	body []byte
+	plain []byte
 	metadataValidators
 	gzipped []byte
+	// size is the length of the uncompressed document.
+	size int
+}
+
+// content returns the document uncompressed. A cached document is kept
+// only gzip-compressed, and is decompressed for each caller that needs the
+// plain bytes: clients not accepting gzip, and handlers reading the document.
+// The compressed copy was made in memory by gzipIfSmaller, so reading it back
+// fails only on a bug; content returns nil then.
+func (m rewrittenMetadata) content() []byte {
+	if m.plain != nil || m.gzipped == nil {
+		return m.plain
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(m.gzipped))
+	if err != nil {
+		return nil
+	}
+	out := bytes.NewBuffer(make([]byte, 0, m.size))
+	if _, err := io.Copy(out, zr); err != nil {
+		return nil
+	}
+	return out.Bytes()
+}
+
+// identity returns m to be served without its gzip copy.
+func (m rewrittenMetadata) identity() rewrittenMetadata {
+	m.plain = m.content()
+	m.gzipped = nil
+	return m
+}
+
+// compact returns m as the cache keeps it: only the gzip copy when there is
+// one.
+func (m rewrittenMetadata) compact() rewrittenMetadata {
+	if m.gzipped != nil {
+		m.plain = nil
+	}
+	return m
 }
 
 // metadataETag returns the strong ETag of a rewritten document.
@@ -248,14 +290,14 @@ func (c *rewriteCache) rewrite(ctx context.Context, key string, in []byte, ttl t
 		c.mu.Lock()
 		delete(c.inFlight, key)
 		if f.err == nil {
-			c.add(&rewriteEntry{key: key, rewrittenMetadata: f.m, expires: expires})
+			c.add(&rewriteEntry{key: key, rewrittenMetadata: f.m.compact(), expires: expires})
 		}
 		c.mu.Unlock()
 		close(f.done)
 	}()
 	f.m, f.err = rewriteWithETag(in, rewrite)
 	if f.err == nil {
-		f.m.gzipped = gzipIfSmaller(f.m.body)
+		f.m.gzipped = gzipIfSmaller(f.m.plain)
 	}
 	return f.m, f.err
 }
@@ -266,7 +308,7 @@ func rewriteWithETag(in []byte, rewrite func([]byte) ([]byte, error)) (rewritten
 	if err != nil {
 		return rewrittenMetadata{}, err
 	}
-	return rewrittenMetadata{body: out, metadataValidators: metadataValidators{etag: metadataETag(out)}}, nil
+	return rewrittenMetadata{plain: out, metadataValidators: metadataValidators{etag: metadataETag(out)}, size: len(out)}, nil
 }
 
 // gzipIfSmaller returns body gzip-compressed, or nil when compressing does
@@ -342,7 +384,7 @@ func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name str
 		if err != nil {
 			return rewrittenMetadata{}, err
 		}
-		return rewrittenMetadata{body: out, metadataValidators: metadataValidators{etag: keptVersionsETag(digest, proxyURL, name, kept)}}, nil
+		return rewrittenMetadata{plain: out, metadataValidators: metadataValidators{etag: keptVersionsETag(digest, proxyURL, name, kept)}, size: len(out)}, nil
 	}
 	m, err := rewriteWithETag(in, rewriteOnly)
 	if err == nil && !cooldown {
@@ -359,7 +401,7 @@ func (p *Proxy) uncachedRewrite(ecosystem, proxyURL, name string, out []byte) re
 	if !p.cooldownEnabled() {
 		v.lastModified = p.metadataDate(ecosystem, proxyURL, name, v.etag)
 	}
-	return rewrittenMetadata{body: out, metadataValidators: v}
+	return rewrittenMetadata{plain: out, metadataValidators: v, size: len(out)}
 }
 
 func (p *Proxy) cooldownEnabled() bool {
@@ -410,7 +452,7 @@ func (p *Proxy) storedRewriteVariant(ecosystem, cacheKey, proxyURL, name string,
 		return rewrittenMetadata{}, "", false
 	}
 	m.lastModified = p.metadataDate(ecosystem, proxyURL, name, m.etag)
-	metrics.RecordMetadataCacheHit(ecosystem, len(m.body))
+	metrics.RecordMetadataCacheHit(ecosystem, m.size)
 	p.recordMetadataRead(entry)
 	return m, contentType, true
 }
@@ -447,10 +489,10 @@ func serveRewrittenMetadata(w http.ResponseWriter, r *http.Request, m rewrittenM
 // serveRewrittenMetadataAs is serveRewrittenMetadata for a document of
 // another content type.
 func serveRewrittenMetadataAs(w http.ResponseWriter, r *http.Request, m rewrittenMetadata, contentType string) {
-	body, etag := m.body, m.etag
+	etag := m.etag
 	compressed := m.gzipped != nil && acceptsGzip(r)
 	if compressed {
-		body, etag = m.gzipped, gzipETag(m.etag)
+		etag = gzipETag(m.etag)
 	}
 	ensureVary(w.Header(), headerAcceptEncoding)
 	w.Header().Set(headerETag, etag)
@@ -460,6 +502,10 @@ func serveRewrittenMetadataAs(w http.ResponseWriter, r *http.Request, m rewritte
 	if notModified(r, etag, m.lastModified) {
 		w.WriteHeader(http.StatusNotModified)
 		return
+	}
+	body := m.gzipped
+	if !compressed {
+		body = m.content()
 	}
 	w.Header().Set(headerContentType, contentType)
 	if compressed {

@@ -45,8 +45,8 @@ func TestRewriteCache_RepeatServesCachedRewrite(t *testing.T) {
 
 	for range 3 {
 		m, err := c.rewrite(context.Background(), key, []byte("doc"), 0, r.fn)
-		if err != nil || string(m.body) != "DOC" {
-			t.Fatalf("rewrite = %q, %v", m.body, err)
+		if err != nil || string(m.content()) != "DOC" {
+			t.Fatalf("rewrite = %q, %v", m.content(), err)
 		}
 	}
 	if got := r.calls.Load(); got != 1 {
@@ -61,8 +61,8 @@ func TestRewriteCache_NewUpstreamBytesRewriteAgain(t *testing.T) {
 	for _, doc := range []string{"v1", "v2"} {
 		key := rewriteCacheKey("npm", "http://proxy", "left-pad", []byte(doc))
 		m, err := c.rewrite(context.Background(), key, []byte(doc), 0, r.fn)
-		if err != nil || string(m.body) != strings.ToUpper(doc) {
-			t.Fatalf("rewrite(%s) = %q, %v", doc, m.body, err)
+		if err != nil || string(m.content()) != strings.ToUpper(doc) {
+			t.Fatalf("rewrite(%s) = %q, %v", doc, m.content(), err)
 		}
 	}
 	if got := r.calls.Load(); got != 2 {
@@ -86,7 +86,7 @@ func TestRewriteCache_ConcurrentRequestsShareRewrite(t *testing.T) {
 		if err != nil {
 			t.Error(err)
 		}
-		outs <- string(m.body)
+		outs <- string(m.content())
 	}
 	go run()
 	<-r.entered
@@ -128,8 +128,8 @@ func TestRewriteCache_WaiterLeavingKeepsRewrite(t *testing.T) {
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
-	if m, err := c.rewrite(context.Background(), key, []byte("doc"), 0, r.fn); err != nil || string(m.body) != "DOC" {
-		t.Errorf("cached rewrite = %q, %v", m.body, err)
+	if m, err := c.rewrite(context.Background(), key, []byte("doc"), 0, r.fn); err != nil || string(m.content()) != "DOC" {
+		t.Errorf("cached rewrite = %q, %v", m.content(), err)
 	}
 	if got := r.calls.Load(); got != 1 {
 		t.Errorf("rewrites = %d, want 1", got)

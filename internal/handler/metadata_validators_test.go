@@ -501,8 +501,8 @@ func TestRewriteCacheETag(t *testing.T) {
 	key := rewriteCacheKey("npm", "http://proxy", "demo", []byte("doc"))
 
 	m, err := c.rewrite(t.Context(), key, []byte("doc"), 0, exclaim)
-	if err != nil || string(m.body) != "doc!" {
-		t.Fatalf("rewrite = %q, %v", m.body, err)
+	if err != nil || string(m.content()) != "doc!" {
+		t.Fatalf("rewrite = %q, %v", m.content(), err)
 	}
 	if want := metadataETag([]byte("doc!")); m.etag != want {
 		t.Errorf("rewrite ETag = %q, want %q", m.etag, want)
