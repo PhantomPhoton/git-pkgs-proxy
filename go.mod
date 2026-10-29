@@ -22,7 +22,7 @@ require (
 	github.com/git-pkgs/spdx v0.3.3
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/jmoiron/sqlx v1.4.0
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.3
 	github.com/lib/pq v1.12.3
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/prometheus/client_golang v1.25.0
