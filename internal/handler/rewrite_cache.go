@@ -35,8 +35,8 @@ import (
 // depends on is fixed for the life of the process: the proxy URL is part of
 // the key, and the denylist is loaded at startup. The exception is cooldown,
 // which depends on the time of the request: with cooldown on, entries expire
-// after cooldownRewriteTTL, so a version is held back at most that long past
-// its cooldown.
+// after Proxy.cooldownRewriteTTL, so a version is held back at most that long
+// past its cooldown.
 //
 // Each entry keeps the ETag of its output, so clients can revalidate their
 // copy without the output being hashed again on every request. Dates are not
@@ -65,13 +65,35 @@ type rewriteEntry struct {
 	expires time.Time
 }
 
-// cooldownRewriteTTL is how long a rewrite made with cooldown on is served.
-// Versions leave cooldown as time passes, so a cached rewrite would otherwise
-// keep hiding them. Cooldowns run to days, and a package manager that checks
-// every lockfile entry on each install, as pnpm 12 does, would otherwise
-// have the whole lockfile rewritten again on every install more than a
-// minute after the last.
-const cooldownRewriteTTL = time.Hour
+// maxCooldownRewriteTTL is the longest a rewrite made with cooldown on is
+// served. Versions leave cooldown as time passes, so a cached rewrite would
+// otherwise keep hiding them. Cooldowns run to days, and a package manager
+// that checks every lockfile entry on each install, as pnpm 12 does, would
+// otherwise have the whole lockfile rewritten again on every install more
+// than a minute after the last.
+const maxCooldownRewriteTTL = time.Hour
+
+// minCooldownRewriteTTL is the shortest a rewrite made with cooldown on is
+// served, however short the cooldown.
+const minCooldownRewriteTTL = time.Minute
+
+// cooldownRewriteShare is the share of the shortest cooldown a rewrite made
+// with cooldown on is served for, as a divisor.
+const cooldownRewriteShare = 24
+
+// cooldownRewriteTTL returns how long a rewrite made with cooldown on is
+// served: a 24th of the shortest cooldown configured, so a version is held
+// back at most about 4% past its cooldown, kept between a minute and an hour.
+func (p *Proxy) cooldownRewriteTTL() time.Duration {
+	ttl := p.ShortestCooldown / cooldownRewriteShare
+	switch {
+	case ttl <= 0 || ttl > maxCooldownRewriteTTL:
+		return maxCooldownRewriteTTL
+	case ttl < minCooldownRewriteTTL:
+		return minCooldownRewriteTTL
+	}
+	return ttl
+}
 
 // size is how much of the cache's room the entry takes.
 func (e *rewriteEntry) size() int64 {
@@ -348,7 +370,7 @@ func (c *rewriteCache) add(e *rewriteEntry) {
 // metadata cache stored it, and is empty otherwise; when known it keys the
 // cache, so the document isn't hashed again.
 //
-// With cooldown on, the cached rewrite expires after cooldownRewriteTTL. Its
+// With cooldown on, the cached rewrite expires after p.cooldownRewriteTTL. Its
 // ETag is the hash of its output, and it is dated like any other, so clients
 // revalidate with either validator and get the gzip copy.
 //
@@ -370,7 +392,7 @@ func (p *Proxy) cachedRewrite(ctx context.Context, ecosystem, proxyURL, name str
 		}
 		var ttl time.Duration
 		if cooldown {
-			ttl = cooldownRewriteTTL
+			ttl = p.cooldownRewriteTTL()
 		}
 		m, err := p.rewrites.rewrite(ctx, key, in, ttl, rewriteOnly)
 		if err == nil {

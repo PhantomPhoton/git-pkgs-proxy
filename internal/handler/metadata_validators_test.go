@@ -720,14 +720,14 @@ func TestRewrittenMetadataETagWithCooldownFollowsKeptVersions(t *testing.T) {
 			if rec := serve(handler, c.path, http.Header{"If-None-Match": {etag}}); rec.Code != http.StatusNotModified {
 				t.Errorf("within the rewrite's lifetime: status %d, want 304 from the cached rewrite", rec.Code)
 			}
-			clock.advance(cooldownRewriteTTL)
+			clock.advance(maxCooldownRewriteTTL)
 			rec := serve(handler, c.path, http.Header{"If-None-Match": {etag}})
 			if rec.Code != http.StatusOK || rec.Header().Get("ETag") == etag {
 				t.Errorf("after a version left cooldown: status %d, ETag %q; want 200 with a new ETag", rec.Code, rec.Header().Get("ETag"))
 			}
 
 			proxy.Cooldown = &cooldown.Config{Default: "1d"}
-			clock.advance(cooldownRewriteTTL)
+			clock.advance(maxCooldownRewriteTTL)
 			expectNotModified(t, serve(handler, c.path, http.Header{"If-None-Match": {etag}}), etag)
 		})
 	}
