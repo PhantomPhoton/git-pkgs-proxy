@@ -210,9 +210,12 @@ type Proxy struct {
 	// RouteFor returns how to fetch a package that doesn't come from the
 	// ecosystem's default upstream, such as an npm package in
 	// upstream.npm_routes, or nil to use Resolver.
-	RouteFor            func(ecosystem, name string) *ArtifactRoute
-	Logger              *slog.Logger
-	Cooldown            CooldownPolicy
+	RouteFor func(ecosystem, name string) *ArtifactRoute
+	Logger   *slog.Logger
+	Cooldown CooldownPolicy
+	// ShortestCooldown is the shortest cooldown configured anywhere. It
+	// bounds how long a rewrite filtered by cooldown is cached.
+	ShortestCooldown    time.Duration
 	Denylist            *denylist.Policy
 	CacheMetadata       bool
 	MetadataTTL         time.Duration

@@ -85,6 +85,13 @@ func (h *NPMHandler) Routes() http.Handler {
 			return
 		}
 
+		// pnpm 12 checks packuments with HEAD before fetching them, so
+		// packuments also answer HEAD; net/http leaves out the body.
+		if r.Method == http.MethodHead && isPackumentPath(r.URL.Path) {
+			h.handlePackageMetadata(w, r)
+			return
+		}
+
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -123,6 +130,12 @@ func (h *NPMHandler) Routes() http.Handler {
 		// Otherwise it's a metadata request
 		h.handlePackageMetadata(w, r)
 	})
+}
+
+// isPackumentPath reports whether a request path names package metadata
+// rather than a tarball or a registry endpoint under /-/.
+func isPackumentPath(urlPath string) bool {
+	return !strings.HasPrefix(urlPath, "/-/") && !strings.Contains(strings.TrimPrefix(urlPath, "/"), "/-/")
 }
 
 // handleSecurity relays the npm audit endpoints to upstream. The request body
@@ -391,7 +404,7 @@ func (h *NPMHandler) handleFilteredNPMVersionMetadata(w http.ResponseWriter, r *
 
 	w.Header().Set(headerContentType, contentTypeJSON)
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(rewritten.body)
+	_, _ = w.Write(rewritten.content())
 }
 
 // npmMetadataCacheKey qualifies routed-package metadata cache entries with the
